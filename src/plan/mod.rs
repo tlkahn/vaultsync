@@ -21,9 +21,11 @@ pub struct PlanOpts {
     pub mtime_tolerance_ms: u64,
     /// Map delete direction based on mode (`--delete`).
     pub delete: bool,
-    /// On conflict, local wins (upload).
+    /// On conflict, local wins. Mode-aware: Push/Status plan Upload; Pull
+    /// keeps local (Skip). Never flips non-Conflict deltas.
     pub force_local: bool,
-    /// On conflict, remote wins (download).
+    /// On conflict, remote wins. Mode-aware: Pull/Status plan Download; Push
+    /// keeps remote (Skip). Never flips non-Conflict deltas.
     pub force_remote: bool,
 }
 
@@ -108,10 +110,13 @@ fn classify_pair(local: Option<&Entity>, remote: Option<&Entity>, tol: u64) -> D
         (Some(_), None) => Delta::LocalOnly,
         (None, Some(_)) => Delta::RemoteOnly,
         (Some(l), Some(r)) => {
-            // A key that is a folder on either side is a folder (same key).
-            if l.is_folder() || r.is_folder() {
-                return Delta::Equal;
-            }
+            // Folders never reach here: `resolve` short-circuits folder keys
+            // before classify. A same-key file/folder pair is impossible
+            // (folder keys end with `/`).
+            debug_assert!(
+                !l.is_folder() && !r.is_folder(),
+                "folders must be filtered in resolve"
+            );
             let lm = l.mtime_ms.unwrap_or(0);
             let rm = r.mtime_ms.unwrap_or(0);
             if lm.abs_diff(rm) <= tol {
@@ -226,9 +231,19 @@ fn resolve(
                 // silently letting local (or remote) win by arbitrary precedence.
                 (Conflict, reason::CONFLICT_MTIME_SIZE)
             } else if opts.force_local {
-                (Upload, reason::FORCE_LOCAL)
+                match mode {
+                    // Push and Status may plan Upload; Pull must keep local
+                    // (mode invariant: Pull never plans Upload).
+                    Mode::Push | Mode::Status => (Upload, reason::FORCE_LOCAL),
+                    Mode::Pull => (Skip, reason::FORCE_LOCAL),
+                }
             } else if opts.force_remote {
-                (Download, reason::FORCE_REMOTE)
+                match mode {
+                    // Pull and Status may plan Download; Push must keep remote
+                    // (mode invariant: Push never plans Download).
+                    Mode::Pull | Mode::Status => (Download, reason::FORCE_REMOTE),
+                    Mode::Push => (Skip, reason::FORCE_REMOTE),
+                }
             } else {
                 (Conflict, reason::CONFLICT_MTIME_SIZE)
             }
@@ -488,6 +503,23 @@ mod tests {
     }
 
     #[test]
+    fn plan_conflict_both_forces_cancel_in_pull() {
+        let o = PlanOpts {
+            force_local: true,
+            force_remote: true,
+            ..Default::default()
+        };
+        let p = plan(
+            &[file("a.md", 1, Some(1000))],
+            &[file("a.md", 2, Some(1000))],
+            Mode::Pull,
+            &o,
+        );
+        assert_eq!(kinds(&p), vec![ActionKind::Conflict]);
+        assert_eq!(p.actions[0].reason, "conflict_mtime_size");
+    }
+
+    #[test]
     fn plan_conflict_both_forces_cancel() {
         let o = PlanOpts {
             force_local: true,
@@ -502,6 +534,72 @@ mod tests {
         );
         assert_eq!(kinds(&p), vec![ActionKind::Conflict]);
         assert_eq!(p.actions[0].reason, "conflict_mtime_size");
+    }
+
+    #[test]
+    fn plan_pull_force_local_conflict_skips() {
+        let o = PlanOpts {
+            force_local: true,
+            ..Default::default()
+        };
+        let p = plan(
+            &[file("a.md", 1, Some(1000))],
+            &[file("a.md", 2, Some(1000))],
+            Mode::Pull,
+            &o,
+        );
+        assert_eq!(kinds(&p), vec![ActionKind::Skip]);
+        assert_eq!(p.actions[0].reason, "force_local");
+        assert!(!kinds(&p).contains(&ActionKind::Upload));
+    }
+
+    #[test]
+    fn plan_push_force_remote_conflict_skips() {
+        let o = PlanOpts {
+            force_remote: true,
+            ..Default::default()
+        };
+        let p = plan(
+            &[file("a.md", 1, Some(1000))],
+            &[file("a.md", 2, Some(1000))],
+            Mode::Push,
+            &o,
+        );
+        assert_eq!(kinds(&p), vec![ActionKind::Skip]);
+        assert_eq!(p.actions[0].reason, "force_remote");
+        assert!(!kinds(&p).contains(&ActionKind::Download));
+    }
+
+    #[test]
+    fn plan_push_force_local_conflict_uploads() {
+        let o = PlanOpts {
+            force_local: true,
+            ..Default::default()
+        };
+        let p = plan(
+            &[file("a.md", 1, Some(1000))],
+            &[file("a.md", 2, Some(1000))],
+            Mode::Push,
+            &o,
+        );
+        assert_eq!(kinds(&p), vec![ActionKind::Upload]);
+        assert_eq!(p.actions[0].reason, "force_local");
+    }
+
+    #[test]
+    fn plan_pull_force_remote_conflict_downloads() {
+        let o = PlanOpts {
+            force_remote: true,
+            ..Default::default()
+        };
+        let p = plan(
+            &[file("a.md", 1, Some(1000))],
+            &[file("a.md", 2, Some(1000))],
+            Mode::Pull,
+            &o,
+        );
+        assert_eq!(kinds(&p), vec![ActionKind::Download]);
+        assert_eq!(p.actions[0].reason, "force_remote");
     }
 
     #[test]
@@ -535,6 +633,40 @@ mod tests {
     }
 
     #[test]
+    fn plan_force_local_does_not_flip_remote_newer() {
+        // Forces apply to Conflict rows only: RemoteNewer stays a Download
+        // even with force_local (locks the "no flip" invariant, R2.7e).
+        let o = PlanOpts {
+            force_local: true,
+            ..Default::default()
+        };
+        let p = plan(
+            &[file("a.md", 5, Some(1000))],
+            &[file("a.md", 5, Some(5000))],
+            Mode::Status,
+            &o,
+        );
+        assert_eq!(kinds(&p), vec![ActionKind::Download]);
+        assert_eq!(p.actions[0].reason, "remote_newer");
+    }
+
+    #[test]
+    fn plan_force_remote_does_not_flip_local_newer() {
+        let o = PlanOpts {
+            force_remote: true,
+            ..Default::default()
+        };
+        let p = plan(
+            &[file("a.md", 5, Some(5000))],
+            &[file("a.md", 5, Some(1000))],
+            Mode::Status,
+            &o,
+        );
+        assert_eq!(kinds(&p), vec![ActionKind::Upload]);
+        assert_eq!(p.actions[0].reason, "local_newer");
+    }
+
+    #[test]
     fn plan_stats_counts() {
         let local = vec![
             file("a.md", 1, Some(100)),  // local only -> upload
@@ -560,6 +692,33 @@ mod tests {
         let p = run_status(&local, &[]);
         let keys: Vec<_> = p.actions.iter().map(|a| a.key.clone()).collect();
         assert_eq!(keys, vec!["a.md".to_string(), "z.md".to_string()]);
+    }
+
+    #[test]
+    fn plan_pull_delete_local_only_folder_still_skips() {
+        // Locks Phase 1: folders short-circuit in `resolve` before delete
+        // mapping, so `--delete` never removes folder rows. Phase 2 owns a
+        // folder-delete policy decision (checklist P1r3-folder-delete).
+        let o = PlanOpts {
+            delete: true,
+            ..Default::default()
+        };
+        let p = plan(&[folder("n")], &[], Mode::Pull, &o);
+        assert_eq!(kinds(&p), vec![ActionKind::Skip]);
+        assert_eq!(p.actions[0].reason, "folder");
+        assert!(!kinds(&p).contains(&ActionKind::DeleteLocal));
+    }
+
+    #[test]
+    fn plan_push_delete_remote_only_folder_still_skips() {
+        let o = PlanOpts {
+            delete: true,
+            ..Default::default()
+        };
+        let p = plan(&[], &[folder("n")], Mode::Push, &o);
+        assert_eq!(kinds(&p), vec![ActionKind::Skip]);
+        assert_eq!(p.actions[0].reason, "folder");
+        assert!(!kinds(&p).contains(&ActionKind::DeleteRemote));
     }
 
     #[test]
