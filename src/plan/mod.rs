@@ -288,6 +288,52 @@ mod tests {
     }
 
     #[test]
+    fn plan_pull_remote_none_mtime_diff_size_skips_as_local_newer() {
+        // Characterization lock (P1r5-mtime-pull): under the Phase 1
+        // `None -> 0` rule, a remote missing mtime against a present local
+        // classifies `local_newer`; Pull plans Skip (local kept). Phase 2
+        // must revisit this pull-direction staleness deliberately.
+        let p = plan(
+            &[file("a.md", 100, Some(5000))],
+            &[file("a.md", 200, None)],
+            Mode::Pull,
+            &opts(),
+        );
+        assert_eq!(kinds(&p), vec![ActionKind::Skip]);
+        assert_eq!(p.actions[0].reason, "local_newer");
+    }
+
+    #[test]
+    fn plan_pull_remote_none_mtime_same_size_skips_as_local_newer() {
+        // Same-size variant: Equal is *not* chosen because `5000` vs the
+        // None-derived `0` exceeds the tolerance; the pair still classifies
+        // `local_newer` and Pull keeps local.
+        let p = plan(
+            &[file("a.md", 100, Some(5000))],
+            &[file("a.md", 100, None)],
+            Mode::Pull,
+            &opts(),
+        );
+        assert_eq!(kinds(&p), vec![ActionKind::Skip]);
+        assert_eq!(p.actions[0].reason, "local_newer");
+    }
+
+    #[test]
+    fn plan_status_remote_none_mtime_diff_size_uploads_as_local_newer() {
+        // Counters the "no signal" framing: Status *does* surface a row for
+        // a None-mtime remote (Upload / local_newer); the real hole is the
+        // misleading Pull Skip, not a total absence of output.
+        let p = plan(
+            &[file("a.md", 100, Some(5000))],
+            &[file("a.md", 200, None)],
+            Mode::Status,
+            &opts(),
+        );
+        assert_eq!(kinds(&p), vec![ActionKind::Upload]);
+        assert_eq!(p.actions[0].reason, "local_newer");
+    }
+
+    #[test]
     fn plan_both_empty() {
         let p = run_status(&[], &[]);
         assert!(p.actions.is_empty());

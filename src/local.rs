@@ -38,7 +38,15 @@ impl LocalFs {
         // The root itself must exist: a missing vault is a loud error, not an
         // empty plan. `walk` tolerates `NotFound` only for directories
         // discovered mid-walk (vanished between enumeration and recursion).
-        let _ = std::fs::metadata(&self.root)?;
+        let md = std::fs::metadata(&self.root)?;
+        if !md.is_dir() {
+            // A file-as-root must fail with a clear, vaultsync-owned message
+            // (not a raw `Not a directory` OS string).
+            return Err(Error::Other(format!(
+                "vault root is not a directory: {}",
+                self.root.display()
+            )));
+        }
         let mut out = Vec::new();
         walk(&self.root, &self.root, &mut out)?;
         out.sort_by(|a, b| a.key.cmp(&b.key));
@@ -126,8 +134,38 @@ fn file_entity(path: &Path, key: &str) -> Result<Option<Entity>, Error> {
 /// Build a vault-relative key from an already-stripped path, normalizing to
 /// `/` separators and validating it as a key. Fails closed on invalid keys
 /// (e.g. `..` or empty segments) rather than emitting them downstream.
+///
+/// The key is built from `Path::components()` joined with `/`, never by a
+/// blind `\` -> `/` rewrite: on Unix a filename that itself contains `\`
+/// stays a single `Normal` component and is rejected by `ensure_valid_key`
+/// (fail loud, consistent with P1r4-key-ctl); on Windows the components API
+/// already yields separator-free parts. Non-UTF8 components also fail loud
+/// (no U+FFFD lossy collapse).
 fn path_to_key(rel: &Path) -> Result<String, Error> {
-    let key = rel.to_string_lossy().replace('\\', "/");
+    let mut segments: Vec<&str> = Vec::new();
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::Normal(os) => {
+                // Fail closed on non-UTF8 names instead of collapsing to
+                // U+FFFD and colliding with a real replacement-char name.
+                let seg = os.to_str().ok_or_else(|| {
+                    Error::InvalidKey(format!("key component is not valid UTF-8: {os:?}"))
+                })?;
+                segments.push(seg);
+            }
+            // Defense in depth: `rel` is already root-stripped and relative,
+            // so none of these should appear; reject them rather than guess.
+            std::path::Component::ParentDir
+            | std::path::Component::CurDir
+            | std::path::Component::Prefix(_)
+            | std::path::Component::RootDir => {
+                return Err(Error::InvalidKey(format!(
+                    "key contains a non-normal path component: {rel:?}"
+                )));
+            }
+        }
+    }
+    let key = segments.join("/");
     crate::entity::ensure_valid_key(&key)?;
     Ok(key)
 }
@@ -167,6 +205,17 @@ mod tests {
         assert_eq!(path_to_key(Path::new("a/b.md")).unwrap(), "a/b.md");
         // a `..` component in the relative path is rejected (fail-closed)
         assert!(path_to_key(Path::new("foo/../bar.md")).is_err());
+    }
+
+    #[test]
+    fn local_path_to_key_rejects_unix_backslash_name() {
+        // A Unix file whose *name* contains a backslash is a single path
+        // component; it must fail key validation, not be silently rewritten
+        // into the nested key `a/b.md` (H1).
+        let err = path_to_key(Path::new("a\\b.md")).unwrap_err();
+        assert!(matches!(err, Error::InvalidKey(_)));
+        let msg = format!("{err}");
+        assert!(msg.contains("backslash"), "msg: {msg}");
     }
 
     #[test]
@@ -211,6 +260,51 @@ mod tests {
         let a = ents.iter().find(|e| e.key == "a.md").unwrap();
         assert_eq!(a.size, 5);
         assert!(a.mtime_ms.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_list_rejects_backslash_filename() {
+        // End-to-end walk: a file literally named `a\b.md` must fail the walk
+        // loud (`InvalidKey`), never emit a nested key `a/b.md` (H1).
+        use std::os::unix::ffi::OsStrExt;
+        let dir = TempDir::new("vaultsync-test");
+        let name = std::ffi::OsStr::from_bytes(b"a\\b.md");
+        std::fs::write(dir.join(name), "x").unwrap();
+        let fs = LocalFs::new(dir.path());
+        let res = fs.list();
+        assert!(res.is_err(), "expected error, got {res:?}");
+        assert!(matches!(res.unwrap_err(), Error::InvalidKey(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_list_backslash_name_does_not_collide_with_nested_file() {
+        // With both `a\b.md` and a real `a/b.md` present, the walk must err
+        // (never return two `a/b.md` rows: read_dir order is unspecified, but
+        // either order ends in the same loud failure).
+        use std::os::unix::ffi::OsStrExt;
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::write(dir.join("a/b.md"), "nested").unwrap();
+        let name = std::ffi::OsStr::from_bytes(b"a\\b.md");
+        std::fs::write(dir.join(name), "flat").unwrap();
+        let fs = LocalFs::new(dir.path());
+        assert!(fs.list().is_err(), "expected error, got {:?}", fs.list());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_path_to_key_rejects_non_utf8_component() {
+        // A non-UTF8 filename must fail loud (`InvalidKey`), not collapse to
+        // U+FFFD via `to_string_lossy` (L2). Single-component variant keeps
+        // the assert independent of separator handling.
+        use std::os::unix::ffi::OsStrExt;
+        let p = PathBuf::from(std::ffi::OsStr::from_bytes(b"a/\x80.md"));
+        let err = path_to_key(&p).unwrap_err();
+        assert!(matches!(err, Error::InvalidKey(_)));
+        let msg = format!("{err}");
+        assert!(msg.contains("UTF-8"), "msg: {msg}");
     }
 
     #[cfg(unix)]
@@ -321,6 +415,21 @@ mod tests {
         let ents = fs.list().unwrap();
         let old = ents.iter().find(|e| e.key == "old.md").unwrap();
         assert_eq!(old.mtime_ms, Some(0));
+    }
+
+    #[test]
+    fn local_root_file_errors_clearly() {
+        // A vault root that is a plain file must fail with a vaultsync-owned
+        // message naming the path, not a raw `Not a directory (os error 20)`
+        // string from the OS (L1).
+        let dir = TempDir::new("vaultsync-test");
+        let f = dir.join("root.md");
+        std::fs::write(&f, "x").unwrap();
+        let fs = LocalFs::new(&f);
+        let err = fs.list().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("vault root is not a directory"), "msg: {msg}");
+        assert!(msg.contains("root.md"), "msg: {msg}");
     }
 
     #[test]

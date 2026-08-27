@@ -60,9 +60,20 @@ fn parent_folders(key: &str) -> Vec<String> {
     out
 }
 
-fn read_exact_n(r: &mut dyn Read, n: usize) -> std::io::Result<Vec<u8>> {
-    let mut buf = vec![0u8; n];
-    r.read_exact(&mut buf)?;
+/// Read exactly `n` bytes from `r` into a fresh `Vec`, or fail with
+/// `UnexpectedEof` on a short read. Never preallocates caller-controlled
+/// `n` bytes up front: `Read::take` bounds the read and the buffer grows as
+/// data arrives, so a huge `n` with a short reader errors immediately
+/// instead of attempting a `size`-driven allocation (P1r5-put-prealloc).
+fn read_exact_n(r: &mut dyn Read, n: u64) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    r.take(n).read_to_end(&mut buf)?;
+    if buf.len() as u64 != n {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "short read",
+        ));
+    }
     Ok(buf)
 }
 
@@ -142,7 +153,7 @@ impl ObjectStore for MemoryStore {
                 "put_from does not accept folder keys: {key:?}"
             )));
         }
-        let bytes = read_exact_n(r, size as usize)?;
+        let bytes = read_exact_n(r, size)?;
         let etag = format!("{:016x}", fnv1a(&bytes));
         let obj = MockObject {
             bytes,
@@ -190,6 +201,43 @@ mod tests {
         let mut buf = Vec::new();
         store.get_to(key, &mut buf)?;
         Ok(String::from_utf8(buf).unwrap())
+    }
+
+    #[test]
+    fn mock_put_from_large_size_short_reader_errors() {
+        // A caller-declared `size` far larger than the actual reader payload
+        // must produce a short-read error, not a silent truncation. The
+        // 50 MB figure is big enough to catch a size-driven prealloc without
+        // depending on OOM behavior in CI (H2).
+        let store = new_store();
+        let mut cursor = std::io::Cursor::new(b"x".to_vec());
+        let err = store
+            .put_from("a.md", &mut cursor, 50_000_000, None)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Io(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+            "expected UnexpectedEof, got {err:?}"
+        );
+        // nothing must be stored
+        assert_eq!(store.list("").unwrap(), Vec::<Entity>::new());
+    }
+
+    #[test]
+    fn mock_put_from_huge_size_short_reader_errors() {
+        // `u64::MAX` size with a 1-byte reader: must error (`UnexpectedEof`)
+        // without ever attempting a `size`-driven allocation. Running this
+        // against the old `vec![0u8; n]` code path aborts the process
+        // (handle_alloc_error), which is exactly the defect this locks (H2).
+        let store = new_store();
+        let mut cursor = std::io::Cursor::new(b"x".to_vec());
+        let err = store
+            .put_from("a.md", &mut cursor, u64::MAX, None)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Io(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+            "expected UnexpectedEof, got {err:?}"
+        );
+        assert_eq!(store.list("").unwrap(), Vec::<Entity>::new());
     }
 
     #[test]
