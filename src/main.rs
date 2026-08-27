@@ -1,3 +1,4 @@
 fn main() {
-    println!("vaultsync {}", vaultsync::version());
+    let code = vaultsync::cli::run_from_env();
+    std::process::exit(code);
 }

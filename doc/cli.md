@@ -18,6 +18,10 @@ vaultsync [global flags] <command> [command flags]
 | `-y, --yes` | skip confirmation for destructive flags |
 | `--concurrency <n>` | transfer workers |
 
+Phase 1 note: the current hand-rolled parser accepts `--vault` / `--delete`
+only **after** the subcommand; the pre-command global-flag order shown above
+is the Phase 2 parser target (clap migration, N3).
+
 ## Commands
 
 ### `vaultsync status`
@@ -114,11 +118,19 @@ Same as `aws` CLI where possible.
 
 ### Human (default)
 
+Phase 1 subset emitted by `format_plan_human`: split delete counts, no
+byte-size column, and the conflict reason is the planner's reason token as
+emitted. Byte sizes / tighter column alignment / hiding `S` rows by default
+are Phase 2+ (formatter growth is out of scope for Phase 1). The JSON block
+below remains the structured contract (`delete_local` / `delete_remote`
+counts already match the formatter).
+
 ```text
-plan: 3 upload, 1 download, 0 delete, 2 skip, 0 conflict
-U  notes/a.md                         12.4 KB
-D  notes/b.md                          3.1 KB
-*  notes/c.md                          conflict size/mtime
+plan: 3 upload, 1 download, 0 delete_local, 0 delete_remote, 2 skip, 1 conflict
+U  notes/a.md
+D  notes/b.md
+*  notes/c.md    conflict_mtime_size
+S  notes/
 ```
 
 ### JSON (`--json`)
