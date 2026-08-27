@@ -47,9 +47,9 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
             reject_trailing(&rest[1..], "check")?;
             Ok(Command::Check)
         }
-        "status" => parse_vault_cmd(&rest[1..], None),
-        "push" => parse_vault_cmd(&rest[1..], Some(Mode::Push)),
-        "pull" => parse_vault_cmd(&rest[1..], Some(Mode::Pull)),
+        "status" => parse_vault_cmd(&rest[1..], Mode::Status),
+        "push" => parse_vault_cmd(&rest[1..], Mode::Push),
+        "pull" => parse_vault_cmd(&rest[1..], Mode::Pull),
         other => Err(format!("unknown command: {other}\n{USAGE}")),
     }
 }
@@ -62,22 +62,34 @@ fn reject_trailing(rest_tail: &[String], cmd: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Shared flag parser for status/push/pull.
-fn parse_vault_cmd(tail: &[String], mode: Option<Mode>) -> Result<Command, String> {
+/// Shared flag parser for status/push/pull. The mode is known at the call
+/// site, so it is passed directly (no `Option<Mode>` + `unreachable!()` arm).
+fn parse_vault_cmd(tail: &[String], mode: Mode) -> Result<Command, String> {
     let mut vault = PathBuf::from(".");
+    let mut vault_seen = false;
     let mut delete = false;
     let mut i = 0;
     while i < tail.len() {
         match tail[i].as_str() {
             "--vault" => {
+                if vault_seen {
+                    return Err("repeated --vault flag".to_string());
+                }
+                vault_seen = true;
                 i += 1;
                 if i >= tail.len() {
                     return Err("--vault requires a path argument".to_string());
                 }
-                vault = PathBuf::from(&tail[i]);
+                let tok = &tail[i];
+                if tok.is_empty() || tok.starts_with('-') {
+                    return Err(format!(
+                        "--vault requires a path argument, got {tok:?}\n{USAGE}"
+                    ));
+                }
+                vault = PathBuf::from(tok);
             }
             "--delete" => {
-                if mode.is_none() {
+                if mode == Mode::Status {
                     // Status mode never emits Delete rows; accepting then silently
                     // discarding the flag is worse than rejecting it outright.
                     return Err("--delete is only valid for push/pull, not status".to_string());
@@ -87,11 +99,11 @@ fn parse_vault_cmd(tail: &[String], mode: Option<Mode>) -> Result<Command, Strin
             other => {
                 return Err(format!(
                     "unknown flag for {}: {other}\n{USAGE}",
-                    mode.map_or("status", |m| match m {
+                    match mode {
                         Mode::Status => "status",
                         Mode::Push => "push",
                         Mode::Pull => "pull",
-                    })
+                    }
                 ));
             }
         }
@@ -99,10 +111,9 @@ fn parse_vault_cmd(tail: &[String], mode: Option<Mode>) -> Result<Command, Strin
     }
 
     match mode {
-        None => Ok(Command::Status { vault }),
-        Some(Mode::Push) => Ok(Command::Push { vault, delete }),
-        Some(Mode::Pull) => Ok(Command::Pull { vault, delete }),
-        Some(Mode::Status) => unreachable!(),
+        Mode::Status => Ok(Command::Status { vault }),
+        Mode::Push => Ok(Command::Push { vault, delete }),
+        Mode::Pull => Ok(Command::Pull { vault, delete }),
     }
 }
 
@@ -250,6 +261,47 @@ mod tests {
             Command::Status {
                 vault: PathBuf::from(".")
             }
+        );
+    }
+
+    #[test]
+    fn parse_vault_rejects_flag_like_value() {
+        // `--vault` must not swallow a following flag-looking token as its
+        // path value (R3/B2: `--delete` was silently consumed as a path).
+        let mut args = a();
+        args.push("push".into());
+        args.push("--vault".into());
+        args.push("--delete".into());
+        let msg = parse_args(&args).unwrap_err();
+        assert!(msg.contains("--vault"), "msg: {msg}");
+
+        let mut args = a();
+        args.push("status".into());
+        args.push("--vault".into());
+        args.push("-o".into());
+        assert!(parse_args(&args).is_err());
+
+        // missing value still errors
+        let mut args = a();
+        args.push("push".into());
+        args.push("--vault".into());
+        assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn parse_repeated_vault_flag_errors() {
+        // Repeated `--vault` is a parse error (fail loud over silent
+        // last-wins).
+        let mut args = a();
+        args.push("push".into());
+        args.push("--vault".into());
+        args.push("/a".into());
+        args.push("--vault".into());
+        args.push("/b".into());
+        let msg = parse_args(&args).unwrap_err();
+        assert!(
+            msg.contains("repeated") || msg.contains("duplicate"),
+            "msg: {msg}"
         );
     }
 

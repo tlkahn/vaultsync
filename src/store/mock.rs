@@ -3,7 +3,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::entity::Entity;
 use crate::error::Error;
@@ -18,16 +17,19 @@ struct MockObject {
 
 /// In-memory store. Files live in a map; folders are synthesized on `list`
 /// from file-key parents, matching the "no folder objects" remote default.
+///
+/// Etags are content-derived (FNV-1a-64 over stored bytes, lowercase hex), so
+/// they are comparable across store instances and processes: same content
+/// yields the same etag, different content yields different etags. The planner
+/// still treats etags as opaque (Phase 1 never compares them).
 pub struct MemoryStore {
     objects: Mutex<HashMap<String, MockObject>>,
-    next_etag: AtomicU64,
 }
 
 impl MemoryStore {
     pub fn new() -> Self {
         MemoryStore {
             objects: Mutex::new(HashMap::new()),
-            next_etag: AtomicU64::new(1),
         }
     }
 
@@ -62,6 +64,16 @@ fn read_exact_n(r: &mut dyn Read, n: usize) -> std::io::Result<Vec<u8>> {
     let mut buf = vec![0u8; n];
     r.read_exact(&mut buf)?;
     Ok(buf)
+}
+
+/// FNV-1a 64-bit hash over a byte slice (std-only, no crates).
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 impl ObjectStore for MemoryStore {
@@ -131,7 +143,7 @@ impl ObjectStore for MemoryStore {
             )));
         }
         let bytes = read_exact_n(r, size as usize)?;
-        let etag = format!("etag-{}", self.next_etag.fetch_add(1, Ordering::Relaxed));
+        let etag = format!("{:016x}", fnv1a(&bytes));
         let obj = MockObject {
             bytes,
             mtime_ms,
@@ -178,6 +190,17 @@ mod tests {
         let mut buf = Vec::new();
         store.get_to(key, &mut buf)?;
         Ok(String::from_utf8(buf).unwrap())
+    }
+
+    #[test]
+    fn mock_put_rejects_control_char_key() {
+        // `put_from` inherits the full `ensure_valid_key` rule set, including
+        // control chars (B1); nothing must be stored on rejection.
+        let store = new_store();
+        let mut cursor = std::io::Cursor::new(b"x".to_vec());
+        let err = store.put_from("a/\nb", &mut cursor, 1, None).unwrap_err();
+        assert!(matches!(err, Error::InvalidKey(_)));
+        assert_eq!(store.list("").unwrap(), Vec::<Entity>::new());
     }
 
     #[test]
@@ -335,6 +358,61 @@ mod tests {
         let folder = all.iter().find(|e| e.key == "notes/").expect("folder");
         assert_eq!(folder.size, 0);
         assert!(folder.is_folder());
+    }
+
+    #[test]
+    fn mock_etag_differs_for_different_content_across_stores() {
+        // Two fresh store instances, different content: etags must differ
+        // (content-derived, not a per-instance counter).
+        let s1 = new_store();
+        let s2 = new_store();
+        let e1 = put_str(&s1, "f.md", "foo", None).unwrap();
+        let e2 = put_str(&s2, "f.md", "bar", None).unwrap();
+        assert_ne!(e1.etag, e2.etag);
+    }
+
+    #[test]
+    fn mock_etag_stable_for_same_content() {
+        // Re-putting identical content must yield the same etag (content-derived).
+        let store = new_store();
+        let first = put_str(&store, "g.md", "same", None).unwrap();
+        let second = put_str(&store, "g.md", "same", None).unwrap();
+        assert_eq!(first.etag, second.etag);
+    }
+
+    #[test]
+    fn mock_etag_equal_for_same_content_across_stores() {
+        // Same content on two fresh stores: equal etags (property Phase 2
+        // cross-store fixtures rely on).
+        let s1 = new_store();
+        let s2 = new_store();
+        let e1 = put_str(&s1, "h.md", "same", None).unwrap();
+        let e2 = put_str(&s2, "h.md", "same", None).unwrap();
+        assert_eq!(e1.etag, e2.etag);
+    }
+
+    #[test]
+    fn mock_folder_keys_are_not_object_targets() {
+        // `list` synthesizes folder views; folder keys are not objects.
+        // head/get_to/delete must answer NotFound for them (locks the
+        // A-low-1/B3 contract; callers branch on Entity::is_folder()).
+        let store = new_store();
+        put_str(&store, "notes/a.md", "a", None).unwrap();
+        let all = store.list("").unwrap();
+        assert!(all.iter().any(|e| e.key == "notes/"));
+        assert!(matches!(
+            store.head("notes/").unwrap_err(),
+            Error::NotFound(_)
+        ));
+        let mut buf = Vec::new();
+        assert!(matches!(
+            store.get_to("notes/", &mut buf).unwrap_err(),
+            Error::NotFound(_)
+        ));
+        assert!(matches!(
+            store.delete("notes/").unwrap_err(),
+            Error::NotFound(_)
+        ));
     }
 
     #[test]

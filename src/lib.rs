@@ -17,6 +17,11 @@ use crate::plan::{ActionKind, Mode, Plan, PlanOpts};
 use crate::store::ObjectStore;
 
 /// Build a [`Plan`] from a local walk + a store listing.
+///
+/// Remote list keys are validated with `ensure_valid_key` before planning
+/// (fail closed): an escaping or control-char key from the store never becomes
+/// a planned action. `plan()` itself stays pure (fixtures may feed it
+/// anything).
 pub fn build_plan(
     local: &LocalFs,
     store: &dyn ObjectStore,
@@ -25,6 +30,9 @@ pub fn build_plan(
 ) -> Result<Plan, Error> {
     let local_entities = local.list()?;
     let remote_entities = store.list("")?;
+    for e in &remote_entities {
+        crate::entity::ensure_valid_key(&e.key)?;
+    }
     Ok(plan::plan(&local_entities, &remote_entities, mode, opts))
 }
 
@@ -114,10 +122,86 @@ pub(crate) mod testutil {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entity::Entity;
     use crate::plan::{ActionKind, PlanOpts};
     use crate::store::ObjectStore;
     use crate::store::mock::MemoryStore;
     use crate::testutil::TempDir;
+
+    /// Minimal store stub whose `list` returns seeded entities; object ops
+    /// always `NotFound`. Used to exercise `build_plan`'s remote ingest
+    /// validation without pulling in a real store.
+    struct StubStore {
+        listed: Vec<Entity>,
+    }
+
+    impl ObjectStore for StubStore {
+        fn list(&self, _prefix: &str) -> Result<Vec<Entity>, Error> {
+            Ok(self.listed.clone())
+        }
+        fn head(&self, key: &str) -> Result<Entity, Error> {
+            Err(Error::NotFound(key.to_string()))
+        }
+        fn get_to(&self, key: &str, _w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            Err(Error::NotFound(key.to_string()))
+        }
+        fn put_from(
+            &self,
+            _key: &str,
+            _r: &mut dyn std::io::Read,
+            _size: u64,
+            _mtime_ms: Option<u64>,
+        ) -> Result<Entity, Error> {
+            Err(Error::Other("stub".to_string()))
+        }
+        fn delete(&self, key: &str) -> Result<(), Error> {
+            Err(Error::NotFound(key.to_string()))
+        }
+    }
+
+    #[test]
+    fn build_plan_rejects_invalid_remote_key() {
+        // Remote list keys must pass `ensure_valid_key` before any plan is
+        // built (fail closed): an escaping or control-char key must never
+        // become a planned action.
+        let dir = TempDir::new("vaultsync-lib-test");
+        let local = LocalFs::new(dir.path());
+        for bad in ["../evil.md", "a/\nb.md"] {
+            let store = StubStore {
+                listed: vec![crate::entity::file(bad, 1, Some(1))],
+            };
+            let err = build_plan(&local, &store, Mode::Status, &PlanOpts::default()).unwrap_err();
+            assert!(matches!(err, Error::InvalidKey(_)), "key {bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn build_plan_accepts_remote_folder_entities() {
+        // Folder views (trailing `/`) from a remote listing must still pass
+        // validation and plan as Skip `folder`.
+        let dir = TempDir::new("vaultsync-lib-test");
+        let local = LocalFs::new(dir.path());
+        let store = StubStore {
+            listed: vec![
+                crate::entity::folder("notes"),
+                crate::entity::file("notes/a.md", 1, Some(1)),
+            ],
+        };
+        let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default()).unwrap();
+        let folder_act = p
+            .actions
+            .iter()
+            .find(|a| a.key == "notes/")
+            .expect("folder entity present");
+        assert_eq!(folder_act.kind, ActionKind::Skip);
+        assert_eq!(folder_act.reason, "folder");
+        let file_act = p
+            .actions
+            .iter()
+            .find(|a| a.key == "notes/a.md")
+            .expect("file entity present");
+        assert_eq!(file_act.kind, ActionKind::Download);
+    }
 
     fn put_str(store: &MemoryStore, key: &str, body: &str, mtime: u64) {
         let mut cursor = std::io::Cursor::new(body.as_bytes().to_vec());
@@ -211,6 +295,25 @@ mod tests {
         assert!(txt.lines().any(|l| l.starts_with("U  a.md")));
         assert!(txt.lines().any(|l| l.starts_with("D  b.md")));
         assert!(txt.lines().any(|l| l.starts_with("*  c.md")));
+    }
+
+    #[test]
+    fn folder_mtime_asymmetry_is_intentional() {
+        // Local folder entities carry real mtimes; mock/remote synthesized
+        // folders use `None`. Asymmetry is intentional (decision row
+        // P1r4-folder-mtime): Phase 2 must not compare folder mtimes across
+        // sides.
+        let dir = TempDir::new("vaultsync-lib-test");
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        let local_ents = LocalFs::new(dir.path()).list().unwrap();
+        let local_folder = local_ents.iter().find(|e| e.key == "notes/").unwrap();
+        assert!(local_folder.mtime_ms.is_some());
+
+        let store = MemoryStore::new();
+        put_str(&store, "notes/a.md", "x", 1000);
+        let remote_ents = store.list("").unwrap();
+        let remote_folder = remote_ents.iter().find(|e| e.key == "notes/").unwrap();
+        assert_eq!(remote_folder.mtime_ms, None);
     }
 
     /// Mirrors the roadmap exit sentence: status against a mock store in a

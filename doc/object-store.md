@@ -6,36 +6,33 @@ Isolate provider SDKs behind a tiny trait so the planner never imports S3 types.
 
 ## Trait (normative sketch)
 
-Names are Rust-ish; adjust to final code style.
+Names are Rust-ish; adjust to final code style. Sketch matches the shipped
+surface in `src/store/mod.rs`.
 
 ```rust
-/// Object key relative to the configured prefix. No leading slash.
-/// Folders end with '/'.
-pub type Key = String;
-
-pub struct ObjectMeta {
-    pub key: Key,
-    pub size: u64,
+pub struct Entity {
+    pub key: String,       // vault-relative; no leading '/'; folders end with '/'
+    pub size: u64,         // bytes; 0 for folders
     pub mtime_ms: Option<u64>,
     pub etag: Option<String>,
-    pub content_type: Option<String>,
 }
 
 pub trait ObjectStore {
-    fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>>;
-    fn head(&self, key: &str) -> Result<ObjectMeta>;
-    fn get(&self, key: &str) -> Result<Vec<u8>>; // streaming API later if needed
-    fn put(&self, key: &str, body: &[u8], mtime_ms: Option<u64>) -> Result<ObjectMeta>;
+    fn list(&self, prefix: &str) -> Result<Vec<Entity>>;          // folders synthesized from prefixes
+    fn head(&self, key: &str) -> Result<Entity>;
+    fn get_to(&self, key: &str, w: &mut dyn Write) -> Result<Entity>;   // streaming
+    fn put_from(&self, key: &str, r: &mut dyn Read, size: u64, mtime_ms: Option<u64>) -> Result<Entity>; // streaming
     fn delete(&self, key: &str) -> Result<()>;
 }
 ```
 
-**Locked:** expose **streaming in the trait from day one**. Buffered `Vec<u8>` helpers may wrap the streaming API for small files and tests, but the planner/executor talk to streaming methods so large PDF/PNG objects never force a trait break:
+**Locked:** expose **streaming in the trait from day one** (`get_to` /
+`put_from`). Buffered `Vec<u8>` helpers may wrap the streaming API for small
+files and tests, but the planner/executor talk to streaming methods so large
+PDF/PNG objects never force a trait break.
 
-```rust
-fn get_to(&self, key: &str, w: &mut dyn Write) -> Result<ObjectMeta>;
-fn put_from(&self, key: &str, r: &mut dyn Read, size: u64, mtime_ms: Option<u64>) -> Result<ObjectMeta>;
-```
+There is no `content_type` field on `Entity` in v1; Content-Type handling (if
+any) is backend-side only (post-v1 if it becomes a trait concern).
 
 Async shape (`AsyncRead` / `AsyncWrite`) is allowed if the S3 spike selects an async SDK; keep the same streaming responsibility either way.
 
@@ -68,8 +65,8 @@ Practical options (pick in Phase 2 spike, not earlier):
 | ----- | ------ |
 | list | `ListObjectsV2` paginated; synthesize folder prefixes from `CommonPrefixes` if delimiter `/` is used, or derive from keys |
 | head | `HeadObject` |
-| get | `GetObject` |
-| put | `PutObject` (multipart only if size > threshold; can defer multipart to v1.1) |
+| get_to | `GetObject` (stream body into the caller's writer) |
+| put_from | `PutObject` (multipart only if size > threshold; can defer multipart to v1.1) |
 | delete | `DeleteObject` (batch delete later) |
 
 ### Metadata
@@ -121,7 +118,7 @@ Both should implement the same `ObjectStore` trait. No planner changes.
 
 In-memory or temp-dir-backed `ObjectStore` for tests:
 
-- `list`/`get`/`put`/`delete` over a `HashMap` or local sandbox folder
+- `list`/`head`/`get_to`/`put_from`/`delete` over a `HashMap` or local sandbox folder
 - used by planner/executor tests without network
 
 ## Errors

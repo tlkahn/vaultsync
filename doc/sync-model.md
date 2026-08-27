@@ -48,7 +48,7 @@ Two entities are **equal enough to skip** when:
 
 **mtime tolerance:** default 1 second (S3 and some FS round to seconds). Borrowed lesson from remotely-save S3/Dropbox second rounding.
 
-**etag:** if both sides have a comparable content hash/etag and they match, treat as equal even if mtime drifts (`--trust-etag` maybe later). v1 may use etag only as remote opaque token after upload, not as local hash, to avoid hashing every file on large vaults unless `--checksum` is set.
+**etag:** if both sides have a comparable content hash/etag and they match, treat as equal even if mtime drifts (`--trust-etag` maybe later). v1 may use etag only as remote opaque token after upload, not as local hash, to avoid hashing every file on large vaults unless `--checksum` is set. Mock etags are content-derived (FNV-1a), so cross-store fixtures compare meaningfully.
 
 ### Newer
 
@@ -120,9 +120,11 @@ Plan {
   actions: [
     { key, kind: Upload|Download|DeleteLocal|DeleteRemote|Skip|Conflict, reason, local?, remote? }
   ]
-  stats: { upload, download, delete_local, delete_remote, skip, conflict, bytes_in, bytes_out }
+  stats: { upload, download, delete_local, delete_remote, skip, conflict }
 }
 ```
+
+(`bytes_in`/`bytes_out` are post-v1; Phase 1 stats are action counts only.)
 
 `status` prints this. `push`/`pull` build the same plan then execute the subset allowed by mode.
 

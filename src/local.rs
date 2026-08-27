@@ -1,4 +1,15 @@
 //! Local filesystem walker: turns a vault directory tree into [`Entity`] keys.
+//!
+//! Walker omissions (Phase 1, all silent and by design):
+//! - symlinks - files **and** directories - are skipped entirely
+//!   (`--follow-symlinks` is a Phase 2 policy decision, P1r4-symlink);
+//! - device / FIFO / socket nodes are skipped (only `is_dir` / `is_file`
+//!   entries are emitted);
+//! - entries that vanish mid-walk (`NotFound`) are skipped; other IO errors
+//!   (e.g. permission) abort the walk loudly;
+//! - a local file whose name fails key validation (now including control
+//!   chars and whitespace-only segments, P1r4-key-ctl) fails the walk loud
+//!   instead of emitting a corrupt key.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,6 +35,10 @@ impl LocalFs {
     /// - symlinks are skipped
     /// - mtime/size come from `fs::metadata`
     pub fn list(&self) -> Result<Vec<Entity>, Error> {
+        // The root itself must exist: a missing vault is a loud error, not an
+        // empty plan. `walk` tolerates `NotFound` only for directories
+        // discovered mid-walk (vanished between enumeration and recursion).
+        let _ = std::fs::metadata(&self.root)?;
         let mut out = Vec::new();
         walk(&self.root, &self.root, &mut out)?;
         out.sort_by(|a, b| a.key.cmp(&b.key));
@@ -32,9 +47,25 @@ impl LocalFs {
 }
 
 fn walk(dir: &Path, root: &Path, out: &mut Vec<Entity>) -> Result<(), Error> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let ft = entry.file_type()?;
+    // `NotFound` here means the directory vanished after its parent
+    // enumerated it (or between `read_dir` and first use): skip silently.
+    // All other IO errors (permission, etc.) stay fatal.
+    let read_dir = match std::fs::read_dir(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+        Ok(rd) => rd,
+    };
+    for entry in read_dir {
+        let entry = match entry {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+            Ok(e) => e,
+        };
+        let ft = match entry.file_type() {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+            Ok(ft) => ft,
+        };
         if ft.is_symlink() {
             continue;
         }
@@ -46,24 +77,50 @@ fn walk(dir: &Path, root: &Path, out: &mut Vec<Entity>) -> Result<(), Error> {
 
         if ft.is_dir() {
             let key = format!("{key}/");
-            out.push(Entity {
-                key,
-                size: 0,
-                mtime_ms: mtime_of(&path)?,
-                etag: None,
-            });
+            if let Some(e) = folder_entity(&path, &key)? {
+                out.push(e);
+            }
             walk(&path, root, out)?;
-        } else if ft.is_file() {
-            let md = std::fs::metadata(&path)?;
-            out.push(Entity {
-                key,
-                size: md.len(),
-                mtime_ms: mtime_of(&path)?,
-                etag: None,
-            });
+        } else if ft.is_file()
+            && let Some(e) = file_entity(&path, &key)?
+        {
+            out.push(e);
         }
     }
     Ok(())
+}
+
+/// Stat a single directory into an entity, tolerating `NotFound` (the
+/// directory vanished between enumeration and stat). All other IO errors stay
+/// fatal.
+fn folder_entity(path: &Path, key: &str) -> Result<Option<Entity>, Error> {
+    let md = match std::fs::metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+        Ok(md) => md,
+    };
+    Ok(Some(Entity {
+        key: key.to_string(),
+        size: 0,
+        mtime_ms: mtime_of(&md),
+        etag: None,
+    }))
+}
+
+/// Stat a single file into an entity, tolerating `NotFound` (the entry
+/// vanished between `read_dir` and the stat). All other IO errors stay fatal.
+fn file_entity(path: &Path, key: &str) -> Result<Option<Entity>, Error> {
+    let md = match std::fs::metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+        Ok(md) => md,
+    };
+    Ok(Some(Entity {
+        key: key.to_string(),
+        size: md.len(),
+        mtime_ms: mtime_of(&md),
+        etag: None,
+    }))
 }
 
 /// Build a vault-relative key from an already-stripped path, normalizing to
@@ -75,18 +132,24 @@ fn path_to_key(rel: &Path) -> Result<String, Error> {
     Ok(key)
 }
 
-fn mtime_of(path: &Path) -> Result<Option<u64>, Error> {
-    let md = std::fs::metadata(path)?;
+/// Client-visible mtime in ms since epoch from a `Metadata` already in hand
+/// (size and mtime come from the same stat; no second syscall).
+fn mtime_of(md: &std::fs::Metadata) -> Option<u64> {
     match md.modified() {
-        Ok(t) => Ok(system_time_to_ms(t)),
-        Err(_) => Ok(None),
+        Ok(t) => system_time_to_ms(t),
+        Err(_) => None,
     }
 }
 
+/// Convert a `SystemTime` to ms since epoch. Pre-epoch times saturate to
+/// `Some(0)` (known, very old) rather than collapsing to `None`; `None` again
+/// means only "the FS could not provide an mtime".
 fn system_time_to_ms(t: SystemTime) -> Option<u64> {
-    t.duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .ok()
+    Some(
+        t.duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    )
 }
 
 #[cfg(test)]
@@ -162,6 +225,102 @@ mod tests {
         let ks = keys(&fs);
         assert!(ks.contains(&"real.txt".to_string()));
         assert!(!ks.iter().any(|k| k == "link.txt"), "symlink not skipped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_skips_symlinked_directories() {
+        // A symlink to an outside directory is skipped entirely: neither the
+        // link itself nor its children appear (B5; `--follow-symlinks` is a
+        // Phase 2 policy). Sibling real files still list.
+        let dir = TempDir::new("vaultsync-test");
+        let outside = TempDir::new("vaultsync-outside");
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+        std::fs::write(outside.join("sub/deep.md"), "d").unwrap();
+        std::os::unix::fs::symlink(outside.join("sub"), dir.join("linkdir")).unwrap();
+        std::fs::write(dir.join("real.md"), "r").unwrap();
+        let fs = LocalFs::new(dir.path());
+        let ks = keys(&fs);
+        assert!(ks.contains(&"real.md".to_string()));
+        assert!(
+            !ks.iter()
+                .any(|k| k == "linkdir" || k.starts_with("linkdir/")),
+            "symlinked dir not skipped: {ks:?}"
+        );
+    }
+
+    #[test]
+    fn walk_file_entity_missing_returns_none() {
+        // A file that vanishes between `read_dir` and the stat (TOCTOU) must
+        // be skipped, not abort the whole walk (A3).
+        let dir = TempDir::new("vaultsync-test");
+        let missing = dir.join("gone.md");
+        assert!(!missing.exists());
+        let got = file_entity(&missing, "gone.md").unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn walk_skips_vanished_subdir() {
+        // A directory that vanishes before its `read_dir` runs (TOCTOU) must
+        // be skipped, not abort the walk (A3). Driven at the walk level: a
+        // missing subdir path yields Ok with nothing pushed.
+        let dir = TempDir::new("vaultsync-test");
+        let missing_sub = dir.join("sub");
+        assert!(!missing_sub.exists());
+        let mut out = Vec::new();
+        walk(&missing_sub, &dir, &mut out).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_non_notfound_errors_still_fail() {
+        // Permission errors are not swallowed: a readable-then-locked subdir
+        // aborts the walk (only `NotFound` is tolerated as "vanished").
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("vaultsync-test");
+        let sub = dir.join("locked");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("x.md"), "x").unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let fs = LocalFs::new(dir.path());
+        let res = fs.list();
+        // restore before TempDir drop so cleanup can remove the tree
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(res.is_err(), "expected permission error, got {res:?}");
+    }
+
+    #[test]
+    fn system_time_to_ms_saturates_pre_epoch() {
+        // Pre-1970 times saturate to Some(0) (known, very old) instead of
+        // collapsing to None ("unknown mtime"). Post-epoch values unchanged.
+        let pre = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        assert_eq!(system_time_to_ms(pre), Some(0));
+        let post = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1234);
+        assert_eq!(system_time_to_ms(post), Some(1234));
+    }
+
+    #[test]
+    fn local_pre_epoch_file_mtime_saturates_zero() {
+        // End-to-end: a file with a 1955 mtime walks as `mtime_ms: Some(0)`
+        // (A4). std-only `FileTimes` (stable since 1.75).
+        let dir = TempDir::new("vaultsync-test");
+        let f = dir.join("old.md");
+        std::fs::write(&f, "old").unwrap();
+        let pre_epoch =
+            std::time::UNIX_EPOCH - std::time::Duration::from_secs(60 * 60 * 24 * 365 * 15);
+        let times = std::fs::FileTimes::new().set_modified(pre_epoch);
+        std::fs::File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+        let fs = LocalFs::new(dir.path());
+        let ents = fs.list().unwrap();
+        let old = ents.iter().find(|e| e.key == "old.md").unwrap();
+        assert_eq!(old.mtime_ms, Some(0));
     }
 
     #[test]

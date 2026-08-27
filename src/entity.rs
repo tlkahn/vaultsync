@@ -14,7 +14,9 @@ pub struct Entity {
     pub size: u64,
     /// Client-visible mtime in ms since epoch, when known.
     pub mtime_ms: Option<u64>,
-    /// Remote opaque token (etag) when known.
+    /// Remote opaque token (etag) when known. Content-derived in the mock
+    /// (FNV-1a); the planner treats it as opaque (Phase 1 never compares
+    /// etags).
     pub etag: Option<String>,
 }
 
@@ -44,6 +46,11 @@ pub fn ensure_valid_key(key: &str) -> Result<(), Error> {
             "key must not contain backslash: {key:?}"
         )));
     }
+    if key.chars().any(char::is_control) {
+        return Err(Error::InvalidKey(format!(
+            "key must not contain control characters: {key:?}"
+        )));
+    }
 
     let segments: Vec<&str> = key.split('/').collect();
     for (i, seg) in segments.iter().enumerate() {
@@ -55,6 +62,11 @@ pub fn ensure_valid_key(key: &str) -> Result<(), Error> {
         if seg.is_empty() {
             return Err(Error::InvalidKey(format!(
                 "key contains an empty path segment: {key:?}"
+            )));
+        }
+        if seg.chars().all(char::is_whitespace) {
+            return Err(Error::InvalidKey(format!(
+                "key contains a whitespace-only path segment: {key:?}"
             )));
         }
         if seg == "." || seg == ".." {
@@ -173,6 +185,30 @@ mod tests {
     fn entity_reject_backslash() {
         let err = ensure_valid_key("a\\b").unwrap_err();
         assert!(matches!(err, Error::InvalidKey(_)));
+    }
+
+    #[test]
+    fn entity_reject_control_chars() {
+        // Control characters (NUL, LF, CR, TAB, DEL, ...) anywhere in the key
+        // are rejected: they break human output rows and are never needed in
+        // vault keys.
+        for key in ["a/\nb", "a/\tb.md", "a/\rb", "a\u{0}b", "a\u{7f}b"] {
+            let err = ensure_valid_key(key).unwrap_err();
+            assert!(matches!(err, Error::InvalidKey(_)), "key {key:?}");
+        }
+    }
+
+    #[test]
+    fn entity_reject_whitespace_only_segment() {
+        // A segment consisting entirely of whitespace is rejected (invisible
+        // key component). Segments with leading/trailing spaces but real
+        // content stay valid (real vaults contain them; S3 stores them fine).
+        for key in ["a/ /b", " /a.md", "a/ ", "\t"] {
+            let err = ensure_valid_key(key).unwrap_err();
+            assert!(matches!(err, Error::InvalidKey(_)), "key {key:?}");
+        }
+        assert!(ensure_valid_key("a/ b.md").is_ok());
+        assert!(ensure_valid_key("a/b ").is_ok());
     }
 
     #[test]

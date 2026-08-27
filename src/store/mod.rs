@@ -20,6 +20,12 @@ pub trait ObjectStore {
     /// Folders are synthesized from key prefixes when no folder marker object
     /// exists. Results are sorted by key.
     ///
+    /// Contract: `list` may return folder keys that exist only as prefixes
+    /// (folder *views*, trailing `/`, `Entity::is_folder()` true). Such keys
+    /// are not objects: `head`/`get_to`/`delete` operate on object keys only
+    /// and return [`Error::NotFound`] for folder views. Callers must branch
+    /// on `Entity::is_folder()` (or filter) before object ops.
+    ///
     /// `prefix` is a raw string prefix, **not** a delimiter-aligned path
     /// segment. Callers that want only the contents of a folder must pass a
     /// trailing `/` (e.g. `notes/`); passing `notes` will also match `notes.md`
@@ -31,6 +37,13 @@ pub trait ObjectStore {
     fn get_to(&self, key: &str, w: &mut dyn Write) -> Result<Entity, Error>;
     /// Store exactly `size` bytes read from `r`. File keys only: a trailing
     /// `/` (folder marker) is rejected with [`Error::InvalidKey`].
+    ///
+    /// Contract: exactly `size` bytes are consumed and stored. A reader that
+    /// ends early errors loudly (`UnexpectedEof`); bytes beyond `size` in the
+    /// reader are ignored (normal `Read` semantics - the reader is read up to
+    /// `size`, no more). Backends must not grow this into silent partial puts:
+    /// the Phase 2 executor re-verifies transferred size at read time
+    /// (checklist R3.3), and mock behavior matches the contract.
     fn put_from(
         &self,
         key: &str,

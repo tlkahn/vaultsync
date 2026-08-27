@@ -57,9 +57,11 @@ Entity {
   size         # bytes; 0 for folders
   mtime_ms     # client-visible mtime when known
   etag         # remote opaque version token when known
-  side         # Local | Remote (or implied by which list)
 }
 ```
+
+(No `side` field: which side an entity belongs to is implied by which list
+produced it.)
 
 Rules:
 
@@ -85,13 +87,14 @@ Must not:
 
 ### 3. Object store
 
-See [object-store.md](./object-store.md). Trait roughly:
+See [object-store.md](./object-store.md). Trait (streaming from day one,
+matching `src/store/mod.rs`):
 
 ```text
 list(prefix) -> Vec<Entity>
 head(key) -> Entity
-get(key) -> bytes
-put(key, bytes, mtime_ms) -> Entity
+get_to(key, w) -> Entity        # stream body into w
+put_from(key, r, size, mtime_ms) -> Entity   # store exactly size bytes from r
 delete(key) -> ()
 ```
 

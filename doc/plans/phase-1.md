@@ -638,7 +638,7 @@ Use this as the working board; tick in PRs or locally.
 - [x] Slice 5 - `build_plan` / `status_with_store` / human formatter
 - [x] Slice 6 - argv parse + `run_with_io` exit codes + push/pull stubs
 - [x] Slice 7 - exit-criteria test + manual smoke
-- [x] `cargo test` green (101 tests)
+- [x] `cargo test` green (119 tests)
 - [x] `cargo run -- status --vault <temp>` dirty plan demo
 - [x] Update root `README.md` status blurb to "Phase 1 complete" when exit criteria pass (done, 2026-08-27)
 - [x] Optionally tick Phase 1 boxes in `doc/roadmap.md` when done (done)

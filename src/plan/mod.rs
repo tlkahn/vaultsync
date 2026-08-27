@@ -15,7 +15,7 @@ pub enum Mode {
 }
 
 /// Planner options.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct PlanOpts {
     /// mtime difference (ms) treated as "equal". Default 1000.
     pub mtime_tolerance_ms: u64,
@@ -141,6 +141,18 @@ fn classify_pair(local: Option<&Entity>, remote: Option<&Entity>, tol: u64) -> D
 pub fn plan(local: &[Entity], remote: &[Entity], mode: Mode, opts: &PlanOpts) -> Plan {
     let local_map: HashMap<&str, &Entity> = local.iter().map(|e| (e.key.as_str(), e)).collect();
     let remote_map: HashMap<&str, &Entity> = remote.iter().map(|e| (e.key.as_str(), e)).collect();
+    // Duplicate input keys currently last-win silently in the map; assert the
+    // contract that plan inputs are deduplicated so the behavior cannot creep.
+    debug_assert_eq!(
+        local_map.len(),
+        local.len(),
+        "duplicate local keys in plan input"
+    );
+    debug_assert_eq!(
+        remote_map.len(),
+        remote.len(),
+        "duplicate remote keys in plan input"
+    );
 
     let mut keys: Vec<&str> = local_map.keys().chain(remote_map.keys()).copied().collect();
     keys.sort_unstable();
@@ -159,7 +171,6 @@ pub fn plan(local: &[Entity], remote: &[Entity], mode: Mode, opts: &PlanOpts) ->
             remote: rem.cloned(),
         });
     }
-    actions.sort_by(|a, b| a.key.cmp(&b.key));
 
     let mut stats = PlanStats::default();
     for a in &actions {
