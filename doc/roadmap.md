@@ -13,7 +13,7 @@
 - [x] Planner unit tests with fixture trees (no network)
 - [x] CLI stubs: `status`, `push`, `pull`, `check`, `version` printing help/plans against mock
 
-Exit criteria: `cargo test` green (135 tests); `vaultsync status` against mock store in a temp vault prints a correct plan.
+Exit criteria: `cargo test` green (138 tests); `vaultsync status` against mock store in a temp vault prints a correct plan.
 
 ## Phase 2 - Real local FS + S3
 
@@ -113,6 +113,9 @@ Record choices here as they are made.
 | 2026-08-27 | P1r6-mtime-zero | Amends P1r-mtime-none / P1r5-mtime-pull: pre-epoch mtimes saturate to `Some(0)`, indistinguishable from `None -> 0` in the classifier. Equal-size pairs skip on zero evidence; diff-size pairs conflict. Phase 2 etag comparison resolves; classify unchanged in Phase 1. |
 | 2026-08-27 | P1r6-windows-keys | `ensure_valid_key` accepts Windows-illegal names (device names `CON`/`NUL`/`aux`/`COM*`, trailing dot/space segments). Accepted as a platform caveat (macOS/Linux/S3 handle them); revisit with platform-aware validation or warnings at Windows-port time. |
 | 2026-08-27 | P1r6-root-symlink | A symlinked vault root is followed by design (`fs::metadata` on the root); only entries below the root skip symlinks. Locked by `local_list_follows_symlinked_root`. |
+| 2026-08-27 | P1r7-special-node-key | Walker validates keys only for emittable nodes (`is_dir`/`is_file`); special files (FIFO/socket/device) are skipped unconditionally, name never inspected. Files/dirs with invalid names still fail loud (P1r4-key-ctl). Locked by `local_list_skips_special_file_with_backslash_name`. |
+| 2026-08-27 | P1r7-delete-repeat | Repeated `--delete` is a parse error (fail loud), matching repeated `--vault` (P1r4-vault-value). Locked by `parse_repeated_delete_flag_errors`. |
+| 2026-08-27 | P1r7-parse-usage | Every `parse_args` error message ends with the USAGE block (uniform rule). Locked by `parse_errors_always_include_usage`. |
 
 ## Open decisions
 
@@ -124,6 +127,7 @@ Written down so they are not silently dropped. Do not implement in this fix PR.
 
 - [ ] File-vs-folder path collision: reject/Conflict a `K` file vs a `K/` folder (or children under a file key). P1r-type-collision.
 - [ ] Unknown-mtime policy: revisit `mtime None -> 0` when a real backend is present; consider Conflict when either side lacks mtime and sizes differ. P1r-mtime-none. Revisit must cover **pull-direction staleness** (remote `None` + local present classifies `local_newer`; Pull plans Skip and keeps local) and `status` visibility for None-mtime pairs (P1r5-mtime-pull).
+- [ ] **Etag-aware equality (P1r7):** within-tolerance same-size pairs currently classify `Equal` with zero content evidence; Phase 2 must decide the local-hash policy (`--checksum` / size-gated hashing / never) before any etag short-circuit, since local entities never carry etags today. Mock etags are content-derived (P1r4-etag), so the comparison is testable the moment a policy exists. Complements P1r6-mtime-zero.
 - [ ] Real `push`/`pull` exit codes: executor-era `push`/`pull` must return non-zero when the executed plan contained conflicts (sync-model: "non-zero exit if any conflict"); the Phase 1 stub's unconditional 0 is a placeholder locked by `run_push_stub_conflict_exit_0_placeholder`. P1r-stub-exit.
 - [ ] Force-flag combination surface: if/reopen how `--force-local --force-remote` is exposed at the CLI. Currently planner cancels both to Conflict. P1r-both-forces.
 - [ ] Real backend `put_from` must stream without the mock's `size as usize` full-buffer read. P1r-put-size.
@@ -131,13 +135,11 @@ Written down so they are not silently dropped. Do not implement in this fix PR.
 - [ ] **Remote key ingest validation (R2.2):** validate keys on list/head ingest (or once in `build_plan`) before any local path join. Control chars + ws-only segments are now rejected at `ensure_valid_key` and `build_plan` validates `list` output (P1r4-key-ctl, P1r4-remote-ingest); remaining executor work: validate `head` responses too, and route *all* local path construction through a single `key_to_local_path(vault, key) -> Result<PathBuf>` that validates before joining. Extends P1r-key-validation.
 - [ ] **Key identity across filesystems (A2/B4):** decide canonicalization before the real backend lands - NFC-normalize at emit/ingest vs preserve bytes; detect case-only collisions (`Note.md` vs `note.md`) in a plan preflight when the local volume is case-insensitive (Conflict or warn); document v1 key identity as case-sensitive / codepoint-exact.
 - [ ] **Symlink policy (P1r4-symlink):** `--follow-symlinks` (off by default) or a warn-side Skip reason for skipped symlinked dirs; Obsidian users symlink attachment folders.
-- [ ] **Non-UTF8 local names:** `path_to_key` currently `to_string_lossy()` (U+FFFD collision risk); decide fail-closed vs lossy for exotic volumes.
+- [ ] **Symlink-swap TOCTOU (P1r7):** walker and executor must defend against entry swaps between `file_type` (no-follow) and open - re-verify type at open time (or open with no-follow semantics); on download, resolve the real path and confirm it stays under the canonicalized vault root before writing. Pairs with R2.2 (`key_to_local_path` single join site).
 - [ ] **Folder mtime use:** folder mtimes are asymmetric by design (P1r4-folder-mtime); do not build Phase 2 logic on cross-side folder mtime comparison.
 - [ ] **Walker depth (Phase 3 note):** recursion is unbounded; add a depth cap or iterative walk during hardening, before executor-era deep trees (L3; next to the symlink-policy item).
 - [ ] **MSRV + CI (Phase 2/3 note):** pin `rust-version` and add a fmt/clippy/test workflow when CI exists.
 - [ ] **Executor `put_from` size verification (R3.3):** real backend/executor must **re-stat after read and fail on size/mtime mismatch** - not merely trust the declared size (a file that grew between walk and put would otherwise yield a silently truncated, self-consistent object). Extends P1r-put-size (mock "exactly size bytes" contract stays).
 - [ ] **Skip-row output policy (R3 low):** hide `S` rows by default or behind `-v` once vaults are large; Phase 1 fixtures may keep full print.
-- [ ] **`--vault` value hygiene (R3 low):** reject empty/flag-like (leading `-`) values (P1r4-vault-value); decide repeated `--vault` policy (error vs last-wins).
+- [x] **`--vault` value hygiene (R3 low):** landed - empty/flag-like (leading `-`) values rejected and repeated `--vault` is a parse error (P1r4-vault-value).
 - [ ] **`--vault` `-foo` escape hatch (P1r5):** support `--vault=<path>` and/or `--` so a vault literally named `-foo` is reachable. Documented tradeoff of P1r4-vault-value (leading `-` values rejected); clap migration note, not a Phase 1 defect (L4).
-
-Read-only decision-log rows: P1r-mtime-conflict, P1r-status-delete, P1r-key-validation, P1r-list-prefix.

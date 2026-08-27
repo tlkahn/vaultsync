@@ -6,8 +6,9 @@
 //! - a symlinked vault **root** is followed (`fs::metadata` on the root
 //!   resolves it); the symlink skip applies to entries below the root
 //!   (P1r6-root-symlink, locked by `local_list_follows_symlinked_root`);
-//! - device / FIFO / socket nodes are skipped (only `is_dir` / `is_file`
-//!   entries are emitted);
+//! - device / FIFO / socket nodes are skipped unconditionally (only
+//!   `is_dir` / `is_file` entries are emitted; their names are never
+//!   validated, since they are never emitted, P1r7-special-node-key);
 //! - entries that vanish mid-walk (`NotFound`) are skipped; other IO errors
 //!   (e.g. permission) abort the walk loudly;
 //! - a local file whose name fails key validation (now including control
@@ -84,18 +85,23 @@ fn walk(dir: &Path, root: &Path, out: &mut Vec<Entity>) -> Result<(), Error> {
         let rel = path
             .strip_prefix(root)
             .map_err(|_| Error::Other(format!("walk path escaped root: {}", path.display())))?;
-        let key = path_to_key(rel)?;
 
+        // Key construction/validation happens only for nodes that will be
+        // emitted. Special files (FIFO/socket/device) fall through both arms
+        // below with their names never inspected: they are always skipped, so
+        // an invalid name must not abort the walk (P1r7-special-node-key).
+        // Files/dirs with invalid names still fail loud (P1r4-key-ctl).
         if ft.is_dir() {
-            let key = format!("{key}/");
+            let key = format!("{}/", path_to_key(rel)?);
             if let Some(e) = folder_entity(&path, &key)? {
                 out.push(e);
             }
             walk(&path, root, out)?;
-        } else if ft.is_file()
-            && let Some(e) = file_entity(&path, &key)?
-        {
-            out.push(e);
+        } else if ft.is_file() {
+            let key = path_to_key(rel)?;
+            if let Some(e) = file_entity(&path, &key)? {
+                out.push(e);
+            }
         }
     }
     Ok(())
@@ -156,8 +162,10 @@ fn path_to_key(rel: &Path) -> Result<String, Error> {
                 })?;
                 segments.push(seg);
             }
-            // Defense in depth: `rel` is already root-stripped and relative,
-            // so none of these should appear; reject them rather than guess.
+            // Defense in depth: walker-produced `rel` (from `strip_prefix`)
+            // never starts with `.` and never contains an interior `.`, so a
+            // `CurDir` here would be a leading `./...`; `ParentDir`/`Prefix`/
+            // `RootDir` should not appear at all. Reject rather than guess.
             std::path::Component::ParentDir
             | std::path::Component::CurDir
             | std::path::Component::Prefix(_)
@@ -174,7 +182,9 @@ fn path_to_key(rel: &Path) -> Result<String, Error> {
 }
 
 /// Client-visible mtime in ms since epoch from a `Metadata` already in hand
-/// (size and mtime come from the same stat; no second syscall).
+/// (size and mtime come from the same stat; no second syscall). `None` is
+/// produced only when `md.modified()` fails - the conversion itself never
+/// returns `None` (pre-epoch saturates via `system_time_to_ms`).
 fn mtime_of(md: &std::fs::Metadata) -> Option<u64> {
     match md.modified() {
         Ok(t) => system_time_to_ms(t),
@@ -182,9 +192,10 @@ fn mtime_of(md: &std::fs::Metadata) -> Option<u64> {
     }
 }
 
-/// Convert a `SystemTime` to ms since epoch. Pre-epoch times saturate to
-/// `Some(0)` (known, very old) rather than collapsing to `None`; `None` again
-/// means only "the FS could not provide an mtime".
+/// Convert a `SystemTime` to ms since epoch. Always returns `Some`: pre-epoch
+/// times saturate to `Some(0)` (known, very old) rather than collapsing to
+/// `None`. The `Option` in the caller (`mtime_of`) is carried by
+/// `md.modified()` failing, not by this conversion.
 fn system_time_to_ms(t: SystemTime) -> Option<u64> {
     Some(
         t.duration_since(UNIX_EPOCH)
@@ -386,6 +397,27 @@ mod tests {
         let mut out = Vec::new();
         walk(&missing_sub, &dir, &mut out).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_list_skips_special_file_with_backslash_name() {
+        // A FIFO whose *name* contains a backslash must be skipped - its name
+        // is never validated because it is never emitted - while a real file
+        // in the same directory still lists (M1/P1r7-special-node-key).
+        use std::os::unix::ffi::OsStrExt;
+        let dir = TempDir::new("vaultsync-test");
+        let name = std::ffi::OsStr::from_bytes(b"a\\b.fifo");
+        let ok = std::process::Command::new("mkfifo")
+            .arg(dir.join(name))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "mkfifo unavailable or failed to create FIFO");
+        std::fs::write(dir.join("real.md"), "x").unwrap();
+        let fs = LocalFs::new(dir.path());
+        let ks = keys(&fs);
+        assert_eq!(ks, vec!["real.md".to_string()], "ks: {ks:?}");
     }
 
     #[cfg(unix)]

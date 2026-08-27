@@ -81,17 +81,18 @@ fn parse_vault_cmd(tail: &[String], mode: Mode) -> Result<Command, String> {
     let mut vault = PathBuf::from(".");
     let mut vault_seen = false;
     let mut delete = false;
+    let mut delete_seen = false;
     let mut i = 0;
     while i < tail.len() {
         match tail[i].as_str() {
             "--vault" => {
                 if vault_seen {
-                    return Err("repeated --vault flag".to_string());
+                    return Err(format!("repeated --vault flag\n{USAGE}"));
                 }
                 vault_seen = true;
                 i += 1;
                 if i >= tail.len() {
-                    return Err("--vault requires a path argument".to_string());
+                    return Err(format!("--vault requires a path argument\n{USAGE}"));
                 }
                 let tok = &tail[i];
                 if tok.is_empty() || tok.starts_with('-') {
@@ -105,8 +106,17 @@ fn parse_vault_cmd(tail: &[String], mode: Mode) -> Result<Command, String> {
                 if mode == Mode::Status {
                     // Status mode never emits Delete rows; accepting then silently
                     // discarding the flag is worse than rejecting it outright.
-                    return Err("--delete is only valid for push/pull, not status".to_string());
+                    return Err(format!(
+                        "--delete is only valid for push/pull, not status\n{USAGE}"
+                    ));
                 }
+                if delete_seen {
+                    // Repeated `--delete` is a parse error (fail loud over
+                    // silent idempotence), matching repeated `--vault`
+                    // (P1r4-vault-value). USAGE per the uniform rule (P1r7-parse-usage).
+                    return Err(format!("repeated --delete flag\n{USAGE}"));
+                }
+                delete_seen = true;
                 delete = true;
             }
             other => {
@@ -358,6 +368,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_repeated_delete_flag_errors() {
+        // Repeated `--delete` is a parse error (fail loud over silent
+        // idempotence), matching repeated `--vault` (P1r4-vault-value).
+        let mut args = a();
+        args.push("push".into());
+        args.push("--delete".into());
+        args.push("--delete".into());
+        let msg = parse_args(&args).unwrap_err();
+        assert!(msg.contains("repeated"), "msg: {msg}");
+        assert!(msg.contains("--delete"), "msg: {msg}");
+    }
+
+    #[test]
     fn parse_push_delete() {
         let mut args = a();
         args.push("push".into());
@@ -429,6 +452,31 @@ mod tests {
             msg.contains("unexpected") || msg.contains("unknown"),
             "clear hint missing: {msg}"
         );
+    }
+
+    #[test]
+    fn parse_errors_always_include_usage() {
+        // Uniform rule (P1r7-parse-usage): every `parse_args` error message
+        // ends with the USAGE block, matching the unknown-command / unknown-
+        // flag / trailing-token precedent.
+        let cases: Vec<Vec<&str>> = vec![
+            vec!["vaultsync", "foo"],                // unknown command
+            vec!["vaultsync", "status", "--json"],   // unknown flag
+            vec!["vaultsync", "status", "extra"],    // positional
+            vec!["vaultsync", "status", "--delete"], // status delete
+            vec!["vaultsync", "version", "--json"],  // trailing token
+            vec!["vaultsync", "push", "--vault", "/a", "--vault", "/b"], // repeated vault
+            vec!["vaultsync", "push", "--vault"],    // missing value
+            vec!["vaultsync", "push", "--delete", "--delete"], // repeated delete
+        ];
+        for args in cases {
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            let msg = parse_args(&args).unwrap_err();
+            assert!(
+                msg.contains("usage: vaultsync"),
+                "case {args:?} missing usages: {msg:?}"
+            );
+        }
     }
 
     #[test]
