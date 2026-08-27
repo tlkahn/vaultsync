@@ -1,0 +1,12 @@
+[package]
+name = "vaultsync"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Minimal, Unix-style sync of a plain directory (Obsidian vault) to object storage"
+readme = "README.md"
+keywords = ["obsidian", "s3", "sync", "cli"]
+categories = ["command-line-utilities", "filesystem"]
+publish = false
+
+[dependencies]
