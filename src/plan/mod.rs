@@ -117,6 +117,13 @@ fn classify_pair(local: Option<&Entity>, remote: Option<&Entity>, tol: u64) -> D
                 !l.is_folder() && !r.is_folder(),
                 "folders must be filtered in resolve"
             );
+            // Phase 1 classify rule: a missing mtime reads as `0`
+            // (`None -> 0`), and pre-epoch mtimes saturate to `Some(0)`
+            // (P1r4-mtime-pre-epoch). The classifier therefore cannot tell
+            // "unknown" apart from "pre-epoch": an equal-size pair skips on
+            // zero evidence, a diff-size pair conflicts (P1r6-mtime-zero).
+            // Phase 2 etag comparison is the resolution; classify stays
+            // unchanged in Phase 1.
             let lm = l.mtime_ms.unwrap_or(0);
             let rm = r.mtime_ms.unwrap_or(0);
             if lm.abs_diff(rm) <= tol {
@@ -285,6 +292,39 @@ mod tests {
             ..Default::default()
         };
         plan(local, remote, Mode::Status, &o)
+    }
+
+    #[test]
+    fn plan_pre_epoch_zero_vs_none_mtime_same_size_skips_as_equal() {
+        // Characterization lock (P1r6-mtime-zero): pre-epoch mtimes saturate
+        // to `Some(0)` (P1r4-mtime-pre-epoch), which the Phase 1 `None -> 0`
+        // classifier rule cannot tell apart from an unknown mtime. An
+        // equal-size pair therefore skips on zero evidence. Phase 2 etag
+        // comparison is the resolution; classify stays unchanged in Phase 1.
+        let p = plan(
+            &[file("a.md", 5, Some(0))],
+            &[file("a.md", 5, None)],
+            Mode::Status,
+            &opts(),
+        );
+        assert_eq!(kinds(&p), vec![ActionKind::Skip]);
+        assert_eq!(p.actions[0].reason, "equal");
+    }
+
+    #[test]
+    fn plan_pre_epoch_zero_vs_none_mtime_diff_size_conflicts() {
+        // Same `Some(0)`/`None` collision with different sizes: the pair
+        // surfaces as a Conflict row (conflict_mtime_size), never a silent
+        // winner. Documents that the collision is detectable as a conflict
+        // when sizes disagree (P1r6-mtime-zero).
+        let p = plan(
+            &[file("a.md", 5, Some(0))],
+            &[file("a.md", 6, None)],
+            Mode::Status,
+            &opts(),
+        );
+        assert_eq!(kinds(&p), vec![ActionKind::Conflict]);
+        assert_eq!(p.actions[0].reason, "conflict_mtime_size");
     }
 
     #[test]

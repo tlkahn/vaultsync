@@ -15,6 +15,13 @@ pub mod mock;
 ///
 /// Implementations must be usable through `&self` (interior mutability) so the
 /// CLI can share one store object without `mut` gymnastics.
+///
+/// Key validation contract (N1): every key passed to `head` / `get_to` /
+/// `put_from` / `delete` is expected to satisfy `ensure_valid_key`.
+/// `put_from` validates and rejects invalid keys with [`Error::InvalidKey`];
+/// read/delete paths may answer [`Error::NotFound`] for invalid keys (mock
+/// behavior). Phase 2 backends must never forward an unvalidated key to a
+/// provider (e.g. S3) - validate before any outbound call.
 pub trait ObjectStore {
     /// List entities whose key starts with `prefix`. `""` lists everything.
     /// Folders are synthesized from key prefixes when no folder marker object

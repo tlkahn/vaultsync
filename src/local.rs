@@ -3,6 +3,9 @@
 //! Walker omissions (Phase 1, all silent and by design):
 //! - symlinks - files **and** directories - are skipped entirely
 //!   (`--follow-symlinks` is a Phase 2 policy decision, P1r4-symlink);
+//! - a symlinked vault **root** is followed (`fs::metadata` on the root
+//!   resolves it); the symlink skip applies to entries below the root
+//!   (P1r6-root-symlink, locked by `local_list_follows_symlinked_root`);
 //! - device / FIFO / socket nodes are skipped (only `is_dir` / `is_file`
 //!   entries are emitted);
 //! - entries that vanish mid-walk (`NotFound`) are skipped; other IO errors
@@ -305,6 +308,24 @@ mod tests {
         assert!(matches!(err, Error::InvalidKey(_)));
         let msg = format!("{err}");
         assert!(msg.contains("UTF-8"), "msg: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_list_follows_symlinked_root() {
+        // Characterization lock (P1r6-root-symlink / L4): a symlinked vault
+        // *root* is followed by design - the user explicitly named it, and
+        // `fs::metadata(&self.root)` resolves the link. The symlink skip
+        // applies only to entries *below* the root.
+        let dir = TempDir::new("vaultsync-test");
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("a.md"), "hi").unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let fs = LocalFs::new(&link);
+        let ks = keys(&fs);
+        assert!(ks.contains(&"a.md".to_string()), "ks: {ks:?}");
     }
 
     #[cfg(unix)]

@@ -4,6 +4,7 @@
 //! `run_with_io` threads `&mut dyn Write` so dispatch is testable without
 //! spawning the binary.
 
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -23,6 +24,18 @@ pub enum Command {
 }
 
 const USAGE: &str = "usage: vaultsync <command> [options]\n\ncommands:\n  status [--vault <path>]         show plan against mock store\n  push [--vault <path>] [--delete] print push plan (dry-run stub)\n  pull [--vault <path>] [--delete] print pull plan (dry-run stub)\n  check                           mock connectivity stub\n  version                         print version\n  help | --help | -h              show this help";
+
+/// Convert `args_os()` output into `String`s, failing loud on non-UTF8
+/// arguments instead of letting `std::env::args()` panic (M1). The parser
+/// below works on `&[String]`; this seam is the only place OsString meets it.
+fn os_args_to_strings(args: Vec<OsString>) -> Result<Vec<String>, String> {
+    args.into_iter()
+        .map(|a| {
+            a.into_string()
+                .map_err(|os| format!("argument is not valid UTF-8: {os:?}"))
+        })
+        .collect()
+}
 
 /// Parse argv (including the program name at `args[0]`).
 pub fn parse_args(args: &[String]) -> Result<Command, String> {
@@ -199,7 +212,19 @@ fn dispatch_plan_stub(
 
 /// Entry point used by `main`: args from env, mock store, real stdout/stderr.
 pub fn run_from_env() -> i32 {
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<OsString> = std::env::args_os().collect();
+    let args = match os_args_to_strings(args) {
+        Ok(a) => a,
+        Err(msg) => {
+            // Fail loud on non-UTF8 argv (M1): a clear `error:` line and
+            // exit 1, consistent with parse-error handling below - never the
+            // `args()` panic (exit 101).
+            let stderr = std::io::stderr();
+            let mut err = stderr.lock();
+            let _ = writeln!(err, "error: {msg}");
+            return 1;
+        }
+    };
     let store = MemoryStore::new();
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
@@ -421,6 +446,40 @@ mod tests {
         assert!(parse_args(&args).unwrap_err().contains("unknown flag"));
     }
 
+    // --- argv conversion seam ---
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_args_reject_non_utf8() {
+        // A non-UTF8 argument must fail the conversion seam with a clear
+        // message (M1): `std::env::args()` panics on such argv; the seam is
+        // the tested boundary between `args_os()` and the String-based parser.
+        use std::os::unix::ffi::OsStrExt;
+        let offending = std::ffi::OsStr::from_bytes(b"\xff\xfe").to_os_string();
+        let expected_debug = format!("{offending:?}");
+        let err =
+            os_args_to_strings(vec![std::ffi::OsString::from("vaultsync"), offending]).unwrap_err();
+        assert!(err.contains("UTF-8"), "msg: {err}");
+        assert!(
+            err.contains(&expected_debug),
+            "offending bytes not shown: {err}"
+        );
+    }
+
+    #[test]
+    fn cli_args_valid_utf8_roundtrip() {
+        // Happy path through the seam (M1): valid argv converts and feeds the
+        // existing parser unchanged. Locks the no-regression property that
+        // A2's wiring cannot break the normal path.
+        let args = os_args_to_strings(vec!["vaultsync".into(), "status".into()]).unwrap();
+        assert_eq!(
+            parse_args(&args).unwrap(),
+            Command::Status {
+                vault: PathBuf::from(".")
+            }
+        );
+    }
+
     // --- dispatch ---
 
     fn run(cmd: Command, store: &MemoryStore) -> (i32, String, String) {
@@ -473,6 +532,39 @@ mod tests {
         let (code, out, _) = run(Command::Check, &MemoryStore::new());
         assert_eq!(code, 0);
         assert!(out.contains("check: ok (mock)"));
+    }
+
+    #[test]
+    fn run_push_stub_conflict_exit_0_placeholder() {
+        // Characterization lock (P1r6 / L2): the Phase 1 dry-run stub returns
+        // exit 0 even when the plan contains a conflict. This is a deliberate
+        // placeholder, not an endorsement - Phase 2 must define executor exit
+        // codes (conflict -> non-zero per sync-model) before real push ships.
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("c.md"), "x").unwrap();
+        let mt = std::fs::metadata(dir.join("c.md"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let ms = mt
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let store = MemoryStore::new();
+        let mut cursor = std::io::Cursor::new(b"xx".to_vec());
+        store.put_from("c.md", &mut cursor, 2, Some(ms)).unwrap();
+        let (code, out, _) = run(
+            Command::Push {
+                vault: dir.path().into(),
+                delete: false,
+            },
+            &store,
+        );
+        assert_eq!(code, 0);
+        assert!(
+            out.lines().any(|l| l.starts_with("*  c.md")),
+            "conflict row missing: {out}"
+        );
     }
 
     #[test]

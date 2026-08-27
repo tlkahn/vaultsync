@@ -78,7 +78,9 @@ pub fn ensure_valid_key(key: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Fixture constructor for a file entity.
+/// Fixture constructor for a file entity. Test-only: Phase 1 has no
+/// production callers (N2).
+#[cfg(test)]
 pub fn file(key: &str, size: u64, mtime_ms: Option<u64>) -> Entity {
     Entity {
         key: key.to_string(),
@@ -89,6 +91,8 @@ pub fn file(key: &str, size: u64, mtime_ms: Option<u64>) -> Entity {
 }
 
 /// Fixture constructor for a folder entity. The trailing `/` is normalized.
+/// Test-only: Phase 1 has no production callers (N2).
+#[cfg(test)]
 pub fn folder(key: &str) -> Entity {
     let normalized = if key.ends_with('/') {
         key.to_string()
