@@ -92,18 +92,7 @@ fn system_time_to_ms(t: SystemTime) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    /// Unique temp dir per call (std-only; no `tempfile` crate).
-    fn temp_dir() -> PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!("vaultsync-test-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        p
-    }
+    use crate::testutil::TempDir;
 
     fn keys(fs: &LocalFs) -> Vec<String> {
         fs.list().unwrap().iter().map(|e| e.key.clone()).collect()
@@ -119,18 +108,18 @@ mod tests {
 
     #[test]
     fn local_list_empty_dir() {
-        let dir = temp_dir();
-        let fs = LocalFs::new(&dir);
+        let dir = TempDir::new("vaultsync-test");
+        let fs = LocalFs::new(dir.path());
         assert_eq!(fs.list().unwrap(), Vec::<Entity>::new());
     }
 
     #[test]
     fn local_list_files_and_nested() {
-        let dir = temp_dir();
+        let dir = TempDir::new("vaultsync-test");
         std::fs::write(dir.join("a.md"), "hi").unwrap();
         std::fs::create_dir_all(dir.join("n")).unwrap();
         std::fs::write(dir.join("n/b.md"), "yo").unwrap();
-        let fs = LocalFs::new(&dir);
+        let fs = LocalFs::new(dir.path());
         let ks = keys(&fs);
         assert!(ks.contains(&"a.md".to_string()));
         assert!(ks.contains(&"n/".to_string()));
@@ -139,10 +128,10 @@ mod tests {
 
     #[test]
     fn local_keys_use_slash_not_backslash() {
-        let dir = temp_dir();
+        let dir = TempDir::new("vaultsync-test");
         std::fs::create_dir_all(dir.join("a")).unwrap();
         std::fs::write(dir.join("a/b.txt"), "x").unwrap();
-        let fs = LocalFs::new(&dir);
+        let fs = LocalFs::new(dir.path());
         for k in keys(&fs) {
             assert!(!k.contains('\\'), "key {k:?} has backslash");
         }
@@ -151,10 +140,10 @@ mod tests {
 
     #[test]
     fn local_mtime_and_size_populated() {
-        let dir = temp_dir();
+        let dir = TempDir::new("vaultsync-test");
         let payload = b"12345";
         std::fs::write(dir.join("a.md"), payload).unwrap();
-        let fs = LocalFs::new(&dir);
+        let fs = LocalFs::new(dir.path());
         let ents = fs.list().unwrap();
         let a = ents.iter().find(|e| e.key == "a.md").unwrap();
         assert_eq!(a.size, 5);
@@ -164,12 +153,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn local_skips_symlinks() {
-        let dir = temp_dir();
-        let outside = temp_dir();
+        let dir = TempDir::new("vaultsync-test");
+        let outside = TempDir::new("vaultsync-outside");
         std::fs::write(outside.join("secret.txt"), "s").unwrap();
         std::os::unix::fs::symlink(outside.join("secret.txt"), dir.join("link.txt")).unwrap();
         std::fs::write(dir.join("real.txt"), "r").unwrap();
-        let fs = LocalFs::new(&dir);
+        let fs = LocalFs::new(dir.path());
         let ks = keys(&fs);
         assert!(ks.contains(&"real.txt".to_string()));
         assert!(!ks.iter().any(|k| k == "link.txt"), "symlink not skipped");

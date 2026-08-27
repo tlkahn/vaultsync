@@ -101,13 +101,18 @@ impl ObjectStore for MemoryStore {
     }
 
     fn get_to(&self, key: &str, w: &mut dyn Write) -> Result<Entity, Error> {
-        let guard = self.objects.lock().unwrap();
-        let obj = match guard.get(key) {
-            Some(o) => o,
-            None => return Err(Error::NotFound(key.to_string())),
+        // Clone the payload under the lock, then drop the guard before
+        // touching the caller's writer: `w` may re-enter this store (head/
+        // list) and must not deadlock against the same mutex.
+        let (bytes, entity) = {
+            let guard = self.objects.lock().unwrap();
+            let obj = guard
+                .get(key)
+                .ok_or_else(|| Error::NotFound(key.to_string()))?;
+            (obj.bytes.clone(), self.entity_for(key, obj))
         };
-        w.write_all(&obj.bytes)?;
-        Ok(self.entity_for(key, obj))
+        w.write_all(&bytes)?;
+        Ok(entity)
     }
 
     fn put_from(
@@ -118,6 +123,13 @@ impl ObjectStore for MemoryStore {
         mtime_ms: Option<u64>,
     ) -> Result<Entity, Error> {
         crate::entity::ensure_valid_key(key)?;
+        if key.ends_with('/') {
+            // Folder markers are Phase 2+; puts are file keys only. Rejecting
+            // here keeps list/head/get consistent (no split-brain folder put).
+            return Err(Error::InvalidKey(format!(
+                "put_from does not accept folder keys: {key:?}"
+            )));
+        }
         let bytes = read_exact_n(r, size as usize)?;
         let etag = format!("etag-{}", self.next_etag.fetch_add(1, Ordering::Relaxed));
         let obj = MockObject {
@@ -169,6 +181,20 @@ mod tests {
     }
 
     #[test]
+    fn mock_put_rejects_folder_key() {
+        let store = new_store();
+        let mut cursor = std::io::Cursor::new(b"x".to_vec());
+        let err = store.put_from("notes/", &mut cursor, 1, None).unwrap_err();
+        assert!(matches!(err, Error::InvalidKey(_)));
+        // nothing must be stored: list stays empty, head is NotFound
+        assert_eq!(store.list("").unwrap(), Vec::<Entity>::new());
+        assert!(matches!(
+            store.head("notes/").unwrap_err(),
+            Error::NotFound(_)
+        ));
+    }
+
+    #[test]
     fn mock_put_rejects_invalid_key_dotdot() {
         let store = new_store();
         let mut cursor = std::io::Cursor::new(b"x".to_vec());
@@ -195,6 +221,41 @@ mod tests {
         assert_eq!(h.size, 11);
         assert_eq!(h.mtime_ms, Some(1000));
         assert!(h.etag.is_some());
+    }
+
+    /// A writer that re-enters the store from inside `write`. `get_to` must
+    /// not hold the map lock across the caller's writer, or this deadlocks
+    /// on the non-reentrant mutex (regression lock for R2.4).
+    struct ReentrantWrite<'a> {
+        store: &'a MemoryStore,
+        key: String,
+        buf: Vec<u8>,
+    }
+    impl Write for ReentrantWrite<'_> {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            // Re-enters the store: would deadlock if the map guard were held.
+            let _ = self.store.head(&self.key);
+            let _ = self.store.list("");
+            self.buf.extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn mock_get_to_does_not_require_reentrant_store() {
+        let store = new_store();
+        put_str(&store, "a.md", "hello", None).unwrap();
+        let mut w = ReentrantWrite {
+            store: &store,
+            key: "a.md".to_string(),
+            buf: Vec::new(),
+        };
+        let e = store.get_to("a.md", &mut w).unwrap();
+        assert_eq!(w.buf, b"hello");
+        assert_eq!(e.size, 5);
     }
 
     #[test]

@@ -13,7 +13,7 @@
 - [x] Planner unit tests with fixture trees (no network)
 - [x] CLI stubs: `status`, `push`, `pull`, `check`, `version` printing help/plans against mock
 
-Exit criteria: `cargo test` green (67 tests); `vaultsync status` against mock store in a temp vault prints a correct plan.
+Exit criteria: `cargo test` green (101 tests); `vaultsync status` against mock store in a temp vault prints a correct plan.
 
 ## Phase 2 - Real local FS + S3
 
@@ -92,6 +92,10 @@ Record choices here as they are made.
 | 2026-08-27 | P1r-list-prefix | `ObjectStore::list` prefix is a raw string `starts_with`, not a path-segment boundary; folder callers pass trailing `/` |
 | 2026-08-27 | P1r-stub-exit | Phase 1 `push`/`pull` stubs remain exit 0 always; Phase 2 decides whether real push/pull use exit 2 on conflict/dirty before execute |
 | 2026-08-27 | P1r-put-size | Mock `put_from` `size as usize` full-buffer read is mock-only; the real backend must stream without this pattern |
+| 2026-08-27 | P1r3-force-mode | On Conflict, forces are mode-aware: `force_local` -> Upload on Push/Status, Skip on Pull (keep local); `force_remote` -> Download on Pull/Status, Skip on Push (keep remote). Both forces still cancel. Amends "forces only affect Conflict rows" with direction semantics. |
+| 2026-08-27 | P1r3-put-folder-key | `put_from` rejects keys ending in `/` (`InvalidKey`). Folder marker objects deferred. `ensure_valid_key` still allows trailing `/` for folder *entities*. |
+| 2026-08-27 | P1r3-cli-trailing | `version` / `check` / `help` reject unknown trailing tokens (same parse hygiene as flag parsing). |
+| 2026-08-27 | P1r3-get-to-lock | Mock `get_to` clones bytes under the lock, drops guard, then writes (no user `Write` while holding the map mutex). |
 
 ## Open decisions
 
@@ -106,5 +110,10 @@ Written down so they are not silently dropped. Do not implement in this fix PR.
 - [ ] Real `push`/`pull` exit codes: decide whether execute (not stub) uses exit 2 on conflict/dirty before acting. P1r-stub-exit.
 - [ ] Force-flag combination surface: if/reopen how `--force-local --force-remote` is exposed at the CLI. Currently planner cancels both to Conflict. P1r-both-forces.
 - [ ] Real backend `put_from` must stream without the mock's `size as usize` full-buffer read. P1r-put-size.
+- [ ] **Folder + `--delete` policy (R2.1):** choose (a) post-pass empty-dir cleanup outside the plan, (b) plan `DeleteLocal`/`DeleteRemote` for folders when `opts.delete`, or (c) document permanent orphan empty dirs as a known limitation. Characterization tests lock current Skip behavior until this lands. P1r3-folder-delete.
+- [ ] **Remote key ingest validation (R2.2):** validate keys on list/head ingest (or once in `build_plan`) before any local path join; reject control chars / NUL if the backend can surface them. Extends P1r-key-validation.
+- [ ] **Executor `put_from` size verification (R3.3):** real backend/executor must verify bytes-transferred == expected size (or re-stat at read time) and fail loudly on mismatch (growth between walk and put). Extends P1r-put-size (mock "exactly size bytes" contract stays).
+- [ ] **Skip-row output policy (R3 low):** hide `S` rows by default or behind `-v` once vaults are large; Phase 1 fixtures may keep full print.
+- [ ] **`--vault` value hygiene (R3 low):** reject values starting with `--`; decide repeated `--vault` policy (error vs last-wins).
 
 Read-only decision-log rows: P1r-mtime-conflict, P1r-status-delete, P1r-key-validation, P1r-list-prefix.

@@ -35,14 +35,31 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
     }
 
     match rest[0].as_str() {
-        "version" => Ok(Command::Version),
-        "help" | "--help" | "-h" => Ok(Command::Help),
-        "check" => Ok(Command::Check),
+        "version" => {
+            reject_trailing(&rest[1..], "version")?;
+            Ok(Command::Version)
+        }
+        "help" | "--help" | "-h" => {
+            reject_trailing(&rest[1..], "help")?;
+            Ok(Command::Help)
+        }
+        "check" => {
+            reject_trailing(&rest[1..], "check")?;
+            Ok(Command::Check)
+        }
         "status" => parse_vault_cmd(&rest[1..], None),
         "push" => parse_vault_cmd(&rest[1..], Some(Mode::Push)),
         "pull" => parse_vault_cmd(&rest[1..], Some(Mode::Pull)),
         other => Err(format!("unknown command: {other}\n{USAGE}")),
     }
+}
+
+/// Reject trailing tokens after a command that takes no arguments.
+fn reject_trailing(rest_tail: &[String], cmd: &str) -> Result<(), String> {
+    if let Some(tok) = rest_tail.first() {
+        return Err(format!("unexpected argument for {cmd}: {tok}\n{USAGE}"));
+    }
+    Ok(())
 }
 
 /// Shared flag parser for status/push/pull.
@@ -190,20 +207,10 @@ pub fn run_from_env() -> i32 {
 mod tests {
     use super::*;
     use crate::store::mock::MemoryStore;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    use crate::testutil::TempDir;
 
     fn a() -> Vec<String> {
         vec!["vaultsync".to_string()]
-    }
-
-    fn temp_dir() -> PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!("vaultsync-cli-test-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        p
     }
 
     // --- parse ---
@@ -213,6 +220,18 @@ mod tests {
         let mut args = a();
         args.push("version".into());
         assert_eq!(parse_args(&args).unwrap(), Command::Version);
+    }
+
+    #[test]
+    fn parse_version_rejects_trailing_token() {
+        let mut args = a();
+        args.push("version".into());
+        args.push("--json".into());
+        let msg = parse_args(&args).unwrap_err();
+        assert!(
+            msg.contains("unexpected") || msg.contains("unknown"),
+            "clear hint missing: {msg}"
+        );
     }
 
     #[test]
@@ -312,6 +331,30 @@ mod tests {
     }
 
     #[test]
+    fn parse_check_rejects_trailing_token() {
+        let mut args = a();
+        args.push("check".into());
+        args.push("bogus".into());
+        let msg = parse_args(&args).unwrap_err();
+        assert!(
+            msg.contains("unexpected") || msg.contains("unknown"),
+            "clear hint missing: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_help_rejects_trailing_token() {
+        let mut args = a();
+        args.push("help".into());
+        args.push("extra".into());
+        let msg = parse_args(&args).unwrap_err();
+        assert!(
+            msg.contains("unexpected") || msg.contains("unknown"),
+            "clear hint missing: {msg}"
+        );
+    }
+
+    #[test]
     fn parse_unknown_command() {
         let mut args = a();
         args.push("foo".into());
@@ -348,17 +391,27 @@ mod tests {
 
     #[test]
     fn run_status_clean_exit_0() {
-        let dir = temp_dir();
-        let (code, out, _) = run(Command::Status { vault: dir }, &MemoryStore::new());
+        let dir = TempDir::new("vaultsync-cli-test");
+        let (code, out, _) = run(
+            Command::Status {
+                vault: dir.path().into(),
+            },
+            &MemoryStore::new(),
+        );
         assert_eq!(code, 0);
         assert!(out.contains("plan:"));
     }
 
     #[test]
     fn run_status_dirty_exit_2() {
-        let dir = temp_dir();
+        let dir = TempDir::new("vaultsync-cli-test");
         std::fs::write(dir.join("a.md"), "hi").unwrap();
-        let (code, out, _) = run(Command::Status { vault: dir }, &MemoryStore::new());
+        let (code, out, _) = run(
+            Command::Status {
+                vault: dir.path().into(),
+            },
+            &MemoryStore::new(),
+        );
         assert_eq!(code, 2);
         assert!(out.lines().any(|l| l.starts_with("U  a.md")));
     }
@@ -372,12 +425,12 @@ mod tests {
 
     #[test]
     fn run_push_stub_prints_plan_no_store_mutation() {
-        let dir = temp_dir();
+        let dir = TempDir::new("vaultsync-cli-test");
         std::fs::write(dir.join("a.md"), "hi").unwrap();
         let store = MemoryStore::new();
         let (code, out, _) = run(
             Command::Push {
-                vault: dir,
+                vault: dir.path().into(),
                 delete: false,
             },
             &store,
@@ -396,10 +449,10 @@ mod tests {
         store
             .put_from("gone.md", &mut cursor, 1, Some(100))
             .unwrap();
-        let dir = temp_dir();
+        let dir = TempDir::new("vaultsync-cli-test");
         let (code, out, _) = run(
             Command::Push {
-                vault: dir,
+                vault: dir.path().into(),
                 delete: true,
             },
             &store,
@@ -410,12 +463,12 @@ mod tests {
 
     #[test]
     fn run_pull_delete_stub_prints_delete_local() {
-        let dir = temp_dir();
+        let dir = TempDir::new("vaultsync-cli-test");
         std::fs::write(dir.join("gone.md"), "bye").unwrap();
         let store = MemoryStore::new();
         let (code, out, _) = run(
             Command::Pull {
-                vault: dir.clone(),
+                vault: dir.path().into(),
                 delete: true,
             },
             &store,

@@ -29,7 +29,8 @@ pub trait ObjectStore {
     fn head(&self, key: &str) -> Result<Entity, Error>;
     /// Stream object bytes into `w`, returning its metadata.
     fn get_to(&self, key: &str, w: &mut dyn Write) -> Result<Entity, Error>;
-    /// Store exactly `size` bytes read from `r`.
+    /// Store exactly `size` bytes read from `r`. File keys only: a trailing
+    /// `/` (folder marker) is rejected with [`Error::InvalidKey`].
     fn put_from(
         &self,
         key: &str,

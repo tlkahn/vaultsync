@@ -434,9 +434,18 @@ No IO. Fixtures are hand-built `Vec<Entity>`.
      | RemoteOnly | Download | DeleteRemote if delete else Skip | Download |
      | LocalNewer | Upload | Upload | Skip (or Conflict? no: local newer on pull means keep local - **Skip** reason `local_newer`) |
      | RemoteNewer | Download | Skip reason `remote_newer` | Download |
-     | Conflict | Conflict | Conflict unless force_local->Upload / force_remote->Download | same with forces |
+     | Conflict | Conflict | Conflict unless forced (see table below) | Conflict unless forced (see table below) |
 
-  3. Forces only apply to `Conflict` rows in Phase 1.
+     Conflict rows, forces are mode-aware (locked in PR 1 fix round 3; authoritative source is [sync-model.md](../sync-model.md)):
+
+     | force_local | force_remote | Status | Push | Pull |
+     | ----------- | ------------ | ------ | ---- | ---- |
+     | false | false | Conflict | Conflict | Conflict |
+     | true | true | Conflict (cancel) | Conflict | Conflict |
+     | true | false | Upload `force_local` | Upload `force_local` | Skip `force_local` (keep local) |
+     | false | true | Download `force_remote` | Skip `force_remote` (keep remote) | Download `force_remote` |
+
+  3. Forces only apply to `Conflict` rows in Phase 1, with the mode-aware direction table above (`P1r3-force-mode`).
 
 **GREEN:** `src/plan/mod.rs` implementing `plan()`.
 
@@ -629,7 +638,7 @@ Use this as the working board; tick in PRs or locally.
 - [x] Slice 5 - `build_plan` / `status_with_store` / human formatter
 - [x] Slice 6 - argv parse + `run_with_io` exit codes + push/pull stubs
 - [x] Slice 7 - exit-criteria test + manual smoke
-- [x] `cargo test` green (67 tests)
+- [x] `cargo test` green (101 tests)
 - [x] `cargo run -- status --vault <temp>` dirty plan demo
 - [x] Update root `README.md` status blurb to "Phase 1 complete" when exit criteria pass (done, 2026-08-27)
 - [x] Optionally tick Phase 1 boxes in `doc/roadmap.md` when done (done)

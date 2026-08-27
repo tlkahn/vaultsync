@@ -73,23 +73,51 @@ pub fn version() -> &'static str {
 }
 
 #[cfg(test)]
+pub(crate) mod testutil {
+    use std::ops::Deref;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Unique temp dir per instance, removed on drop (std-only; no `tempfile`).
+    /// Derefs to `Path` so `dir.join("x")` and `&dir -> &Path` coercion work.
+    pub(crate) struct TempDir(PathBuf);
+
+    impl TempDir {
+        pub(crate) fn new(prefix: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let p = std::env::temp_dir().join(format!("{prefix}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            TempDir(p)
+        }
+
+        pub(crate) fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Deref for TempDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::plan::{ActionKind, PlanOpts};
     use crate::store::ObjectStore;
     use crate::store::mock::MemoryStore;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_dir() -> PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!("vaultsync-lib-test-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        p
-    }
+    use crate::testutil::TempDir;
 
     fn put_str(store: &MemoryStore, key: &str, body: &str, mtime: u64) {
         let mut cursor = std::io::Cursor::new(body.as_bytes().to_vec());
@@ -106,7 +134,7 @@ mod tests {
 
     #[test]
     fn status_with_store_local_only() {
-        let dir = temp_dir();
+        let dir = TempDir::new("vaultsync-lib-test");
         std::fs::write(dir.join("a.md"), "hi").unwrap();
         let store = MemoryStore::new();
         let p = status_with_store(&dir, &store, &PlanOpts::default()).unwrap();
@@ -117,7 +145,7 @@ mod tests {
 
     #[test]
     fn status_with_store_matches_seeded_remote() {
-        let dir = temp_dir();
+        let dir = TempDir::new("vaultsync-lib-test");
         std::fs::write(dir.join("a.md"), "same").unwrap();
         let mt = std::fs::metadata(dir.join("a.md"))
             .unwrap()
@@ -137,7 +165,7 @@ mod tests {
 
     #[test]
     fn status_with_store_remote_only_download() {
-        let dir = temp_dir();
+        let dir = TempDir::new("vaultsync-lib-test");
         let store = MemoryStore::new();
         put_str(&store, "b.md", "x", 1000);
         let p = status_with_store(&dir, &store, &PlanOpts::default()).unwrap();
@@ -152,7 +180,7 @@ mod tests {
     fn format_plan_human_contains_stats_line() {
         let store = MemoryStore::new();
         put_str(&store, "b.md", "x", 1000);
-        let dir = temp_dir();
+        let dir = TempDir::new("vaultsync-lib-test");
         std::fs::write(dir.join("a.md"), "hi").unwrap();
         let p = status_with_store(&dir, &store, &PlanOpts::default()).unwrap();
         let txt = format_plan_human(&p);
@@ -163,7 +191,7 @@ mod tests {
 
     #[test]
     fn format_plan_human_marks_actions() {
-        let dir = temp_dir();
+        let dir = TempDir::new("vaultsync-lib-test");
         std::fs::write(dir.join("a.md"), "hi").unwrap();
         std::fs::write(dir.join("c.md"), "x").unwrap();
         // seed remote with c.md at the local file's mtime but different size -> conflict
@@ -189,7 +217,7 @@ mod tests {
     /// temp vault produces a correct plan including folder handling.
     #[test]
     fn phase1_exit_status_against_mock_in_temp_vault() {
-        let dir = temp_dir();
+        let dir = TempDir::new("vaultsync-lib-test");
         std::fs::create_dir_all(dir.join("notes")).unwrap();
         std::fs::write(dir.join("notes/hello.md"), "hi").unwrap();
 
