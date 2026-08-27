@@ -9,11 +9,11 @@
 
 ## Phase 1 - Skeleton (current)
 
-1. Rust package with `vaultsync` binary + library modules: `entity`, `plan`, `local`, `store` (trait + mock)
-2. Planner unit tests with fixture trees (no network)
-3. CLI stubs: `status`, `push`, `pull`, `check`, `version` printing help/plans against mock
+- [x] Rust package with `vaultsync` binary + library modules: `entity`, `plan`, `local`, `store` (trait + mock)
+- [x] Planner unit tests with fixture trees (no network)
+- [x] CLI stubs: `status`, `push`, `pull`, `check`, `version` printing help/plans against mock
 
-Exit criteria: `cargo test` green; `vaultsync status` against mock store in a temp vault.
+Exit criteria: `cargo test` green (67 tests); `vaultsync status` against mock store in a temp vault prints a correct plan.
 
 ## Phase 2 - Real local FS + S3
 
@@ -78,6 +78,11 @@ Record choices here as they are made.
 | 2026-08-27 | D4 Local delete safety | v1 permanent unlink/remove behind `--delete`; trash optional post-v1 |
 | 2026-08-27 | D5 Streaming in trait day one | yes (streaming `get_to` / `put_from`; buffered helpers allowed) |
 | 2026-08-27 | D6 License | Dual MIT OR Apache-2.0 |
+| 2026-08-27 | P1 planner | `plan()` always reports full classification; mode + `opts.delete` select execution semantics |
+| 2026-08-27 | P1 mode mapping | Per-delta action matrix locked (Status/Push/Pull table in [phase-1.md](plans/phase-1.md)); forces only affect Conflict rows |
+| 2026-08-27 | P1 folders | Folder-only actions are always Skip `folder` (empty folders do not round-trip to S3) |
+| 2026-08-27 | P1 mock delete-missing | `delete` on a missing key returns `Error::NotFound` (not idempotent) |
+| 2026-08-27 | P1 `push`/`pull` | Dry-run stubs print the plan and mutate nothing; `status` uses empty in-memory mock by default |
 
 ## Open decisions
 

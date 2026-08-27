@@ -1,0 +1,247 @@
+//! In-memory [`ObjectStore`] implementation for tests and Phase 1 CLI smoke.
+
+use std::collections::{BTreeSet, HashMap};
+use std::io::{Read, Write};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::entity::Entity;
+use crate::error::Error;
+use crate::store::ObjectStore;
+
+/// A stored object's payload and metadata.
+struct MockObject {
+    bytes: Vec<u8>,
+    mtime_ms: Option<u64>,
+    etag: String,
+}
+
+/// In-memory store. Files live in a map; folders are synthesized on `list`
+/// from file-key parents, matching the "no folder objects" remote default.
+pub struct MemoryStore {
+    objects: Mutex<HashMap<String, MockObject>>,
+    next_etag: AtomicU64,
+}
+
+impl MemoryStore {
+    pub fn new() -> Self {
+        MemoryStore {
+            objects: Mutex::new(HashMap::new()),
+            next_etag: AtomicU64::new(1),
+        }
+    }
+
+    fn entity_for(&self, key: &str, obj: &MockObject) -> Entity {
+        Entity {
+            key: key.to_string(),
+            size: obj.bytes.len() as u64,
+            mtime_ms: obj.mtime_ms,
+            etag: Some(obj.etag.clone()),
+        }
+    }
+}
+
+impl Default for MemoryStore {
+    fn default() -> Self {
+        MemoryStore::new()
+    }
+}
+
+/// Ancestor folder keys (each trailing-`/` prefix) of a key.
+fn parent_folders(key: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, b) in key.bytes().enumerate() {
+        if b == b'/' {
+            out.push(key[..=i].to_string());
+        }
+    }
+    out
+}
+
+fn read_exact_n(r: &mut dyn Read, n: usize) -> std::io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; n];
+    r.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+impl ObjectStore for MemoryStore {
+    fn list(&self, prefix: &str) -> Result<Vec<Entity>, Error> {
+        let guard = self.objects.lock().unwrap();
+        let mut keys: BTreeSet<String> = guard.keys().cloned().collect();
+        let folders: Vec<String> = keys.iter().flat_map(|k| parent_folders(k)).collect();
+        for f in folders {
+            keys.insert(f);
+        }
+
+        let mut entities = Vec::new();
+        for key in keys {
+            if !key.starts_with(prefix) {
+                continue;
+            }
+            if key.ends_with('/') {
+                entities.push(Entity {
+                    key,
+                    size: 0,
+                    mtime_ms: None,
+                    etag: None,
+                });
+            } else if let Some(obj) = guard.get(&key) {
+                entities.push(self.entity_for(&key, obj));
+            }
+        }
+        Ok(entities)
+    }
+
+    fn head(&self, key: &str) -> Result<Entity, Error> {
+        let guard = self.objects.lock().unwrap();
+        match guard.get(key) {
+            Some(o) => Ok(self.entity_for(key, o)),
+            None => Err(Error::NotFound(key.to_string())),
+        }
+    }
+
+    fn get_to(&self, key: &str, w: &mut dyn Write) -> Result<Entity, Error> {
+        let guard = self.objects.lock().unwrap();
+        let obj = match guard.get(key) {
+            Some(o) => o,
+            None => return Err(Error::NotFound(key.to_string())),
+        };
+        w.write_all(&obj.bytes)?;
+        Ok(self.entity_for(key, obj))
+    }
+
+    fn put_from(
+        &self,
+        key: &str,
+        r: &mut dyn Read,
+        size: u64,
+        mtime_ms: Option<u64>,
+    ) -> Result<Entity, Error> {
+        let bytes = read_exact_n(r, size as usize)?;
+        let etag = format!("etag-{}", self.next_etag.fetch_add(1, Ordering::Relaxed));
+        let obj = MockObject {
+            bytes,
+            mtime_ms,
+            etag: etag.clone(),
+        };
+        let entity = Entity {
+            key: key.to_string(),
+            size: obj.bytes.len() as u64,
+            mtime_ms,
+            etag: Some(etag),
+        };
+        self.objects.lock().unwrap().insert(key.to_string(), obj);
+        Ok(entity)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), Error> {
+        let mut guard = self.objects.lock().unwrap();
+        match guard.remove(key) {
+            Some(_) => Ok(()),
+            None => Err(Error::NotFound(key.to_string())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_store() -> MemoryStore {
+        MemoryStore::new()
+    }
+
+    fn put_str(
+        store: &MemoryStore,
+        key: &str,
+        body: &str,
+        mtime: Option<u64>,
+    ) -> Result<Entity, Error> {
+        let mut cursor = std::io::Cursor::new(body.as_bytes().to_vec());
+        store.put_from(key, &mut cursor, body.len() as u64, mtime)
+    }
+
+    fn get_str(store: &MemoryStore, key: &str) -> Result<String, Error> {
+        let mut buf = Vec::new();
+        store.get_to(key, &mut buf)?;
+        Ok(String::from_utf8(buf).unwrap())
+    }
+
+    #[test]
+    fn mock_put_get_roundtrip() {
+        let store = new_store();
+        put_str(&store, "a.md", "hello world", Some(1000)).unwrap();
+        assert_eq!(get_str(&store, "a.md").unwrap(), "hello world");
+        let h = store.head("a.md").unwrap();
+        assert_eq!(h.size, 11);
+        assert_eq!(h.mtime_ms, Some(1000));
+        assert!(h.etag.is_some());
+    }
+
+    #[test]
+    fn mock_get_missing_not_found() {
+        let store = new_store();
+        let mut buf = Vec::new();
+        let err = store.get_to("nope", &mut buf).unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    #[test]
+    fn mock_delete_removes() {
+        let store = new_store();
+        put_str(&store, "a.md", "x", None).unwrap();
+        store.delete("a.md").unwrap();
+        let mut buf = Vec::new();
+        assert!(matches!(
+            store.get_to("a.md", &mut buf).unwrap_err(),
+            Error::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn mock_delete_missing() {
+        let store = new_store();
+        assert!(matches!(
+            store.delete("missing").unwrap_err(),
+            Error::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn mock_list_all_and_prefix() {
+        let store = new_store();
+        put_str(&store, "a.md", "a", None).unwrap();
+        put_str(&store, "notes/b.md", "b", None).unwrap();
+        let all = store.list("").unwrap();
+        let keys: Vec<_> = all.iter().map(|e| e.key.clone()).collect();
+        assert!(keys.iter().any(|k| k == "a.md"));
+        assert!(keys.iter().any(|k| k == "notes/b.md"));
+
+        let notes = store.list("notes/").unwrap();
+        let nkeys: Vec<_> = notes.iter().map(|e| e.key.clone()).collect();
+        assert!(nkeys.iter().any(|k| k == "notes/b.md"));
+        assert!(!nkeys.iter().any(|k| k == "a.md"));
+    }
+
+    #[test]
+    fn mock_list_synthesizes_folder_prefixes() {
+        let store = new_store();
+        put_str(&store, "notes/b.md", "b", None).unwrap();
+        let all = store.list("").unwrap();
+        let folder = all.iter().find(|e| e.key == "notes/").expect("folder");
+        assert_eq!(folder.size, 0);
+        assert!(folder.is_folder());
+    }
+
+    #[test]
+    fn mock_overwrite_put() {
+        let store = new_store();
+        let first = put_str(&store, "a.md", "one", Some(10)).unwrap();
+        let second = put_str(&store, "a.md", "twolong", Some(20)).unwrap();
+        assert_eq!(get_str(&store, "a.md").unwrap(), "twolong");
+        let h = store.head("a.md").unwrap();
+        assert_eq!(h.size, 7);
+        assert_eq!(h.mtime_ms, Some(20));
+        assert!(first.etag != second.etag);
+    }
+}

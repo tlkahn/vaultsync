@@ -23,9 +23,13 @@ This repository is past Phase 0 design. Start here:
 
 ## Status
 
-Phase 0 complete (design locked, single-crate skeleton). Phase 1 (planner/CLI stubs) is next.
+Phase 0 design locked and Phase 1 skeleton complete (planner + module tree + CLI stubs against an in-memory mock store; `cargo test` green). Phase 2 (real local FS + S3) is next.
 
 ```text
 cargo build
-cargo run
+cargo run -- version
+cargo run -- status --vault <vault-dir>   # human plan against mock, exit 2 when dirty
+cargo run -- push --vault <vault-dir>     # dry-run stub, no store/disk mutation
+cargo run -- pull --vault <vault-dir>
+cargo run -- check                         # mock connectivity stub
 ```
