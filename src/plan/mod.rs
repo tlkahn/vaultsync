@@ -114,15 +114,19 @@ fn classify_pair(local: Option<&Entity>, remote: Option<&Entity>, tol: u64) -> D
             }
             let lm = l.mtime_ms.unwrap_or(0);
             let rm = r.mtime_ms.unwrap_or(0);
-            if l.size == r.size && lm.abs_diff(rm) <= tol {
-                Delta::Equal
+            if lm.abs_diff(rm) <= tol {
+                // Within tolerance of one another: equal only when size matches,
+                // otherwise the two sides disagree and it is a conflict.
+                if l.size == r.size {
+                    Delta::Equal
+                } else {
+                    Delta::Conflict
+                }
             } else if lm > rm {
                 Delta::LocalNewer
-            } else if rm > lm {
-                Delta::RemoteNewer
             } else {
-                // same mtime (within tol) but different size
-                Delta::Conflict
+                // rm > lm (abs_diff beyond tol means they cannot be equal)
+                Delta::RemoteNewer
             }
         }
     }
@@ -216,7 +220,12 @@ fn resolve(
             Mode::Pull => (Download, reason::REMOTE_NEWER),
         },
         Delta::Conflict => {
-            if opts.force_local {
+            let forcing = opts.force_local as u8 + opts.force_remote as u8;
+            if forcing > 1 {
+                // Both forces set: they cancel. Treat as no force rather than
+                // silently letting local (or remote) win by arbitrary precedence.
+                (Conflict, reason::CONFLICT_MTIME_SIZE)
+            } else if opts.force_local {
                 (Upload, reason::FORCE_LOCAL)
             } else if opts.force_remote {
                 (Download, reason::FORCE_REMOTE)
@@ -328,6 +337,53 @@ mod tests {
     }
 
     #[test]
+    fn plan_conflict_mtime_within_tol_diff_size() {
+        // mtimes differ by 500 <= tol 1000, but sizes differ -> Conflict
+        let p = run_status(
+            &[file("a.md", 1, Some(1500))],
+            &[file("a.md", 2, Some(1000))],
+        );
+        assert_eq!(kinds(&p), vec![ActionKind::Conflict]);
+        assert_eq!(p.actions[0].reason, "conflict_mtime_size");
+        assert_eq!(p.stats.conflict, 1);
+    }
+
+    #[test]
+    fn plan_conflict_mtime_within_tol_diff_size_remote_higher() {
+        // remote mtime slightly higher, within tol, sizes differ -> Conflict
+        let p = run_status(
+            &[file("a.md", 1, Some(1000))],
+            &[file("a.md", 2, Some(1500))],
+        );
+        assert_eq!(kinds(&p), vec![ActionKind::Conflict]);
+        assert_eq!(p.actions[0].reason, "conflict_mtime_size");
+        assert_eq!(p.stats.conflict, 1);
+    }
+
+    #[test]
+    fn plan_diff_size_local_newer_beyond_tol_uploads() {
+        // mtimes differ 4000 > tol 1000 and sizes differ: number side still wins
+        let p = run_status_tol(
+            &[file("a.md", 1, Some(5000))],
+            &[file("a.md", 9, Some(1000))],
+            1000,
+        );
+        assert_eq!(kinds(&p), vec![ActionKind::Upload]);
+        assert_eq!(p.actions[0].reason, "local_newer");
+    }
+
+    #[test]
+    fn plan_diff_size_remote_newer_beyond_tol_downloads() {
+        let p = run_status_tol(
+            &[file("a.md", 1, Some(1000))],
+            &[file("a.md", 9, Some(5000))],
+            1000,
+        );
+        assert_eq!(kinds(&p), vec![ActionKind::Download]);
+        assert_eq!(p.actions[0].reason, "remote_newer");
+    }
+
+    #[test]
     fn plan_conflict_same_mtime_diff_size() {
         let p = run_status(
             &[file("a.md", 1, Some(1000))],
@@ -341,6 +397,7 @@ mod tests {
     fn plan_folders_both_sides_skip() {
         let p = run_status(&[folder("n")], &[folder("n")]);
         assert_eq!(kinds(&p), vec![ActionKind::Skip]);
+        assert_eq!(p.actions[0].reason, "folder");
     }
 
     #[test]
@@ -428,6 +485,23 @@ mod tests {
         );
         assert_eq!(kinds(&p), vec![ActionKind::Skip]);
         assert_eq!(p.actions[0].reason, "local_newer");
+    }
+
+    #[test]
+    fn plan_conflict_both_forces_cancel() {
+        let o = PlanOpts {
+            force_local: true,
+            force_remote: true,
+            ..Default::default()
+        };
+        let p = plan(
+            &[file("a.md", 1, Some(1000))],
+            &[file("a.md", 2, Some(1000))],
+            Mode::Status,
+            &o,
+        );
+        assert_eq!(kinds(&p), vec![ActionKind::Conflict]);
+        assert_eq!(p.actions[0].reason, "conflict_mtime_size");
     }
 
     #[test]

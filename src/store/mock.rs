@@ -117,6 +117,7 @@ impl ObjectStore for MemoryStore {
         size: u64,
         mtime_ms: Option<u64>,
     ) -> Result<Entity, Error> {
+        crate::entity::ensure_valid_key(key)?;
         let bytes = read_exact_n(r, size as usize)?;
         let etag = format!("etag-{}", self.next_etag.fetch_add(1, Ordering::Relaxed));
         let obj = MockObject {
@@ -165,6 +166,24 @@ mod tests {
         let mut buf = Vec::new();
         store.get_to(key, &mut buf)?;
         Ok(String::from_utf8(buf).unwrap())
+    }
+
+    #[test]
+    fn mock_put_rejects_invalid_key_dotdot() {
+        let store = new_store();
+        let mut cursor = std::io::Cursor::new(b"x".to_vec());
+        let err = store.put_from("../x", &mut cursor, 1, None).unwrap_err();
+        assert!(matches!(err, Error::InvalidKey(_)));
+        // key must not have been inserted
+        assert_eq!(store.list("").unwrap(), Vec::<Entity>::new());
+    }
+
+    #[test]
+    fn mock_put_rejects_leading_slash() {
+        let store = new_store();
+        let mut cursor = std::io::Cursor::new(b"x".to_vec());
+        let err = store.put_from("/a.md", &mut cursor, 1, None).unwrap_err();
+        assert!(matches!(err, Error::InvalidKey(_)));
     }
 
     #[test]
@@ -221,6 +240,30 @@ mod tests {
         let nkeys: Vec<_> = notes.iter().map(|e| e.key.clone()).collect();
         assert!(nkeys.iter().any(|k| k == "notes/b.md"));
         assert!(!nkeys.iter().any(|k| k == "a.md"));
+    }
+
+    #[test]
+    fn mock_list_prefix_is_raw_starts_with() {
+        // Locks the documented behavior: prefix is a raw string prefix, not a
+        // path-segment boundary. `note` matches `note.md`, the synthesized
+        // `notes/` folder, and `notes/b.md` alike.
+        let store = new_store();
+        put_str(&store, "note.md", "a", None).unwrap();
+        put_str(&store, "notes/b.md", "b", None).unwrap();
+        let got = store.list("note").unwrap();
+        let keys: Vec<_> = got.iter().map(|e| e.key.clone()).collect();
+        assert!(keys.iter().any(|k| k == "note.md"));
+        assert!(keys.iter().any(|k| k == "notes/"));
+        assert!(keys.iter().any(|k| k == "notes/b.md"));
+        // delimiter-aligned prefix still narrows correctly
+        let skinny: Vec<_> = store
+            .list("notes/")
+            .unwrap()
+            .iter()
+            .map(|e| e.key.clone())
+            .collect();
+        assert!(skinny.iter().any(|k| k == "notes/b.md"));
+        assert!(!skinny.iter().any(|k| k == "note.md"));
     }
 
     #[test]

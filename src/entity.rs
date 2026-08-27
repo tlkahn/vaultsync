@@ -27,7 +27,9 @@ impl Entity {
 
 /// Validate a vault-relative key.
 ///
-/// Rejects the empty string, a leading `/`, or any backslash.
+/// Rejects the empty string, a leading `/`, or any backslash. Path segments
+/// must not be `.`, `..`, or empty (double slash). A single trailing empty
+/// segment from a folder key's final `/` is allowed (e.g. `notes/`).
 pub fn ensure_valid_key(key: &str) -> Result<(), Error> {
     if key.is_empty() {
         return Err(Error::InvalidKey("key must not be empty".to_string()));
@@ -41,6 +43,25 @@ pub fn ensure_valid_key(key: &str) -> Result<(), Error> {
         return Err(Error::InvalidKey(format!(
             "key must not contain backslash: {key:?}"
         )));
+    }
+
+    let segments: Vec<&str> = key.split('/').collect();
+    for (i, seg) in segments.iter().enumerate() {
+        // A single trailing empty segment (folder key `foo/`) is allowed.
+        if seg.is_empty() && i + 1 == segments.len() {
+            continue;
+        }
+        let seg = *seg;
+        if seg.is_empty() {
+            return Err(Error::InvalidKey(format!(
+                "key contains an empty path segment: {key:?}"
+            )));
+        }
+        if seg == "." || seg == ".." {
+            return Err(Error::InvalidKey(format!(
+                "key contains a '.' or '..' path segment: {key:?}"
+            )));
+        }
     }
     Ok(())
 }
@@ -93,6 +114,53 @@ mod tests {
     fn entity_is_folder() {
         assert!(folder("notes").is_folder());
         assert!(!file("notes/a.md", 1, None).is_folder());
+    }
+
+    #[test]
+    fn entity_reject_dot_segment() {
+        let err = ensure_valid_key("foo/./bar").unwrap_err();
+        assert!(matches!(err, Error::InvalidKey(_)));
+    }
+
+    #[test]
+    fn entity_allows_dotfile_name() {
+        assert!(ensure_valid_key(".obsidian/app.json").is_ok());
+        assert!(ensure_valid_key(".gitignore").is_ok());
+    }
+
+    #[test]
+    fn entity_reject_empty_segment() {
+        let err = ensure_valid_key("foo//bar").unwrap_err();
+        assert!(matches!(err, Error::InvalidKey(_)));
+    }
+
+    #[test]
+    fn entity_reject_dot_match() {
+        assert!(ensure_valid_key("foo/.").is_err());
+        assert!(ensure_valid_key("foo/..").is_err());
+    }
+
+    #[test]
+    fn entity_folder_trailing_slash_ok() {
+        assert!(ensure_valid_key("notes/").is_ok());
+    }
+
+    #[test]
+    fn entity_reject_dotdot_segment() {
+        let err = ensure_valid_key("foo/../bar.md").unwrap_err();
+        assert!(matches!(err, Error::InvalidKey(_)));
+    }
+
+    #[test]
+    fn entity_reject_dotdot_only() {
+        let err = ensure_valid_key("..").unwrap_err();
+        assert!(matches!(err, Error::InvalidKey(_)));
+    }
+
+    #[test]
+    fn entity_reject_dotdot_prefix() {
+        let err = ensure_valid_key("../x").unwrap_err();
+        assert!(matches!(err, Error::InvalidKey(_)));
     }
 
     #[test]

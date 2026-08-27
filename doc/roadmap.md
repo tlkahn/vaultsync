@@ -83,7 +83,28 @@ Record choices here as they are made.
 | 2026-08-27 | P1 folders | Folder-only actions are always Skip `folder` (empty folders do not round-trip to S3) |
 | 2026-08-27 | P1 mock delete-missing | `delete` on a missing key returns `Error::NotFound` (not idempotent) |
 | 2026-08-27 | P1 `push`/`pull` | Dry-run stubs print the plan and mutate nothing; `status` uses empty in-memory mock by default |
+| 2026-08-27 | P1r-mtime-conflict | Conflict when mtimes within tolerance and size differs; beyond tolerance, newer side wins even if size differs (PR 1 review fix) |
+| 2026-08-27 | P1r-status-delete | `status` rejects `--delete`; the Status action matrix never emits Delete* rows |
+| 2026-08-27 | P1r-key-validation | `ensure_valid_key` enforced on local walk emit + mock `put_from`; rejects `.` / `..` / empty path segments |
+| 2026-08-27 | P1r-type-collision | **Deferred to Phase 2:** detect key collisions between a `K` file and a `K/` folder (or children under a file key); emit Conflict `type_mismatch`/`path_collision`. Not implemented in the PR 1 fix. |
+| 2026-08-27 | P1r-mtime-none | Phase 1 rule locked: missing mtime treated as `0` in classify. Phase 2 revisit: unknown mtime should not silently lose/win; consider Conflict when either side is missing mtime and sizes differ |
+| 2026-08-27 | P1r-both-forces | Both `force_local` and `force_remote` set => forces cancel, Conflict `conflict_mtime_size` (no silent precedence) |
+| 2026-08-27 | P1r-list-prefix | `ObjectStore::list` prefix is a raw string `starts_with`, not a path-segment boundary; folder callers pass trailing `/` |
+| 2026-08-27 | P1r-stub-exit | Phase 1 `push`/`pull` stubs remain exit 0 always; Phase 2 decides whether real push/pull use exit 2 on conflict/dirty before execute |
+| 2026-08-27 | P1r-put-size | Mock `put_from` `size as usize` full-buffer read is mock-only; the real backend must stream without this pattern |
 
 ## Open decisions
 
 None. Spike-gated work (D1/D2 final crate pick) lives in Phase 2, not as design blockers.
+
+## Phase 2 checklist (deferred PR 1 review items)
+
+Written down so they are not silently dropped. Do not implement in this fix PR.
+
+- [ ] File-vs-folder path collision: reject/Conflict a `K` file vs a `K/` folder (or children under a file key). P1r-type-collision.
+- [ ] Unknown-mtime policy: revisit `mtime None -> 0` when a real backend is present; consider Conflict when either side lacks mtime and sizes differ. P1r-mtime-none.
+- [ ] Real `push`/`pull` exit codes: decide whether execute (not stub) uses exit 2 on conflict/dirty before acting. P1r-stub-exit.
+- [ ] Force-flag combination surface: if/reopen how `--force-local --force-remote` is exposed at the CLI. Currently planner cancels both to Conflict. P1r-both-forces.
+- [ ] Real backend `put_from` must stream without the mock's `size as usize` full-buffer read. P1r-put-size.
+
+Read-only decision-log rows: P1r-mtime-conflict, P1r-status-delete, P1r-key-validation, P1r-list-prefix.

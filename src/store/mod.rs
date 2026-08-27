@@ -19,6 +19,11 @@ pub trait ObjectStore {
     /// List entities whose key starts with `prefix`. `""` lists everything.
     /// Folders are synthesized from key prefixes when no folder marker object
     /// exists. Results are sorted by key.
+    ///
+    /// `prefix` is a raw string prefix, **not** a delimiter-aligned path
+    /// segment. Callers that want only the contents of a folder must pass a
+    /// trailing `/` (e.g. `notes/`); passing `notes` will also match `notes.md`
+    /// and any sibling whose key merely starts with `notes`.
     fn list(&self, prefix: &str) -> Result<Vec<Entity>, Error>;
     /// Fetch metadata for a single object.
     fn head(&self, key: &str) -> Result<Entity, Error>;

@@ -42,7 +42,7 @@ fn walk(dir: &Path, root: &Path, out: &mut Vec<Entity>) -> Result<(), Error> {
         let rel = path
             .strip_prefix(root)
             .map_err(|_| Error::Other(format!("walk path escaped root: {}", path.display())))?;
-        let key = rel.to_string_lossy().replace('\\', "/");
+        let key = path_to_key(rel)?;
 
         if ft.is_dir() {
             let key = format!("{key}/");
@@ -64,6 +64,15 @@ fn walk(dir: &Path, root: &Path, out: &mut Vec<Entity>) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// Build a vault-relative key from an already-stripped path, normalizing to
+/// `/` separators and validating it as a key. Fails closed on invalid keys
+/// (e.g. `..` or empty segments) rather than emitting them downstream.
+fn path_to_key(rel: &Path) -> Result<String, Error> {
+    let key = rel.to_string_lossy().replace('\\', "/");
+    crate::entity::ensure_valid_key(&key)?;
+    Ok(key)
 }
 
 fn mtime_of(path: &Path) -> Result<Option<u64>, Error> {
@@ -98,6 +107,14 @@ mod tests {
 
     fn keys(fs: &LocalFs) -> Vec<String> {
         fs.list().unwrap().iter().map(|e| e.key.clone()).collect()
+    }
+
+    #[test]
+    fn local_path_to_key_normalizes_and_validates() {
+        // plain relative path is fine and slash-normalized
+        assert_eq!(path_to_key(Path::new("a/b.md")).unwrap(), "a/b.md");
+        // a `..` component in the relative path is rejected (fail-closed)
+        assert!(path_to_key(Path::new("foo/../bar.md")).is_err());
     }
 
     #[test]

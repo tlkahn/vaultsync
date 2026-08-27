@@ -59,7 +59,14 @@ fn parse_vault_cmd(tail: &[String], mode: Option<Mode>) -> Result<Command, Strin
                 }
                 vault = PathBuf::from(&tail[i]);
             }
-            "--delete" => delete = true,
+            "--delete" => {
+                if mode.is_none() {
+                    // Status mode never emits Delete rows; accepting then silently
+                    // discarding the flag is worse than rejecting it outright.
+                    return Err("--delete is only valid for push/pull, not status".to_string());
+                }
+                delete = true;
+            }
             other => {
                 return Err(format!(
                     "unknown flag for {}: {other}\n{USAGE}",
@@ -182,7 +189,6 @@ pub fn run_from_env() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::PlanOpts;
     use crate::store::mock::MemoryStore;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -243,6 +249,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_status_rejects_delete_flag() {
+        let mut args = a();
+        args.push("status".into());
+        args.push("--delete".into());
+        let msg = parse_args(&args).unwrap_err();
+        assert!(msg.contains("--delete"), "msg: {msg}");
+        assert!(
+            msg.contains("push") || msg.contains("pull") || msg.contains("not valid for status"),
+            "hint missing: {msg}"
+        );
+    }
+
+    #[test]
     fn parse_push_delete() {
         let mut args = a();
         args.push("push".into());
@@ -251,6 +270,22 @@ mod tests {
             parse_args(&args).unwrap(),
             Command::Push {
                 vault: PathBuf::from("."),
+                delete: true
+            }
+        );
+    }
+
+    #[test]
+    fn parse_push_vault_and_delete() {
+        let mut args = a();
+        args.push("push".into());
+        args.push("--vault".into());
+        args.push("/tmp/v".into());
+        args.push("--delete".into());
+        assert_eq!(
+            parse_args(&args).unwrap(),
+            Command::Push {
+                vault: PathBuf::from("/tmp/v"),
                 delete: true
             }
         );
@@ -374,6 +409,24 @@ mod tests {
     }
 
     #[test]
+    fn run_pull_delete_stub_prints_delete_local() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("gone.md"), "bye").unwrap();
+        let store = MemoryStore::new();
+        let (code, out, _) = run(
+            Command::Pull {
+                vault: dir.clone(),
+                delete: true,
+            },
+            &store,
+        );
+        assert_eq!(code, 0);
+        assert!(out.lines().any(|l| l.starts_with("DL gone.md")));
+        // dry-run stub must not mutate the local file
+        assert!(dir.join("gone.md").exists());
+    }
+
+    #[test]
     fn run_status_error_exit_1() {
         let (code, _, err) = run(
             Command::Status {
@@ -383,11 +436,5 @@ mod tests {
         );
         assert_eq!(code, 1);
         assert!(err.contains("error:"));
-    }
-
-    // silence unused-PlanOpts import in non-Status paths if any
-    #[allow(dead_code)]
-    fn _opts() -> PlanOpts {
-        PlanOpts::default()
     }
 }
