@@ -523,6 +523,78 @@ mod tests {
         assert!(dir.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn execute_pull_delete_leaves_followed_file_symlink() {
+        // W51 (A-M2/B-M1): `pull --delete --follow-symlinks` must exit with
+        // zero per-key failures and leave the followed file symlink (and its
+        // target) intact: the DeleteLocal row is overridden to
+        // Skip(followed_symlink), so `delete_file_guarded`'s symlink refusal
+        // is never reached for a planned key.
+        let dir = TempDir::new("vaultsync-exec");
+        std::fs::write(dir.join("real.md"), "r").unwrap();
+        std::os::unix::fs::symlink("real.md", dir.join("link.md")).unwrap();
+        let local = LocalFs::with_follow(dir.path(), true);
+        let store = MemoryStore::new();
+        let opts = PlanOpts {
+            delete: true,
+            ..Default::default()
+        };
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts).unwrap();
+        let link = plan.actions.iter().find(|a| a.key == "link.md").unwrap();
+        assert_eq!(link.kind, ActionKind::Skip, "{:?}", link);
+        assert_eq!(link.reason, "followed_symlink");
+        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &opts);
+        assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep.failed);
+        // the link survives (never unlinked); `real.md` is a genuine local
+        // extra and IS deleted by pull --delete - only the link is protected.
+        assert!(dir.join("link.md").is_symlink(), "link must survive");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_pull_delete_swapped_symlink_leaf_fails_closed() {
+        // W51: the default-mode fail-closed guard is unchanged. A leaf swapped
+        // for a symlink between walk and execute still refuses the delete
+        // (the key fails, the link and its target survive) - the W39/W50
+        // protections for *unplanned* swaps stay in force.
+        let dir = TempDir::new("vaultsync-exec");
+        let outside = TempDir::new("vaultsync-outside");
+        std::fs::write(dir.join("gone.md"), "bye").unwrap();
+        std::fs::write(outside.join("victim"), "s").unwrap();
+        let local = LocalFs::new(dir.path()); // follow OFF (default)
+        let store = MemoryStore::new();
+        let opts = PlanOpts {
+            delete: true,
+            ..Default::default()
+        };
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts).unwrap();
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| a.key == "gone.md" && a.kind == ActionKind::DeleteLocal)
+        );
+        // swap the leaf for a symlink after planning
+        std::fs::remove_file(dir.join("gone.md")).unwrap();
+        std::os::unix::fs::symlink(outside.join("victim"), dir.join("gone.md")).unwrap();
+        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &opts);
+        assert!(
+            rep.failed.iter().any(|fl| fl.key == "gone.md"),
+            "gone.md not failed: {:?}",
+            rep.failed
+        );
+        assert!(
+            rep.failed.iter().any(|fl| fl.message.contains("symlink")),
+            "no symlink refusal: {:?}",
+            rep.failed
+        );
+        assert_eq!(
+            std::fs::read(outside.join("victim")).unwrap(),
+            b"s",
+            "target must survive"
+        );
+    }
+
     #[test]
     fn exec_delete_local_refuses_drifted_file() {
         // R4-L1/W39: `pull --delete` must re-verify local freshness before

@@ -67,17 +67,23 @@ pub fn build_plan(
         }
         p.stats = compute_stats(&p.actions);
     }
-    // R4-M1/W38: --follow-symlinks is inventory-only in v1. In mutating
-    // modes, a row whose key came from a followed *file* symlink is overridden
-    // to Skip(followed_symlink) - the executor refuses to open a symlink, so
-    // Push/Pull must never plan a transfer for it. Status keeps the rows
-    // (inventory visible). Dir-symlink children are unaffected - they transfer
-    // fine. DeleteLocal rows are unchanged (remove_file unlinks the link).
+    // R4-M1/W38 + W51 (A-M2/B-M1): --follow-symlinks is inventory-only in
+    // v1. In mutating modes, a row whose key came from a followed *file*
+    // symlink is overridden to Skip(followed_symlink) - the executor refuses
+    // to open a symlink, so Push/Pull must never plan a transfer for it, and
+    // a pull --delete must never unlink the link (the guarded delete refuses
+    // symlink leaves as its fail-closed guard for *unplanned* swaps). Status
+    // keeps the rows (inventory visible). Dir-symlink children are unaffected
+    // - they transfer fine. DeleteRemote needs no arm: a key in
+    // `followed_files` is local by construction, so it can never be a
+    // remote-only delete.
     if mode != Mode::Status && !walk_report.followed_files.is_empty() {
         for a in &mut p.actions {
             if matches!(
                 a.kind,
-                plan::ActionKind::Upload | plan::ActionKind::Download
+                plan::ActionKind::Upload
+                    | plan::ActionKind::Download
+                    | plan::ActionKind::DeleteLocal
             ) && walk_report.followed_files.contains(&a.key)
             {
                 a.kind = plan::ActionKind::Skip;
@@ -367,6 +373,29 @@ mod tests {
             .iter()
             .find(|a| a.key == "link.md")
             .expect("link.md action");
+        assert_eq!(link.kind, ActionKind::Skip, "{:?}", link);
+        assert_eq!(link.reason, "followed_symlink");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_plan_pull_delete_skips_followed_symlink_files() {
+        // W51 (A-M2/B-M1): `pull --delete --follow-symlinks` must plan a
+        // local-only followed *file* symlink row as Skip(followed_symlink),
+        // NOT DeleteLocal - the delete arm of the W38 override. The link is
+        // never removed in v1; the guard delete would otherwise refuse it as
+        // a symlink and fail the whole run per-key.
+        let dir = TempDir::new("vaultsync-lib-test");
+        std::fs::write(dir.join("real.md"), "r").unwrap();
+        std::os::unix::fs::symlink("real.md", dir.join("link.md")).unwrap();
+        let local = LocalFs::with_follow(dir.path(), true);
+        let store = MemoryStore::new();
+        let opts = PlanOpts {
+            delete: true,
+            ..Default::default()
+        };
+        let p = build_plan(&local, &store, Mode::Pull, &opts).unwrap();
+        let link = p.actions.iter().find(|a| a.key == "link.md").unwrap();
         assert_eq!(link.kind, ActionKind::Skip, "{:?}", link);
         assert_eq!(link.reason, "followed_symlink");
     }
