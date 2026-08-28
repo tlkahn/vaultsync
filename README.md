@@ -57,6 +57,10 @@ action a plan - or delete files - against a non-existent store).
 - **Mock store is `status` only.** Without a `[store]` section, `push`/
   `pull`/`check` refuse (exit 1); only `status` runs against the in-memory
   mock.
+- **`.*.vaultsync-tmp-*` names are reserved.** Download/upload temp buffers are
+  written as `.name.vaultsync-tmp-<pid>-<n>` siblings and cleaned up on every
+  error path; the walker additionally skips any file matching this reserved
+  pattern so a crash leftover can never be pushed as a real key.
 - **The integration suite skips without `VAULTSYNC_TEST_S3_BUCKET`.** The S3
   tests compile always but skip at runtime with a `[skip]` note when the env
   var is unset, keeping `cargo test` green offline. Set it (plus optional

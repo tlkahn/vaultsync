@@ -476,6 +476,26 @@ mod tests {
     }
 
     #[test]
+    fn build_plan_ignores_tmp_leftover() {
+        // W23/M1: a planted vaultsync temp sibling produces no Upload row and
+        // no stray key; only the real file is planned.
+        let dir = TempDir::new("vaultsync-lib-test");
+        std::fs::write(dir.join("note.md"), "real").unwrap();
+        std::fs::write(dir.join(".note.md.vaultsync-tmp-123-4"), "leftover").unwrap();
+        let local = LocalFs::new(dir.path());
+        let store = MemoryStore::new();
+        let p = build_plan(&local, &store, Mode::Push, &PlanOpts::default()).unwrap();
+        assert_eq!(p.stats.upload, 1);
+        assert!(p.actions.iter().any(|a| a.key == "note.md"));
+        assert!(
+            !p.actions
+                .iter()
+                .any(|a| a.key.starts_with('.') && a.key.contains("vaultsync-tmp")),
+            "tmp sibling planned"
+        );
+    }
+
+    #[test]
     fn check_probe_key_under_prefix() {
         // The probe key is a valid vault-relative key under a dot-prefix.
         let k = probe_key();

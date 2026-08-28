@@ -45,6 +45,9 @@ pub enum Freshness {
 pub struct WalkReport {
     /// Symlinks skipped (default mode, or out-of-vault followed targets).
     pub skipped_symlinks: u32,
+    /// Reserved vaultsync temp siblings (`.*.vaultsync-tmp-*`) skipped
+    /// (W23/M1: a crash leftover is never surfaced as a real key).
+    pub skipped_temp_files: u32,
     /// Human warnings (e.g. a followed symlink escaping the vault root).
     pub warnings: Vec<String>,
 }
@@ -452,6 +455,16 @@ fn temp_sibling(final_path: &Path) -> PathBuf {
     dir.join(format!(".{name}.vaultsync-tmp-{}-{n}", std::process::id()))
 }
 
+/// Whether a file name is a reserved vaultsync temp sibling (W23/M1): a
+/// leading dot plus `.vaultsync-tmp-` inside. Such names are written only by
+/// the download/upload temp paths (`.name.vaultsync-tmp-<pid>-<n>`); the
+/// walker treats them as never-syncable and skips them.
+fn is_vaultsync_tmp(name: Option<&std::ffi::OsStr>) -> bool {
+    let Some(name) = name else { return false };
+    let s = name.to_string_lossy();
+    s.starts_with('.') && s.contains(".vaultsync-tmp-")
+}
+
 /// Set a file's mtime in ms since epoch (std `File::set_times`, stable).
 fn set_file_mtime_ms(f: &std::fs::File, ms: u64) -> Result<(), Error> {
     let t = UNIX_EPOCH + std::time::Duration::from_millis(ms);
@@ -539,9 +552,15 @@ fn walk(
             }
             walk(&path, root, out, opts, report, visited)?;
         } else if ft.is_file() {
-            let key = path_to_key(rel)?;
-            if let Some(e) = file_entity(&path, &key)? {
-                out.push(e);
+            // W23/M1: a reserved vaultsync temp sibling (crash leftover) is
+            // never emitted as a key.
+            if is_vaultsync_tmp(path.file_name()) {
+                report.skipped_temp_files += 1;
+            } else {
+                let key = path_to_key(rel)?;
+                if let Some(e) = file_entity(&path, &key)? {
+                    out.push(e);
+                }
             }
         }
     }
@@ -601,6 +620,12 @@ fn handle_followed_symlink(
             visited,
         )?;
     } else if tmd.is_file() {
+        // W23/M1: skip a reserved temp sibling reached via a followed symlink,
+        // for symmetry with the default walk.
+        if is_vaultsync_tmp(path.file_name()) {
+            report.skipped_temp_files += 1;
+            return Ok(());
+        }
         let key = path_to_key(rel)?;
         if let Some(e) = file_entity(path, &key)? {
             out.push(e);
@@ -1245,6 +1270,21 @@ mod tests {
                 "symlink present (fail closed)"
             );
         }
+    }
+
+    #[test]
+    fn local_list_skips_vaultsync_tmp_siblings() {
+        // W23/M1: the walker must never emit vaultsync temp siblings (a crash
+        // leftover `.name.vaultsync-tmp-<pid>-<n>` next to the final path would
+        // otherwise list as a normal file and get pushed as a real key).
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::write(dir.join("note.md"), "real").unwrap();
+        std::fs::write(dir.join(".note.md.vaultsync-tmp-123-4"), "crash-leftover").unwrap();
+        let fs = LocalFs::new(dir.path());
+        let (ents, rep) = fs.list_report().unwrap();
+        let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["note.md"], "tmp sibling listed: {keys:?}");
+        assert_eq!(rep.skipped_temp_files, 1);
     }
 
     #[test]
