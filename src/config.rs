@@ -213,8 +213,16 @@ fn resolve_store(store: Option<&StoreConfig>, env: &EnvSnapshot) -> Result<Store
                 .bucket
                 .clone()
                 .ok_or_else(|| Error::Other("store.bucket is required".to_string()))?;
-            if bucket.is_empty() {
-                return Err(Error::Other("store.bucket must not be empty".to_string()));
+            // r11-L2/W98: bucket is the one *required* store field, so the
+            // nonblank policy is a hard error here (unlike optional
+            // region/endpoint where blank means unset). A whitespace-only
+            // value would otherwise resolve and fail late at the first SDK
+            // call. Real values with stray padding pass through verbatim - no
+            // silent trimming.
+            if bucket.trim().is_empty() {
+                return Err(Error::Other(
+                    "store.bucket must not be empty or whitespace-only".to_string(),
+                ));
             }
             // Env `AWS_REGION` overrides an explicit config region; with
             // neither set the result is `None` so the AWS default chain
@@ -388,6 +396,29 @@ mtime_tolerance_ms = 1000
             format!("{err}").to_lowercase().contains("bucket"),
             "err: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_store_rejects_whitespace_only_bucket() {
+        // r11-L2 (W98): bucket is the one *required* store field; for a
+        // required field the nonblank policy is a hard error (unlike optional
+        // region/endpoint where blank means unset). Today only
+        // `bucket.is_empty()` is rejected, so `bucket = "   "` resolves and
+        // fails late at the first SDK call. RED: resolves with no error.
+        for bad in ["", "   "] {
+            let text = format!("[store]\nbucket = \"{bad}\"\n");
+            let cfg = parse_config_str(&text).unwrap();
+            let err = settings(&cfg).unwrap_err();
+            assert!(
+                format!("{err}").contains("store.bucket") && format!("{err}").contains("empty"),
+                "{bad:?} must error naming store.bucket as empty: {err}"
+            );
+        }
+        // Boundary: a nonblank value with stray padding still resolves
+        // verbatim - no silent trimming of real values.
+        let cfg = parse_config_str("[store]\nbucket = \"b \"\n").unwrap();
+        let s = settings(&cfg).unwrap();
+        assert_eq!(s.store.bucket, "b ", "no silent trimming of real values");
     }
 
     #[test]
