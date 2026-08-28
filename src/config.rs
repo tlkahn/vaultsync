@@ -214,7 +214,16 @@ fn resolve_store(store: Option<&StoreConfig>, env: &EnvSnapshot) -> Result<Store
             // neither set the result is `None` so the AWS default chain
             // (env/shared config/profile) decides (W7/B-M2; env-over-config
             // precedence locked by resolve_settings_env_overrides_config_region).
-            let region = env.aws_region.clone().or_else(|| s.region.clone());
+            // W69/A-N1: an empty/whitespace-only env value is treated as
+            // unset (mirroring the SDK's own env provider) - it must never
+            // override a config region with `Some("")`, which would build
+            // `Region::new("")` and break the whole default chain.
+            let env_region = env
+                .aws_region
+                .as_ref()
+                .filter(|r| !r.trim().is_empty())
+                .cloned();
+            let region = env_region.or_else(|| s.region.clone());
             // W58/A nit: reject a configured prefix with an empty path
             // segment ("a//b", "/a") loudly before normalize_prefix - such a
             // prefix would produce keys `ensure_valid_key` rejects. A single
@@ -423,6 +432,36 @@ mtime_tolerance_ms = 1000
             Some("eu-west-3"),
             "env overrides config region"
         );
+    }
+
+    #[test]
+    fn resolve_settings_empty_env_region_falls_back() {
+        // W69/A-N1: an empty `AWS_REGION` env value is treated as unset (the
+        // SDK's own env provider does the same). It must never override a
+        // config region with `Some("")` - which would build
+        // `Region::new("")` and break the whole default chain.
+        let text = "[store]\nbucket = \"b\"\nregion = \"eu-west-3\"\n";
+        let cfg = parse_config_str(text).unwrap();
+        let cwd = Cli::default();
+        let empty_env = EnvSnapshot {
+            aws_region: Some(String::new()),
+        };
+        let with_config = resolve_settings(&cfg, &cwd, &empty_env).unwrap();
+        assert_eq!(
+            with_config.store.region.as_deref(),
+            Some("eu-west-3"),
+            "empty env region must fall back to the config region"
+        );
+        // whitespace-only env value is also unset
+        let ws_env = EnvSnapshot {
+            aws_region: Some("   ".to_string()),
+        };
+        let with_config_ws = resolve_settings(&cfg, &cwd, &ws_env).unwrap();
+        assert_eq!(with_config_ws.store.region.as_deref(), Some("eu-west-3"));
+        // and with no config region the result stays None (default chain)
+        let no_cfg = parse_config_str("[store]\nbucket = \"b\"\n").unwrap();
+        let no_region = resolve_settings(&no_cfg, &cwd, &empty_env).unwrap();
+        assert_eq!(no_region.store.region, None);
     }
 
     #[test]
