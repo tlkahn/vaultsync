@@ -216,21 +216,32 @@ pub fn plan(local: &[Entity], remote: &[Entity], mode: Mode, opts: &PlanOpts) ->
 /// Keys involved in a file-vs-folder path collision (P1r-type-collision):
 /// any file key `K` that coexists with a `K/` folder key or a `K/...`
 /// descendant, plus the colliding folder keys themselves.
-fn path_collision_keys(keys: &[&str]) -> std::collections::BTreeSet<String> {
+///
+/// W52/B-M2: the input contract is `plan()`'s sorted, dedup'd key list
+/// (callers must sort + dedup first). That makes every `K/...` descendant
+/// of a non-folder key `K` contiguous, so the scan is a binary search
+/// (`partition_point`) + a forward windowed scan - O(n log n) overall
+/// instead of the old per-key full-list O(n^2). Folder keys binary-search
+/// their exact base instead of a linear `contains`.
+pub(crate) fn path_collision_keys(keys: &[&str]) -> std::collections::BTreeSet<String> {
     let mut collided = std::collections::BTreeSet::new();
     for k in keys {
         if k.ends_with('/') {
             let base = k.strip_suffix('/').unwrap();
-            if keys.contains(&base) {
+            if keys.binary_search(&base).is_ok() {
                 collided.insert(k.to_string());
                 collided.insert(base.to_string());
             }
         } else {
             let prefix = format!("{k}/");
-            for k2 in keys {
+            // Descendants `k/...` are contiguous from the first key >= "{k}/".
+            let start = keys.partition_point(|k2| *k2 < prefix.as_str());
+            for k2 in &keys[start..] {
                 if k2.starts_with(&prefix) {
                     collided.insert(k.to_string());
                     collided.insert(k2.to_string());
+                } else {
+                    break;
                 }
             }
         }
@@ -1179,5 +1190,122 @@ mod tests {
         let remote = vec![file("note2.md", 1, Some(1))];
         let c = case_collision_keys(&local, &remote);
         assert!(c.is_empty(), "c: {c:?}");
+    }
+
+    // --- W52/B-M2: path_collision_keys complexity + equivalence ---
+
+    #[test]
+    fn path_collision_keys_matches_naive_reference() {
+        // W52/B-M2: the production (binary-search, windowed-scan)
+        // implementation must agree exactly with the O(n^2) reference over
+        // sorted+dedup'd key sets - the sorted-input contract `plan()` feeds
+        // it.
+        let mut rng = Lcg::new(0x5EED_BEEF);
+        for trial in 0..40usize {
+            let n = 10 + (rng.next() % 60) as usize;
+            let mut keys: Vec<String> = (0..n).map(|_| random_key(&mut rng)).collect();
+            // sprinkled explicit edges: `K` vs `K/x`, `K/` folder markers,
+            // case variants, trailing-slash edges
+            match trial {
+                0 => keys.extend(["K".into(), "K/x".into()]),
+                1 => keys.extend(["K/".into(), "K".into()]),
+                2 => keys.extend(["Notes".into(), "notes/x".into()]),
+                3 => keys.extend(["a/".into(), "a/b".into(), "a/b/c".into()]),
+                4 => keys.extend(["zz".into(), "zz/".into()]),
+                _ => {}
+            }
+            keys.sort();
+            keys.dedup();
+            let refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+            let expect = naive_path_collision_keys(&refs);
+            let got = crate::plan::path_collision_keys(&refs);
+            assert_eq!(got, expect, "trial {trial}: keys={keys:?}");
+        }
+    }
+
+    #[test]
+    fn path_collision_keys_catches_collision_at_scale() {
+        // W52/B-M2: windowed-scan boundary guard at scale. 100k synthetic
+        // dirNNNNN/fileNNNNN.md keys plus one planted `zz/collide` +
+        // `zz/collide/x.md` pair; only the pair (both members) is reported.
+        // Debug-build-safe (a runtime assertion, not a benchmark); the
+        // O(n^2) algorithm does not complete this in a reasonable time.
+        let mut keys: Vec<String> = Vec::with_capacity(100_002);
+        for i in 0..100_000 {
+            keys.push(format!("dir{i:05}/file{i:05}.md"));
+        }
+        keys.push("zz/collide".into());
+        keys.push("zz/collide/x.md".into());
+        keys.sort();
+        keys.dedup();
+        let refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+        let got = crate::plan::path_collision_keys(&refs);
+        assert_eq!(got.len(), 2, "expected only the planted pair: {got:?}");
+        assert!(got.contains("zz/collide"), "got: {got:?}");
+        assert!(got.contains("zz/collide/x.md"), "got: {got:?}");
+    }
+
+    /// Deterministic tiny LCG for the W52 randomized equivalence test (no
+    /// external crates).
+    struct Lcg(u64);
+    impl Lcg {
+        fn new(seed: u64) -> Self {
+            Lcg(seed)
+        }
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+    }
+
+    /// Random vault-ish key over a tiny alphabet (segments `a`-`c`,
+    /// occasional uppercase, occasional trailing `/`), so randomized sorted
+    /// sets hit file/folder/case/trailing-slash edges.
+    fn random_key(rng: &mut Lcg) -> String {
+        let segs = 1 + (rng.next() % 3) as usize;
+        let mut parts: Vec<String> = Vec::new();
+        for _ in 0..segs {
+            let len = 1 + (rng.next() % 3) as usize;
+            let mut s = String::new();
+            for _ in 0..len {
+                s.push((b'a' + (rng.next() % 3) as u8) as char);
+            }
+            if rng.next() % 5 == 0 {
+                s = s.to_uppercase();
+            }
+            parts.push(s);
+        }
+        let mut k = parts.join("/");
+        if rng.next() % 7 == 0 {
+            k.push('/');
+        }
+        k
+    }
+
+    /// The pre-W52 O(n^2) algorithm, copied verbatim as the equivalence
+    /// reference.
+    fn naive_path_collision_keys(keys: &[&str]) -> std::collections::BTreeSet<String> {
+        let mut collided = std::collections::BTreeSet::new();
+        for k in keys {
+            if k.ends_with('/') {
+                let base = k.strip_suffix('/').unwrap();
+                if keys.contains(&base) {
+                    collided.insert(k.to_string());
+                    collided.insert(base.to_string());
+                }
+            } else {
+                let prefix = format!("{k}/");
+                for k2 in keys {
+                    if k2.starts_with(&prefix) {
+                        collided.insert(k.to_string());
+                        collided.insert(k2.to_string());
+                    }
+                }
+            }
+        }
+        collided
     }
 }
