@@ -107,16 +107,14 @@ impl S3Store {
         caller_prefix: &str,
     ) -> Result<Vec<(String, u64, Option<u64>)>, Error> {
         let s3_prefix = format!("{}{}", self.prefix, caller_prefix);
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
-        let store_prefix = self.prefix.clone();
-        self.rt.block_on(async move {
+        self.rt.block_on(async {
             let mut out = Vec::new();
             let mut continuation: Option<String> = None;
             loop {
-                let mut req = client
+                let mut req = self
+                    .client
                     .list_objects_v2()
-                    .bucket(&bucket)
+                    .bucket(&self.bucket)
                     .prefix(&s3_prefix)
                     .max_keys(1000);
                 if let Some(tok) = &continuation {
@@ -125,7 +123,7 @@ impl S3Store {
                 let resp = req.send().await.map_err(|e| map_sdk_err(&e, "list"))?;
                 for obj in resp.contents().iter() {
                     let Some(full) = obj.key() else { continue };
-                    let Some(rel) = strip_prefix(&store_prefix, full) else {
+                    let Some(rel) = strip_prefix(&self.prefix, full) else {
                         continue;
                     };
                     // LastModified is the only mtime source in a listing.
@@ -513,13 +511,12 @@ impl ObjectStore for S3Store {
     fn head(&self, key: &str) -> Result<Entity, Error> {
         validate_object_key(key)?;
         let fk = full_key(&self.prefix, key);
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
         let rel = key.to_string();
         let out = self.rt.block_on(async {
-            let resp = client
+            let resp = self
+                .client
                 .head_object()
-                .bucket(&bucket)
+                .bucket(&self.bucket)
                 .key(&fk)
                 .send()
                 .await
@@ -543,13 +540,12 @@ impl ObjectStore for S3Store {
     fn get_to(&self, key: &str, w: &mut dyn Write) -> Result<Entity, Error> {
         validate_object_key(key)?;
         let fk = full_key(&self.prefix, key);
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
         let rel = key.to_string();
         let entity = self.rt.block_on(async {
-            let resp = client
+            let resp = self
+                .client
                 .get_object()
-                .bucket(&bucket)
+                .bucket(&self.bucket)
                 .key(&fk)
                 .send()
                 .await
@@ -646,10 +642,13 @@ impl ObjectStore for S3Store {
                     .map_err(|e| Error::Other(format!("put_from: read temp: {e:?}")))
             });
             let body = body_res?;
-            let client = self.client.clone();
-            let bucket = self.bucket.clone();
             self.rt.block_on(async move {
-                let mut req = client.put_object().bucket(&bucket).key(&fk).body(body);
+                let mut req = self
+                    .client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(&fk)
+                    .body(body);
                 if let Some(v) = encode_mtime(mtime_ms) {
                     req = req.metadata(MTIME_KEY, v);
                 }
@@ -674,12 +673,10 @@ impl ObjectStore for S3Store {
     fn delete(&self, key: &str) -> Result<(), Error> {
         validate_object_key(key)?;
         let fk = full_key(&self.prefix, key);
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
         self.rt.block_on(async move {
-            client
+            self.client
                 .delete_object()
-                .bucket(&bucket)
+                .bucket(&self.bucket)
                 .key(&fk)
                 .send()
                 .await
