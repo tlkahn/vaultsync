@@ -206,7 +206,25 @@ fn exec_download(
             }
         };
         if !absent {
+            // R4-L5/W43: distinguish a destination that was *skipped by the
+            // walk* (a pre-existing symlink - the key is remote-only because
+            // the walk skipped it, not because it appeared) from one that
+            // truly appeared since the plan. Both fail closed; only the message
+            // differs.
+            let is_symlink = match local.is_symlink_destination(&a.key) {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e);
+                }
+            };
             let _ = std::fs::remove_file(&tmp);
+            if is_symlink {
+                return Err(Error::Other(format!(
+                    "destination {} exists but was skipped by the walk (symlink); not overwriting",
+                    a.key
+                )));
+            }
             return Err(Error::Other(format!(
                 "destination appeared since plan for {}; not overwriting",
                 a.key
@@ -893,6 +911,49 @@ mod tests {
         // W21/N1: the freshness-guard error path must not leave the temp
         // sibling behind (the symlink destination errors before rename).
         assert_no_tmp_leftovers(dir.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_download_over_symlink_destination_message() {
+        // R4-L5/W43: a default-mode pull where the destination is a
+        // pre-existing symlink (skipped by the walk, so the key is remote-only)
+        // must fail closed but with an ACCURATE message - naming the skipped
+        // symlink - not misdiagnose it as a destination that "appeared since
+        // plan".
+        let dir = TempDir::new("vaultsync-exec");
+        let outside = TempDir::new("vaultsync-outside");
+        std::fs::write(outside.join("secret"), "s").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), dir.join("a.md")).unwrap();
+        let store = MemoryStore::new();
+        put_str(&store, "a.md", "remote-bytes", Some(1_700_000_000_123));
+        let local = LocalFs::new(dir.path()); // follow off
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let act = plan.actions.iter().find(|a| a.key == "a.md").unwrap();
+        assert_eq!(act.kind, ActionKind::Download);
+        assert!(
+            act.local.is_none(),
+            "symlink skipped by walk -> remote-only"
+        );
+        let rep =
+            crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+        let fl = rep
+            .failed
+            .iter()
+            .find(|fl| fl.key == "a.md")
+            .unwrap_or_else(|| panic!("a.md not failed: {:?}", rep.failed));
+        assert!(
+            !fl.message.contains("appeared"),
+            "misdiagnosed pre-existing symlink as appeared: {}",
+            fl.message
+        );
+        assert!(
+            fl.message.contains("symlink") || fl.message.contains("walk"),
+            "message does not mention skipped symlink: {}",
+            fl.message
+        );
+        // the outside target is untouched (never written through)
+        assert_eq!(std::fs::read(outside.join("secret")).unwrap(), b"s");
     }
 
     #[test]

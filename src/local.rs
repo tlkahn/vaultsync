@@ -318,6 +318,20 @@ impl LocalFs {
         Ok(Freshness::Fresh)
     }
 
+    /// Whether a pull destination is a pre-existing symlink. Used by the
+    /// remote-only download guard to give an accurate message (R4-L5/W43): a
+    /// symlink was skipped by the walk (so the key is remote-only), which is
+    /// not the same as a destination that *appeared since plan*. `NotFound`
+    /// -> false.
+    pub fn is_symlink_destination(&self, key: &str) -> Result<bool, Error> {
+        let path = key_to_local_path(&self.root, key)?;
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+            Ok(md) => Ok(md.file_type().is_symlink()),
+        }
+    }
+
     /// Whether a pull destination is currently absent (W22/N2/L3). Used to
     /// guard a `remote_only` download that had no planned local entity: a
     /// destination that appeared since the plan (a regular file, directory, or
