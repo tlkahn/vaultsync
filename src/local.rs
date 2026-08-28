@@ -751,7 +751,15 @@ fn handle_followed_symlink(
     };
     if tmd.is_dir() {
         if !visited.insert(target) {
-            return Ok(()); // cycle guard
+            // R5-L8/W46: a second link to an already-followed target (or a
+            // true cycle) is skipped, but now warns and counts instead of
+            // being silently omitted.
+            report.warnings.push(format!(
+                "skipping {} (symlink target already reached via another link)",
+                path_to_key(rel)?
+            ));
+            report.skipped_symlinks += 1;
+            return Ok(()); // cycle guard / duplicate-target guard
         }
         let key = format!("{}/", path_to_key(rel)?);
         if let Some(e) = folder_entity(path, &key)? {
@@ -1686,6 +1694,35 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("escape") && w.contains("vault root")),
             "warning missing: {:?}",
+            report.warnings
+        );
+        assert_eq!(report.skipped_symlinks, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_follow_warns_on_duplicate_dir_target() {
+        // R5-L8/W46: two dir symlinks to the SAME in-vault target. The first
+        // is followed; the second must be skipped with an "already reached"
+        // warning (and counted), not silently omitted.
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::create_dir_all(dir.join("realdir")).unwrap();
+        std::fs::write(dir.join("realdir/x.md"), "x").unwrap();
+        std::os::unix::fs::symlink("realdir", dir.join("d1")).unwrap();
+        std::os::unix::fs::symlink("realdir", dir.join("d2")).unwrap();
+        let fs = LocalFs::with_follow(dir.path(), true);
+        let (ents, report) = fs.list_report().unwrap();
+        let keys: Vec<String> = ents.iter().map(|e| e.key.clone()).collect();
+        let d1 = keys.iter().any(|k| k == "d1/");
+        let d2 = keys.iter().any(|k| k == "d2/");
+        // exactly one of d1/, d2/ appears (readdir order is unspecified)
+        assert!(d1 ^ d2, "exactly one link dir expected: {keys:?}");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("already reached") && (w.contains("d1") || w.contains("d2"))),
+            "no duplicate-target warning: {:?}",
             report.warnings
         );
         assert_eq!(report.skipped_symlinks, 1);
