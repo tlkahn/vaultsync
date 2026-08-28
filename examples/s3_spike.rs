@@ -240,8 +240,17 @@ async fn probe_path_style(client: &Client, bucket: &str) -> Result<(), Box<dyn s
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+// W74 (B nit): no `#[tokio::main]` here - the throwaway spike builds a
+// current-thread runtime manually so the package can stay on the minimal
+// `tokio/rt` feature (no `macros`).
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let bucket =
         std::env::var("VS_SPIKE_BUCKET").map_err(|_| "VS_SPIKE_BUCKET is required".to_string())?;
     let region = std::env::var("VS_SPIKE_REGION").unwrap_or_else(|_| "us-west-1".to_string());
