@@ -1047,7 +1047,19 @@ fn handle_followed_symlink(
         .strip_prefix(root)
         .map_err(|_| Error::Other(format!("walk symlink escaped root: {}", path.display())))?;
     let target = match std::fs::canonicalize(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // r10-L1/W87: a dangling symlink in follow mode is skipped WITH
+            // a count and a warning, mirroring the out-of-vault and
+            // duplicate-target arms below - a dangling link most often
+            // signals a moved/deleted target and must not be silent (it was
+            // previously invisible: count 0, no warning).
+            report.warnings.push(format!(
+                "skipping {} (dangling symlink: target does not exist)",
+                path_to_key(rel)?
+            ));
+            report.skipped_symlinks += 1;
+            return Ok(());
+        }
         Err(e) => return Err(e.into()),
         Ok(t) => t,
     };
@@ -2404,6 +2416,35 @@ mod tests {
         assert!(!keys.iter().any(|k| k == "link.txt"), "symlink not skipped");
         assert_eq!(report.skipped_symlinks, 1, "report count");
         assert!(report.warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_follow_symlinks_counts_dangling() {
+        // r10-L1 (W87): in follow mode a dangling symlink (target does not
+        // exist) is silently dropped - no count, no warning - while the
+        // out-of-vault and duplicate-target cases both warn and count. The
+        // dangling case most often signals a moved/deleted target, so the
+        // follow-mode walk must report it the same way. Fails today: count
+        // 0, no warning.
+        let dir = TempDir::new("vaultsync-test");
+        std::os::unix::fs::symlink("missing-target", dir.join("dangling.md")).unwrap();
+        let fs = LocalFs::with_follow(dir.path(), true);
+        let (ents, report) = fs.list_report().unwrap();
+        let keys: Vec<String> = ents.iter().map(|e| e.key.clone()).collect();
+        assert!(
+            !keys.iter().any(|k| k == "dangling.md"),
+            "dangling symlink must not be listed: {keys:?}"
+        );
+        assert_eq!(report.skipped_symlinks, 1, "dangling must be counted");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("dangling.md") && w.contains("dangling")),
+            "no dangling warning: {:?}",
+            report.warnings
+        );
     }
 
     #[cfg(unix)]
