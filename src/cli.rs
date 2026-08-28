@@ -505,8 +505,61 @@ fn resolve_vault_from_config(cmd: Command, settings: &crate::config::Settings) -
     }
 }
 
-/// Entry point used by `main`: args from env, config load, mock store, real
-/// stdout/stderr. (The store becomes config-driven in Slice 6/7; still mock.)
+/// True when a command mutates or probes a real store and therefore must not
+/// silently run (or delete) against the in-memory mock (A-M2/B-L5, W5).
+fn requires_real_store(cmd: &Command) -> bool {
+    matches!(cmd, Command::Push { .. } | Command::Pull { .. } | Command::Check { .. })
+}
+
+/// Stable command name used in the no-store refusal message.
+fn command_name(cmd: &Command) -> &'static str {
+    match cmd {
+        Command::Push { .. } => "push",
+        Command::Pull { .. } => "pull",
+        Command::Check { .. } => "check",
+        _ => "this command",
+    }
+}
+
+/// Dispatch a fully-resolved command + settings. W5 (A-M2/B-L5): push/pull/
+/// check refuse loudly when no `[store]` is configured (the in-memory mock is
+/// `status`-only); `status` keeps the mock for offline play.
+fn run_with_settings(
+    cmd: Command,
+    settings: &crate::config::Settings,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    if requires_real_store(&cmd) && settings.store.bucket.is_empty() {
+        let _ = writeln!(
+            err,
+            "error: {} requires a configured [store] (set store.bucket and AWS credentials); the in-memory mock is for `status` only",
+            command_name(&cmd)
+        );
+        return 1;
+    }
+    // Merge the config vault_root into the command when --vault was unset.
+    let cmd = resolve_vault_from_config(cmd, settings);
+
+    // Build the store: a real `[store]` bucket -> S3Store; otherwise the mock.
+    let store: Box<dyn ObjectStore> = if settings.store.bucket.is_empty() {
+        Box::new(MemoryStore::new())
+    } else {
+        match crate::store::s3::S3Store::new(&settings.store) {
+            Ok(s) => Box::new(s),
+            Err(e) => {
+                let _ = writeln!(err, "error: {e}");
+                return 1;
+            }
+        }
+    };
+    run_with_io(cmd, store.as_ref(), settings.mtime_tolerance_ms, out, err)
+}
+
+/// Entry point used by `main`: args from env, config load, store dispatch,
+/// real stdout/stderr. The store is config-driven (Slice 6/7): a `[store]`
+/// section builds S3Store; without one, `status` uses the in-memory mock and
+/// push/pull/check are refused (W5).
 pub fn run_from_env() -> i32 {
     let args: Vec<OsString> = std::env::args_os().collect();
     let args = match os_args_to_strings(args) {
@@ -537,7 +590,7 @@ pub fn run_from_env() -> i32 {
         return run_with_io(cmd, &MemoryStore::new(), 0, &mut out, &mut err);
     }
 
-    // Load + resolve config, then merge the config vault_root into the command.
+    // Load + resolve config.
     let explicit = cmd_config_path(&cmd).map(Path::to_path_buf);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from(VAULT_UNSET));
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -561,21 +614,7 @@ pub fn run_from_env() -> i32 {
             }
         }
     };
-    let cmd = resolve_vault_from_config(cmd, &settings);
-
-    // Build the store: a real `[store]` bucket -> S3Store; otherwise the mock.
-    let store: Box<dyn ObjectStore> = if settings.store.bucket.is_empty() {
-        Box::new(MemoryStore::new())
-    } else {
-        match crate::store::s3::S3Store::new(&settings.store) {
-            Ok(s) => Box::new(s),
-            Err(e) => {
-                let _ = writeln!(err, "error: {e}");
-                return 1;
-            }
-        }
-    };
-    run_with_io(cmd, store.as_ref(), settings.mtime_tolerance_ms, &mut out, &mut err)
+    run_with_settings(cmd, &settings, &mut out, &mut err)
 }
 
 #[cfg(test)]
@@ -1049,6 +1088,73 @@ mod tests {
             err.to_lowercase().contains("credential") || err.to_lowercase().contains("permission"),
             "actionable hint missing: {err}"
         );
+    }
+
+    fn no_store_settings(vault: &std::path::Path) -> crate::config::Settings {
+        crate::config::Settings {
+            vault_root: vault.to_path_buf(),
+            store: crate::config::StoreSettings {
+                bucket: String::new(),
+                region: String::new(),
+                endpoint: None,
+                prefix: String::new(),
+                path_style: false,
+            },
+            mtime_tolerance_ms: 1000,
+            concurrency: 4,
+        }
+    }
+
+    #[test]
+    fn requires_real_store_predicate() {
+        // W5 (A-M2/B-L5): push/pull/check need a configured store; status and
+        // help/version run against the mock.
+        assert!(requires_real_store(&Command::push(PathBuf::from("."), false)));
+        assert!(requires_real_store(&Command::pull(PathBuf::from("."), false)));
+        assert!(requires_real_store(&Command::check()));
+        assert!(!requires_real_store(&Command::status(PathBuf::from("."))));
+        assert!(!requires_real_store(&Command::Help));
+        assert!(!requires_real_store(&Command::Version));
+    }
+
+    #[test]
+    fn run_pull_requires_configured_store() {
+        // W5 (A-M2/B-L5) dispatch level: pull --delete with no [store] must
+        // refuse (exit 1) and leave the temp vault untoched - this locks shut
+        // the old hole where pull --delete planned DeleteLocal for every local
+        // file and deleted them against the empty mock with exit 0.
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("victim.md"), "precious").unwrap();
+        let settings = no_store_settings(dir.path());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings(Command::pull(dir.path().into(), true), &settings, &mut out, &mut err);
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(code, 1);
+        assert!(
+            err.contains("[store]") || err.to_lowercase().contains("store"),
+            "expected store refusal: {err}"
+        );
+        // no data loss
+        assert!(dir.join("victim.md").exists());
+        assert_eq!(std::fs::read(dir.join("victim.md")).unwrap(), b"precious");
+    }
+
+    #[test]
+    fn run_check_requires_configured_store() {
+        // W5 (B-L5): check without a bucket must never be a green mock probe.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let settings = no_store_settings(dir.path());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings(Command::check(), &settings, &mut out, &mut err);
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(code, 1);
+        assert!(
+            err.to_lowercase().contains("store"),
+            "expected store refusal: {err}"
+        );
+        assert!(!String::from_utf8(out).unwrap().contains("check: ok"), "must not be a mock green check");
     }
 
     #[test]
