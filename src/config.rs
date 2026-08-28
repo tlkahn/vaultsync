@@ -183,6 +183,15 @@ pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings,
     })
 }
 
+/// W69/W86 policy: an empty or whitespace-only value is treated as unset
+/// (mirroring the SDK's own env provider) - it must never flow through as
+/// `Some("")`, which would build `Region::new("")` / `endpoint_url("")`
+/// and fail late with an opaque SDK error. Shared by the env region and the
+/// config region/endpoint paths so the two can never drift.
+fn nonblank(v: Option<String>) -> Option<String> {
+    v.filter(|s| !s.trim().is_empty())
+}
+
 fn resolve_store(store: Option<&StoreConfig>, env: &EnvSnapshot) -> Result<StoreSettings, Error> {
     match store {
         // No `[store]` section -> offline/mock defaults, never an error.
@@ -215,12 +224,12 @@ fn resolve_store(store: Option<&StoreConfig>, env: &EnvSnapshot) -> Result<Store
             // unset (mirroring the SDK's own env provider) - it must never
             // override a config region with `Some("")`, which would build
             // `Region::new("")` and break the whole default chain.
-            let env_region = env
-                .aws_region
-                .as_ref()
-                .filter(|r| !r.trim().is_empty())
-                .cloned();
-            let region = env_region.or_else(|| s.region.clone());
+            let env_region = nonblank(env.aws_region.clone());
+            // r10-M2/W86: same policy for the config value itself - an
+            // empty/whitespace `[store].region` is unset, not a hard error
+            // (existing hand-written configs must not newly fail), and must
+            // never reach `Region::new("")`.
+            let region = env_region.or_else(|| nonblank(s.region.clone()));
             // W58/A nit: reject a configured prefix with an empty path
             // segment ("a//b", "/a") loudly before normalize_prefix - such a
             // prefix would produce keys `ensure_valid_key` rejects. A single
@@ -238,7 +247,9 @@ fn resolve_store(store: Option<&StoreConfig>, env: &EnvSnapshot) -> Result<Store
             Ok(StoreSettings {
                 bucket,
                 region,
-                endpoint: s.endpoint.clone(),
+                // r10-M2/W86: empty/whitespace endpoint is unset - an
+                // `endpoint_url("")` fails late with an opaque SDK error.
+                endpoint: nonblank(s.endpoint.clone()),
                 prefix: normalize_prefix(prefix),
                 path_style: s.path_style.unwrap_or(false),
             })
@@ -393,6 +404,66 @@ mtime_tolerance_ms = 1000
         let cfg = FileConfig::default();
         let s = settings(&cfg).unwrap();
         assert_eq!(s.mtime_tolerance_ms, 1000);
+    }
+
+    #[test]
+    fn resolve_settings_empty_config_region_is_unset() {
+        // r10-M2 (W86): `[store].region = ""` / whitespace-only must be
+        // treated as unset, mirroring the W69 env policy - `Region::new("")`
+        // fails late with an opaque SDK error and breaks the default chain.
+        // Fails today: the config value flows through unfiltered as
+        // `Some("")`.
+        for bad in ["", "   "] {
+            let text = format!("[store]\nbucket = \"b\"\nregion = \"{bad}\"\n");
+            let cfg = parse_config_str(&text).unwrap();
+            let s = settings(&cfg).unwrap();
+            assert_eq!(
+                s.store.region, None,
+                "region {bad:?} must resolve to None (unset)"
+            );
+        }
+        // a real value still passes through
+        let cfg =
+            parse_config_str("[store]\nbucket = \"b\"\nregion = \"us-east-1\"\n").unwrap();
+        assert_eq!(
+            settings(&cfg).unwrap().store.region.as_deref(),
+            Some("us-east-1")
+        );
+        // env-region precedence over a whitespace config region is unchanged:
+        // the env value wins (whitespace config is unset, not a hard error)
+        let cfg =
+            parse_config_str("[store]\nbucket = \"b\"\nregion = \"   \"\n").unwrap();
+        let env = EnvSnapshot {
+            aws_region: Some("eu-west-3".to_string()),
+        };
+        let s = resolve_settings(&cfg, &env).unwrap();
+        assert_eq!(s.store.region.as_deref(), Some("eu-west-3"));
+    }
+
+    #[test]
+    fn resolve_settings_whitespace_config_endpoint_is_unset() {
+        // r10-M2 (W86): `[store].endpoint = ""` / whitespace-only must
+        // resolve to `None` - `endpoint_url("")` fails late with an opaque
+        // SDK error. Fails today: the config value flows through unfiltered
+        // as `Some("")`.
+        for bad in ["", "  "] {
+            let text = format!("[store]\nbucket = \"b\"\nendpoint = \"{bad}\"\n");
+            let cfg = parse_config_str(&text).unwrap();
+            let s = settings(&cfg).unwrap();
+            assert_eq!(
+                s.store.endpoint, None,
+                "endpoint {bad:?} must resolve to None (unset)"
+            );
+        }
+        // a real value still passes through
+        let cfg = parse_config_str(
+            "[store]\nbucket = \"b\"\nendpoint = \"https://minio.local\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            settings(&cfg).unwrap().store.endpoint.as_deref(),
+            Some("https://minio.local")
+        );
     }
 
     #[test]

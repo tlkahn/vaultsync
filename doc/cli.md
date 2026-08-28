@@ -157,6 +157,11 @@ shared config, profile) - there is no hardcoded region guess. Deliberately,
 an operator override of a checked-in file, matching how `AWS_*` behaves
 across AWS tooling.
 
+An empty or whitespace-only `region` or `endpoint` in the config (or an
+empty `AWS_REGION`) means **unset**: it is filtered at resolution, so it can
+never reach the SDK as `Region::new("")` / `endpoint_url("")` (which fail
+late with an opaque error). Treat an empty string as "not configured".
+
 A relative `vault_root` (e.g. `vault_root = "."` or `notes`) resolves
 against the process working directory, not the config file's directory;
 anchor it absolutely if you rely on the file's location.
