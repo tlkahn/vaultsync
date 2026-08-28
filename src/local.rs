@@ -115,12 +115,15 @@ impl LocalFs {
     ///   `expected_size` (a file that grew/shrunk between walk and open is a
     ///   per-key error, never a silently-truncated object);
     /// - mtime recheck: if `expected_mtime_ms` is `Some`, the opened
-    ///   descriptor's mtime must be within the default tolerance of it.
+    ///   descriptor's mtime must be within ``tolerance_ms`` of it (W2/PR2
+    ///   A-H2/B-M1 threads the resolved config tolerance here; the hardcoded
+    ///   default is now only the resolution default).
     pub fn open_verified(
         &self,
         key: &str,
         expected_size: u64,
         expected_mtime_ms: Option<u64>,
+        tolerance_ms: u64,
     ) -> Result<std::fs::File, Error> {
         let path = key_to_local_path(&self.root, key)?;
         // No-follow type check: reject a symlink swapped in after the walk.
@@ -157,7 +160,7 @@ impl LocalFs {
         if let Some(expect_ms) = expected_mtime_ms {
             if let Ok(mt) = fmd.modified() {
                 if let Some(actual_ms) = system_time_to_ms(mt) {
-                    if actual_ms.abs_diff(expect_ms) > crate::config::DEFAULT_MTIME_TOLERANCE_MS {
+                    if actual_ms.abs_diff(expect_ms) > tolerance_ms {
                         return Err(Error::Other(format!(
                             "open_verified: mtime changed for {} (expected {expect_ms}, found {actual_ms})",
                             key
@@ -924,7 +927,7 @@ mod tests {
         let dir = TempDir::new("vaultsync-test");
         std::fs::write(dir.join("a.md"), "hello world").unwrap();
         let fs = LocalFs::new(dir.path());
-        let mut f = fs.open_verified("a.md", 11, None).unwrap();
+        let mut f = fs.open_verified("a.md", 11, None, 1000).unwrap();
         let mut buf = String::new();
         std::io::Read::read_to_string(&mut f, &mut buf).unwrap();
         assert_eq!(buf, "hello world");
@@ -941,7 +944,7 @@ mod tests {
         std::fs::write(outside.join("secret"), "s").unwrap();
         std::os::unix::fs::symlink(outside.join("secret"), dir.join("a.md")).unwrap();
         let fs = LocalFs::new(dir.path());
-        let err = fs.open_verified("a.md", 1, None).unwrap_err();
+        let err = fs.open_verified("a.md", 1, None, 1000).unwrap_err();
         assert!(
             format!("{err}").contains("symlink"),
             "expected symlink refusal, got: {err}"
@@ -954,8 +957,30 @@ mod tests {
         let dir = TempDir::new("vaultsync-test");
         std::fs::write(dir.join("a.md"), "12345").unwrap();
         let fs = LocalFs::new(dir.path());
-        assert!(fs.open_verified("a.md", 5, None).is_ok());
-        assert!(fs.open_verified("a.md", 6, None).is_err(), "size mismatch not caught");
+        assert!(fs.open_verified("a.md", 5, None, 1000).is_ok());
+        assert!(fs.open_verified("a.md", 6, None, 1000).is_err(), "size mismatch not caught");
+    }
+
+    #[test]
+    fn local_open_verified_respects_custom_tolerance() {
+        // W2 (PR2 A-H2/B-M1): open_verified honors the ticket-in tolerance, not
+        // the hardcoded default. A file 3000 ms off the expected mtime is
+        // accepted with tolerance 5000 and rejected with tolerance 1000.
+        let dir = TempDir::new("vaultsync-test");
+        let f = dir.join("a.md");
+        std::fs::write(&f, "12345").unwrap();
+        let base = 1_700_000_000_000u64;
+        {
+            let fh = std::fs::File::open(&f).unwrap();
+            let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis(base);
+            fh.set_times(std::fs::FileTimes::new().set_modified(t)).unwrap();
+        }
+        let fs = LocalFs::new(dir.path());
+        assert!(fs.open_verified("a.md", 5, Some(base + 3000), 5000).is_ok());
+        let err = fs
+            .open_verified("a.md", 5, Some(base + 3000), 1000)
+            .unwrap_err();
+        assert!(format!("{err}").contains("mtime changed"), "err: {err}");
     }
 
     #[test]
@@ -963,7 +988,7 @@ mod tests {
         let dir = TempDir::new("vaultsync-test");
         let fs = LocalFs::new(dir.path());
         assert!(matches!(
-            fs.open_verified("gone.md", 1, None).unwrap_err(),
+            fs.open_verified("gone.md", 1, None, 1000).unwrap_err(),
             Error::NotFound(_)
         ));
     }

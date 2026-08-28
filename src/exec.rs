@@ -37,11 +37,15 @@ pub struct ExecFailure {
 }
 
 /// Apply a plan. `Mode::Status` plans never mutate anything (belt and braces).
+/// `opts` carries the resolved `mtime_tolerance_ms` used for the upload-side
+/// re-verification (W2, PR2 A-H2/B-M1) and, later, the pull destination
+/// freshness guard (W13).
 pub fn execute_plan(
     local: &LocalFs,
     store: &dyn ObjectStore,
     plan: &Plan,
     mode: Mode,
+    opts: &crate::plan::PlanOpts,
 ) -> ExecReport {
     let mut rep = ExecReport::default();
     if mode == Mode::Status {
@@ -58,7 +62,7 @@ pub fn execute_plan(
 
     // Pass 2: uploads (push).
     for a in plan.actions.iter().filter(|a| a.kind == ActionKind::Upload) {
-        match exec_upload(local, store, a) {
+        match exec_upload(local, store, a, opts.mtime_tolerance_ms) {
             Ok(()) => rep.executed += 1,
             Err(e) => fail(&mut rep, &a.key, e),
         }
@@ -134,7 +138,12 @@ fn exec_download(local: &LocalFs, store: &dyn ObjectStore, a: &crate::plan::Acti
 }
 
 /// Upload one key, re-verifying size + mtime at open (R3.3).
-fn exec_upload(local: &LocalFs, store: &dyn ObjectStore, a: &crate::plan::Action) -> Result<(), Error> {
+fn exec_upload(
+    local: &LocalFs,
+    store: &dyn ObjectStore,
+    a: &crate::plan::Action,
+    tolerance_ms: u64,
+) -> Result<(), Error> {
     let local_ent = a
         .local
         .as_ref()
@@ -142,7 +151,7 @@ fn exec_upload(local: &LocalFs, store: &dyn ObjectStore, a: &crate::plan::Action
     // Planned size and mtime are the truth the walk recorded; a file that
     // changed between walk and open fails here (per-key), not silently.
     let expected_mtime = local_ent.mtime_ms;
-    let mut f = local.open_verified(&a.key, local_ent.size, expected_mtime)?;
+    let mut f = local.open_verified(&a.key, local_ent.size, expected_mtime, tolerance_ms)?;
     store.put_from(&a.key, &mut f, local_ent.size, expected_mtime)?;
     Ok(())
 }
@@ -237,13 +246,44 @@ mod tests {
         let local = LocalFs::new(dir.path());
         let store = MemoryStore::new();
         let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default()).unwrap();
-        let rep = execute_plan(&local, &store, &plan, Mode::Push);
+        let rep = execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default());
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert_eq!(rep.executed, 1);
         let e = store.head("a.md").unwrap();
         assert_eq!(e.size, 5);
         assert_eq!(e.mtime_ms, Some(mt));
         assert_eq!(get_bytes(&store, "a.md"), b"hello");
+    }
+
+    fn set_mtime_ms(p: &std::path::Path, ms: u64) {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms);
+        let times = std::fs::FileTimes::new().set_modified(t);
+        std::fs::File::open(p).unwrap().set_times(times).unwrap();
+    }
+
+    #[test]
+    fn exec_upload_uses_plan_tolerance() {
+        // W2 (PR2 A-H2/B-M1): the executor passes the plan's mtime tolerance to
+        // open_verified. A file that drifts 3000 ms between walk and open is
+        // accepted under plan tolerance 5000 (today: the hardcoded 1000 fails
+        // the key).
+        let dir = TempDir::new("vaultsync-exec");
+        let p = dir.join("a.md");
+        std::fs::write(&p, "hello").unwrap();
+        let base = 1_700_000_000_000u64;
+        set_mtime_ms(&p, base);
+        let local = LocalFs::new(dir.path());
+        let store = MemoryStore::new();
+        let opts = PlanOpts {
+            mtime_tolerance_ms: 5000,
+            ..Default::default()
+        };
+        let plan = crate::build_plan(&local, &store, Mode::Push, &opts).unwrap();
+        // drift the file 3000 ms after the plan captured its mtime
+        set_mtime_ms(&p, base + 3000);
+        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Push, &opts);
+        assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep.failed);
+        assert_eq!(rep.executed, 1, "{:?}", rep);
     }
 
     #[test]
@@ -253,7 +293,7 @@ mod tests {
         put_str(&store, "n/b.md", "remote-bytes", Some(1_700_000_000_123));
         let local = LocalFs::new(dir.path());
         let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
-        let rep = execute_plan(&local, &store, &plan, Mode::Pull);
+        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert_eq!(std::fs::read(dir.join("n/b.md")).unwrap(), b"remote-bytes");
         let got = mtime_ms(&dir.join("n/b.md"));
@@ -274,7 +314,7 @@ mod tests {
             ..Default::default()
         };
         let plan = crate::build_plan(&local, &store, Mode::Push, &opts).unwrap();
-        let rep = execute_plan(&local, &store, &plan, Mode::Push);
+        let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert!(matches!(
             store.head("gone.md").unwrap_err(),
@@ -296,7 +336,7 @@ mod tests {
             ..Default::default()
         };
         let plan = crate::build_plan(&local, &store, Mode::Pull, &opts).unwrap();
-        let rep = execute_plan(&local, &store, &plan, Mode::Pull);
+        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &opts);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert!(!dir.join("n/gone.md").exists());
         // both `sub` and `n` are now empty -> removed bottom-up; root stays.
@@ -318,7 +358,7 @@ mod tests {
             ..Default::default()
         };
         let plan = crate::build_plan(&local, &store, Mode::Push, &opts).unwrap();
-        let rep = execute_plan(&local, &store, &plan, Mode::Push);
+        let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         let log = store.log();
         let put = log.iter().position(|l| l == "put_from:a.md");
@@ -342,7 +382,7 @@ mod tests {
         let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default()).unwrap();
         let before_c = store.head("c.md").unwrap();
         let before_a = store.head("a.md").unwrap();
-        let rep = execute_plan(&local, &store, &plan, Mode::Push);
+        let rep = execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default());
         assert_eq!(rep.executed, 0, "no transfers expected");
         assert_eq!(rep.failed, Vec::<ExecFailure>::new());
         // nothing mutated
@@ -363,7 +403,7 @@ mod tests {
         use std::io::Write as _;
         f.write_all(b"defghijklmnop").unwrap();
         drop(f);
-        let rep = execute_plan(&local, &store, &plan, Mode::Push);
+        let rep = execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default());
         assert!(
             rep.failed.iter().any(|fl| fl.key == "a.md"),
             "a.md not failed: {:?}",
@@ -385,7 +425,7 @@ mod tests {
         let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
         // remote vanishes between plan and execute
         store.delete("a.md").unwrap();
-        let rep = execute_plan(&local, &store, &plan, Mode::Pull);
+        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
         assert!(
             rep.failed.iter().any(|fl| fl.key == "a.md"),
             "a.md not failed: {:?}",
@@ -407,7 +447,7 @@ mod tests {
         use std::io::Write as _;
         f.write_all(b"aaaaaaaaaa").unwrap();
         drop(f);
-        let rep = execute_plan(&local, &store, &plan, Mode::Push);
+        let rep = execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default());
         assert_eq!(rep.executed, 1, "only ok.md");
         assert_eq!(rep.failed.len(), 1);
         assert_eq!(rep.failed[0].key, "bad.md");
@@ -423,7 +463,7 @@ mod tests {
         put_str(&store, "K/x", "child", Some(100));
         let local = LocalFs::new(dir.path());
         let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default()).unwrap();
-        let rep = execute_plan(&local, &store, &plan, Mode::Push);
+        let rep = execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default());
         assert_eq!(rep.executed, 0);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new());
         // nothing uploaded as file `K`
@@ -439,7 +479,7 @@ mod tests {
         put_str(&store, "b.md", "remote", Some(100));
         let local = LocalFs::new(dir.path());
         let plan = crate::build_plan(&local, &store, Mode::Status, &PlanOpts::default()).unwrap();
-        let rep = execute_plan(&local, &store, &plan, Mode::Status);
+        let rep = execute_plan(&local, &store, &plan, Mode::Status, &PlanOpts::default());
         assert_eq!(rep.executed, 0);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new());
         // no upload of a.md, no download of b.md

@@ -282,9 +282,12 @@ fn reject_json(err: &mut dyn Write) -> i32 {
 }
 
 /// Dispatch a command against a store, writing to `out`/`err`. Returns exit code.
+/// `tolerance_ms` is the resolved `transfer.mtime_tolerance_ms` threaded into
+/// every `PlanOpts` (W2, PR2 A-H2/B-M1).
 pub fn run_with_io(
     cmd: Command,
     store: &dyn ObjectStore,
+    tolerance_ms: u64,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
@@ -324,7 +327,10 @@ pub fn run_with_io(
             if json {
                 return reject_json(err);
             }
-            let opts = PlanOpts::default();
+            let opts = PlanOpts {
+                mtime_tolerance_ms: tolerance_ms,
+                ..Default::default()
+            };
             let local = crate::local::LocalFs::with_follow(&vault, follow_symlinks);
             match crate::build_plan(&local, store, Mode::Status, &opts) {
                 Ok(plan) => {
@@ -353,6 +359,7 @@ pub fn run_with_io(
                 return reject_json(err);
             }
             let opts = PlanOpts {
+                mtime_tolerance_ms: tolerance_ms,
                 delete,
                 force_local,
                 force_remote,
@@ -375,6 +382,7 @@ pub fn run_with_io(
                 return reject_json(err);
             }
             let opts = PlanOpts {
+                mtime_tolerance_ms: tolerance_ms,
                 delete,
                 force_local,
                 force_remote,
@@ -428,7 +436,7 @@ fn dispatch_plan(
             if dry_run {
                 if is_clean(&plan) { 0 } else { 2 }
             } else {
-                let report = crate::exec::execute_plan(&local, store, &plan, mode);
+                let report = crate::exec::execute_plan(&local, store, &plan, mode, opts);
                 for f in &report.failed {
                     let _ = writeln!(err, "error: {}\n  {}", f.key, f.message);
                 }
@@ -525,7 +533,8 @@ pub fn run_from_env() -> i32 {
 
     // help/version need no config and must not fail on a bad config file.
     if matches!(cmd, Command::Help | Command::Version) {
-        return run_with_io(cmd, &MemoryStore::new(), &mut out, &mut err);
+        // help/version need no tolerance; the value is unused for these.
+        return run_with_io(cmd, &MemoryStore::new(), 0, &mut out, &mut err);
     }
 
     // Load + resolve config, then merge the config vault_root into the command.
@@ -566,7 +575,7 @@ pub fn run_from_env() -> i32 {
             }
         }
     };
-    run_with_io(cmd, store.as_ref(), &mut out, &mut err)
+    run_with_io(cmd, store.as_ref(), settings.mtime_tolerance_ms, &mut out, &mut err)
 }
 
 #[cfg(test)]
@@ -894,9 +903,13 @@ mod tests {
     // --- dispatch ---
 
     fn run(cmd: Command, store: &dyn ObjectStore) -> (i32, String, String) {
+        run_tol(cmd, store, crate::config::DEFAULT_MTIME_TOLERANCE_MS)
+    }
+
+    fn run_tol(cmd: Command, store: &dyn ObjectStore, tolerance_ms: u64) -> (i32, String, String) {
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_with_io(cmd, store, &mut out, &mut err);
+        let code = run_with_io(cmd, store, tolerance_ms, &mut out, &mut err);
         (
             code,
             String::from_utf8(out).unwrap(),
@@ -1049,6 +1062,39 @@ mod tests {
         assert!(store.head("a.md").is_ok());
         assert!(out.contains("plan:"), "no summary: {out}");
         assert!(out.lines().any(|l| l.starts_with("U  a.md")));
+    }
+
+    #[test]
+    fn cli_dispatch_uses_configured_tolerance() {
+        // W2 (PR2 A-H2/B-M1): the resolved transfer tolerance reaches the plan
+        // via the dispatch seam. Local `a.md` is 4000 ms newer than the remote;
+        // with tolerance 5000 they are Equal (Skip), with the default 1000 the
+        // row would be an Upload.
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "same").unwrap();
+        let local_ms = 1_700_000_004_000u64;
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis(local_ms);
+        std::fs::File::open(dir.join("a.md"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(t))
+            .unwrap();
+        let store = MemoryStore::new();
+        let mut cursor = std::io::Cursor::new(b"same".to_vec());
+        store
+            .put_from("a.md", &mut cursor, 4, Some(1_700_000_000_000))
+            .unwrap();
+        let (code, out, _) = run_tol(Command::push(dir.path().into(), false), &store, 5000);
+        assert_eq!(code, 0);
+        assert!(
+            !out.lines().any(|l| l.starts_with("U  a.md")),
+            "expected Skip under tolerance 5000: {out}"
+        );
+        // sanity: same command under the default 1000 does plan an Upload
+        let (_, out2, _) = run(Command::push(dir.path().into(), false), &store);
+        assert!(
+            out2.lines().any(|l| l.starts_with("U  a.md")),
+            "expected Upload under default tolerance: {out2}"
+        );
     }
 
     #[test]

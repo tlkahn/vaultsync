@@ -279,7 +279,7 @@ fn s3_integ_e2e_push_pull() {
         let local = LocalFs::new(&src);
         let plan = vaultsync::build_plan(&local, s, Mode::Push, &PlanOpts::default())
             .map_err(|e| format!("{e}"))?;
-        let rep = vaultsync::exec::execute_plan(&local, s, &plan, Mode::Push);
+        let rep = vaultsync::exec::execute_plan(&local, s, &plan, Mode::Push, &PlanOpts::default());
         assert!(rep.failed.is_empty(), "push failures: {:?}", rep.failed);
 
         // wipe the source, pull into a fresh dir
@@ -288,7 +288,7 @@ fn s3_integ_e2e_push_pull() {
         let ldst = LocalFs::new(&dst);
         let plan2 = vaultsync::build_plan(&ldst, s, Mode::Pull, &PlanOpts::default())
             .map_err(|e| format!("{e}"))?;
-        let rep2 = vaultsync::exec::execute_plan(&ldst, s, &plan2, Mode::Pull);
+        let rep2 = vaultsync::exec::execute_plan(&ldst, s, &plan2, Mode::Pull, &PlanOpts::default());
         assert!(rep2.failed.is_empty(), "pull failures: {:?}", rep2.failed);
 
         // byte- and mtime-compare each expected file
