@@ -40,6 +40,12 @@ use crate::store::ObjectStore;
 /// User-metadata key for the client-visible mtime (decimal ms).
 const MTIME_KEY: &str = "vaultsync-mtime";
 
+/// Single-PUT ceiling (S3 PutObject max object size, documented in
+/// object-store.md / cli.md): `put_from` rejects a larger size client-side
+/// before buffering or uploading (W80/r8b L3) instead of paying the whole
+/// disk buffer + upload attempt and failing at the backend.
+const MAX_SINGLE_PUT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
 /// The S3 backend. Async fully contained behind the `Runtime`.
 pub struct S3Store {
     client: Client,
@@ -518,6 +524,15 @@ impl ObjectStore for S3Store {
     ) -> Result<Entity, Error> {
         // Validate before any client call (trait N1).
         validate_put_key(key)?;
+        // W80/r8b L3: reject above the documented 5 GiB single-PUT ceiling
+        // client-side, BEFORE buffering the reader to a temp file or paying an
+        // upload attempt - the backend would reject it anyway, after the whole
+        // disk buffer was written. S3-specific; the mock has no ceiling.
+        if size > MAX_SINGLE_PUT_BYTES {
+            return Err(Error::Other(format!(
+                "put_from: {key} is {size} bytes, above the 5 GiB single-PUT ceiling (multipart is post-v1)"
+            )));
+        }
         let fk = full_key(&self.prefix, key);
 
         // Buffer the reader to a temp file on disk (never a size-sized Vec),
@@ -596,6 +611,34 @@ impl ObjectStore for S3Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn s3_put_from_rejects_above_single_put_ceiling() {
+        // r8b L3 (W80): put_from must reject a size above the documented
+        // 5 GiB single-PUT ceiling client-side, BEFORE buffering the reader
+        // to a temp file or attempting the upload - fail fast with a clear
+        // message instead of the unrelated short-read failure that a
+        // 5 GiB-sized empty reader produces today. Client construction is
+        // offline-safe (the existing s3store_new_normalizes_prefix does the
+        // same). RED today: falls through to the buffer loop and errors with
+        // "short read".
+        let settings = StoreSettings {
+            bucket: "bucket".to_string(),
+            region: None,
+            endpoint: None,
+            prefix: String::new(),
+            path_style: false,
+        };
+        let store = S3Store::new(&settings).unwrap();
+        let mut r = std::io::empty();
+        let err = store
+            .put_from("a.md", &mut r, 5 * 1024 * 1024 * 1024 + 1, None)
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("5 GiB"),
+            "expected a 5 GiB ceiling error, got: {err}"
+        );
+    }
 
     #[test]
     fn effective_get_size_reports_streamed_bytes() {
