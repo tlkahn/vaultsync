@@ -304,8 +304,11 @@ impl LocalFs {
     /// executor's writer lifetime to the locality re-check/rename tail for
     /// one saved open+close per file, and `finalize_write` also needs the
     /// path (not just the fd) for the temp-cleanup and rename tails. The
-    /// re-open window is provably harmless (unique temp name, `create_new`
-    /// allocation, owner-only file).
+    /// re-open window is guarded by the regular-file check (W107/M2): a temp
+    /// swapped for a symlink or other node type after the writer handle drops
+    /// is refused before open/sync/rename, and the accidental-collision case
+    /// (a pre-planted symlink or stale leftover at a candidate name) is
+    /// covered by the unique `create_new` allocation (W40).
     pub fn finalize_write(
         &self,
         key: &str,
@@ -314,6 +317,27 @@ impl LocalFs {
     ) -> Result<(), Error> {
         let path = key_to_local_path(&self.root, key)?;
         let result = (|| -> Result<(), Error> {
+            // W107/M2: the temp is re-opened by path below, so the
+            // post-allocation window (writer handle dropped, before the
+            // re-open) is guarded the same way every sibling path guards it:
+            // no-follow stat, refuse a symlink or any non-regular node, never
+            // open through it. A vanished temp falls through to `File::open`,
+            // which reports the same NotFound the old path did. The cleanup
+            // below removes the temp (a symlink `remove_file` unlinks the
+            // link itself, never the target).
+            let smd = std::fs::symlink_metadata(tmp)?;
+            if smd.file_type().is_symlink() {
+                return Err(Error::Other(format!(
+                    "download temp is now a symlink: {}",
+                    path.display()
+                )));
+            }
+            if !smd.is_file() {
+                return Err(Error::Other(format!(
+                    "download temp is no longer a regular file: {}",
+                    path.display()
+                )));
+            }
             let f = std::fs::File::open(tmp)?;
             if let Some(ms) = mtime_ms {
                 set_file_mtime_ms(&f, ms)?;
@@ -2027,6 +2051,59 @@ mod tests {
         );
         // the directory (final path) is untouched
         assert!(dir.join("sub/a.md").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finalize_write_refuses_symlinked_temp() {
+        // W107/M2: the temp path is re-opened by `finalize_write` after the
+        // writer handle drops; a temp swapped for a symlink to an outside
+        // file in that window must be refused (the re-open must not land
+        // mtime/sync on the target) and the symlink inode removed, never
+        // renamed onto the vault key. Fails today: `File::open` follows the
+        // link and the symlink is renamed over the final path.
+        let dir = TempDir::new("vaultsync-test");
+        let outside = TempDir::new("vaultsync-outside");
+        std::fs::write(outside.join("victim"), "s").unwrap();
+        let fs = LocalFs::new(dir.path());
+        let (tmp, _f, _created) = fs.tmp_path_for("a.md").unwrap();
+        std::fs::write(&tmp, "payload").unwrap();
+        drop(_f);
+        // swap the temp for a symlink to an outside file after the writer
+        // handle dropped
+        std::fs::remove_file(&tmp).unwrap();
+        std::os::unix::fs::symlink(outside.join("victim"), &tmp).unwrap();
+        let err = fs.finalize_write("a.md", &tmp, None).unwrap_err();
+        assert!(
+            format!("{err}").contains("symlink"),
+            "no symlink refusal: {err}"
+        );
+        // the outside target is untouched (mtime/sync never landed on it)
+        assert_eq!(std::fs::read(outside.join("victim")).unwrap(), b"s");
+        // the final path never appeared and the symlink temp was removed
+        assert!(!dir.join("a.md").exists(), "symlink renamed onto the key");
+        assert!(!tmp.exists(), "symlink temp not removed: {:?}", tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finalize_write_refuses_directory_temp() {
+        // W107/M2: a temp replaced by a directory in the re-open window must
+        // be refused with the non-regular arm - a rename of a dir onto a file
+        // path would otherwise surface as a confusing rename error (or worse).
+        let dir = TempDir::new("vaultsync-test");
+        let fs = LocalFs::new(dir.path());
+        let (tmp, _f, _created) = fs.tmp_path_for("a.md").unwrap();
+        std::fs::write(&tmp, "payload").unwrap();
+        drop(_f);
+        std::fs::remove_file(&tmp).unwrap();
+        std::fs::create_dir(&tmp).unwrap();
+        let err = fs.finalize_write("a.md", &tmp, None).unwrap_err();
+        assert!(
+            format!("{err}").contains("regular file"),
+            "no non-regular refusal: {err}"
+        );
+        assert!(!dir.join("a.md").exists(), "directory renamed onto the key");
     }
 
     #[test]
