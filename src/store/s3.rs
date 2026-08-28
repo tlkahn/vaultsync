@@ -288,8 +288,13 @@ fn convert_listed(items: Vec<(String, u64, Option<u64>)>) -> (Vec<Entity>, Vec<(
             },
         );
     }
-    let file_keys: Vec<String> = map.keys().cloned().collect();
-    for f in file_keys.iter().flat_map(|k| parent_folders(k)) {
+    // M7/W103: collect the synthesized parent folders directly from the
+    // keys (each `parent_folders` allocates its own `String`s) - no full-key
+    // clone into an intermediate `Vec<String>` first. `parents` must be
+    // materialized before mutating `map`, but the keys themselves are never
+    // cloned.
+    let parents: Vec<String> = map.keys().flat_map(|k| parent_folders(k)).collect();
+    for f in parents {
         map.entry(f.clone()).or_insert(Entity {
             key: f,
             size: 0,
