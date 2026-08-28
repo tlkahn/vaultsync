@@ -322,10 +322,37 @@ fn s3_integ_streaming_put_large() {
     });
 }
 
-fn temp_dir(label: &str) -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!("vaultsync-itest-dir-{}-{}", unique_num(), label));
-    std::fs::create_dir_all(&p).unwrap();
-    p
+/// A local temp directory that removes itself (and its contents) on drop
+/// (W73/A-N4): an assertion failure must not leak the dir - the old explicit
+/// `remove_dir_all` calls ran only on the success path and were unreachable
+/// after a panicking assert, while `with_store`'s sweeper covers bucket
+/// objects only.
+struct TestDir(std::path::PathBuf);
+
+impl TestDir {
+    fn new(label: &str) -> TestDir {
+        let p =
+            std::env::temp_dir().join(format!("vaultsync-itest-dir-{}-{}", unique_num(), label));
+        std::fs::create_dir_all(&p).unwrap();
+        TestDir(p)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for TestDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 fn mtime_ms(p: &std::path::Path) -> u64 {
@@ -359,7 +386,7 @@ fn s3_integ_e2e_push_pull() {
     // folders + binary + unicode), wipe local, pull into a fresh dir, and
     // byte- and mtime-compare.
     with_store("e2e", |s| {
-        let src = temp_dir("src");
+        let src = TestDir::new("src");
         std::fs::create_dir_all(src.join("notes")).unwrap();
         let files: Vec<(&str, Vec<u8>)> = vec![
             ("note.md", b"hello world\n".to_vec()),
@@ -380,16 +407,16 @@ fn s3_integ_e2e_push_pull() {
         }
 
         // push
-        let local = LocalFs::new(&src);
+        let local = LocalFs::new(src.path());
         let plan = vaultsync::build_plan(&local, s, Mode::Push, &PlanOpts::default())
             .map_err(|e| format!("{e}"))?;
         let rep = vaultsync::exec::execute_plan(&local, s, &plan, Mode::Push, &PlanOpts::default());
         assert!(rep.failed.is_empty(), "push failures: {:?}", rep.failed);
 
         // wipe the source, pull into a fresh dir
-        let _ = std::fs::remove_dir_all(&src);
-        let dst = temp_dir("dst");
-        let ldst = LocalFs::new(&dst);
+        let _ = std::fs::remove_dir_all(src.path());
+        let dst = TestDir::new("dst");
+        let ldst = LocalFs::new(dst.path());
         let plan2 = vaultsync::build_plan(&ldst, s, Mode::Pull, &PlanOpts::default())
             .map_err(|e| format!("{e}"))?;
         let rep2 =
@@ -404,7 +431,6 @@ fn s3_integ_e2e_push_pull() {
             assert!(gm.abs_diff(fixed) < 2000, "{rel} mtime {gm} != {fixed}");
         }
 
-        let _ = std::fs::remove_dir_all(&dst);
         Ok(())
     });
 }
