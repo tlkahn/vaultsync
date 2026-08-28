@@ -62,6 +62,10 @@ action a plan - or delete files - against a non-existent store).
   written as `.name.vaultsync-tmp-<pid>-<n>` siblings and cleaned up on every
   error path; the walker additionally skips any file matching this reserved
   pattern so a crash leftover can never be pushed as a real key.
+- **`[ignore].patterns` and `[transfer].concurrency` are Phase 3.** They are
+  parsed but not yet applied: `push`/`pull`/`check` refuse loudly on a
+  non-empty `[ignore].patterns` (`status` warns), and an explicitly-set
+  `[transfer].concurrency` warns on every run until the pool exists.
 - **The integration suite skips without `VAULTSYNC_TEST_S3_BUCKET`.** The S3
   tests compile always but skip at runtime with a `[skip]` note when the env
   var is unset, keeping `cargo test` green offline. Set it (plus optional
