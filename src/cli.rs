@@ -599,6 +599,16 @@ fn run_with_settings(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
+    // W28/M6: `[transfer].concurrency` is a Phase 3 feature (inert until the
+    // pool exists). An explicitly-set value is warned every run; the default
+    // is silent.
+    if settings.concurrency_explicitly_set {
+        let _ = writeln!(
+            err,
+            "warning: [transfer].concurrency = {} is a Phase 3 feature and is not yet applied; transfers stay sequential",
+            settings.concurrency
+        );
+    }
     // W25/M3: `[ignore].patterns` is a Phase 3 feature (parsed but not yet
     // applied). A mutating command that would silently not apply it must
     // refuse loudly; `status` (read-only) warns and proceeds with the plan.
@@ -1217,6 +1227,7 @@ mod tests {
             mtime_tolerance_ms: 1000,
             concurrency: 4,
             ignore_patterns: Vec::new(),
+            concurrency_explicitly_set: false,
         }
     }
 
@@ -1295,6 +1306,50 @@ mod tests {
             "expected ignore/Phase-3 warning: {err}"
         );
         assert!(out.contains("plan:"), "plan produced: {out}");
+    }
+
+    #[test]
+    fn run_warns_on_configured_concurrency() {
+        // W28/M6: an explicitly-set `[transfer].concurrency` is inert until
+        // Phase 3 (the pool does not exist); warn on stderr every run, exit 0.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let mut settings = no_store_settings(dir.path());
+        settings.concurrency_explicitly_set = true;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings(
+            Command::status(dir.path().into()),
+            &settings,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(code, 0);
+        assert!(
+            err.to_lowercase().contains("concurrency") && err.to_lowercase().contains("phase 3"),
+            "expected inert-concurrency warning: {err}"
+        );
+    }
+
+    #[test]
+    fn run_does_not_warn_without_configured_concurrency() {
+        // W28/M6: only an explicitly-set value warns; the default must not.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let settings = no_store_settings(dir.path()); // flag false
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings(
+            Command::status(dir.path().into()),
+            &settings,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(code, 0);
+        assert!(
+            !err.to_lowercase().contains("concurrency"),
+            "spurious concurrency warning: {err}"
+        );
     }
 
     #[test]

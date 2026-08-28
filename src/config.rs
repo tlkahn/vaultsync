@@ -73,6 +73,10 @@ pub struct Settings {
     /// is surfaced loudly - never silently applied - so a user copying the
     /// cli.md example is not let to believe patterns are in effect.
     pub ignore_patterns: Vec<String>,
+    /// True when the TOML explicitly set `[transfer].concurrency` (W28/M6):
+    /// inert until Phase 3 (the pool does not exist), so dispatch warns rather
+    /// than silently accepting it.
+    pub concurrency_explicitly_set: bool,
 }
 
 /// Resolved store connection settings (no credentials - those stay in the AWS
@@ -164,12 +168,14 @@ pub fn resolve_settings(cfg: &FileConfig, cli: &Cli, env: &EnvSnapshot) -> Resul
         .as_ref()
         .map(|i| i.patterns.clone())
         .unwrap_or_default();
+    let concurrency_explicitly_set = cfg.transfer.as_ref().and_then(|t| t.concurrency).is_some();
     Ok(Settings {
         vault_root,
         store,
         mtime_tolerance_ms,
         concurrency,
         ignore_patterns,
+        concurrency_explicitly_set,
     })
 }
 
