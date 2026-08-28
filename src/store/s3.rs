@@ -35,7 +35,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use crate::config::StoreSettings;
 use crate::entity::Entity;
 use crate::error::Error;
-use crate::store::ObjectStore;
+use crate::store::{Listing, ObjectStore};
 
 /// User-metadata key for the client-visible mtime (decimal ms).
 const MTIME_KEY: &str = "vaultsync-mtime";
@@ -302,6 +302,22 @@ fn convert_listed(items: Vec<(String, u64, Option<u64>)>) -> (Vec<Entity>, Vec<(
     (map.into_values().collect(), dropped_nonempty)
 }
 
+/// Map the dropped non-empty `*/` keys from [`convert_listed`] to warning
+/// strings (W70/A-N2, H1/W99). Pure so the mapping is unit-testable without
+/// a live S3 client; `S3Store::list` puts the result in `Listing.warnings`
+/// and the CLI prints them. Same text as the original eprintln, minus the
+/// CLI `warning: ` prefix.
+fn dropped_folder_warnings(dropped: Vec<(String, u64)>) -> Vec<String> {
+    dropped
+        .into_iter()
+        .map(|(key, size)| {
+            format!(
+                "ignoring remote object {key} ({size} bytes): keys ending in '/' are folder markers; rename it to sync"
+            )
+        })
+        .collect()
+}
+
 /// Validate a key for object operations (head/get/delete): folders are not
 /// objects -> NotFound, matching the trait contract.
 fn validate_object_key(key: &str) -> Result<(), Error> {
@@ -482,19 +498,16 @@ fn create_temp_upload_file() -> Result<(PathBuf, std::fs::File), Error> {
 }
 
 impl ObjectStore for S3Store {
-    fn list(&self, prefix: &str) -> Result<Vec<Entity>, Error> {
+    fn list(&self, prefix: &str) -> Result<Listing, Error> {
         let raw = self.list_prefix_objects(prefix)?;
         let (entities, dropped_nonempty) = convert_listed(raw);
-        // W70/A-N2: `ObjectStore::list` has no warning channel, so the v1
-        // surface is a best-effort one-line stderr warning per dropped key
-        // ("surface, don't hide") - a non-empty `*/` key would otherwise be
-        // invisible: never planned, never warned.
-        for (key, size) in dropped_nonempty {
-            eprintln!(
-                "warning: ignoring remote object {key} ({size} bytes): keys ending in '/' are folder markers; rename it to sync"
-            );
-        }
-        Ok(entities)
+        // W70/A-N2 + H1 (W99): a non-empty `*/` key would otherwise be
+        // invisible - never planned, never warned. The warning now travels in
+        // the `Listing.warnings` channel (same text as before, minus the CLI
+        // "warning: " prefix) so the CLI layer prints it; library code must
+        // not write to process stderr.
+        let warnings = dropped_folder_warnings(dropped_nonempty);
+        Ok(Listing { entities, warnings })
     }
 
     fn head(&self, key: &str) -> Result<Entity, Error> {
@@ -861,6 +874,25 @@ mod tests {
         );
         assert_eq!(dropped, vec![("odd/".to_string(), 10)]);
         assert!(ents.iter().any(|e| e.key == "real.md"));
+    }
+
+    #[test]
+    fn list_reports_dropped_nonempty_folder_keys_as_warnings() {
+        // H1 (W99): the W70 dropped-key warning must flow through the
+        // `Listing.warnings` channel (same text as today's eprintln, without
+        // the CLI "warning: " prefix) instead of `eprintln!` from library
+        // code. `dropped_folder_warnings` is the pure mapping
+        // `S3Store::list` applies to `convert_listed`'s dropped list; the
+        // `Listing` type is its return channel. RED: neither exists
+        // (compile failure).
+        let listing = crate::store::Listing {
+            entities: Vec::new(),
+            warnings: dropped_folder_warnings(vec![("odd/".to_string(), 10)]),
+        };
+        assert_eq!(
+            listing.warnings,
+            vec!["ignoring remote object odd/ (10 bytes): keys ending in '/' are folder markers; rename it to sync".to_string()]
+        );
     }
 
     #[cfg(unix)]

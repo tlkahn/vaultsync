@@ -352,10 +352,17 @@ pub fn run_with_io(
             };
             let local = crate::local::LocalFs::with_follow(&vault, follow_symlinks);
             match crate::build_plan(&local, store, Mode::Status, &opts) {
-                Ok(plan) => {
+                Ok(report) => {
+                    // H1 (W99): build_plan + store-listing warnings surface
+                    // here, at the CLI layer - library code never writes to
+                    // stderr.
+                    for w in &report.warnings {
+                        let _ = writeln!(err, "warning: {w}");
+                    }
                     print_walk_warnings(&local, follow_symlinks, err);
-                    let _ = write!(out, "{}", crate::format_plan_human_verbose(&plan, verbose));
-                    if is_clean(&plan) { 0 } else { 2 }
+                    let plan = &report.plan;
+                    let _ = write!(out, "{}", crate::format_plan_human_verbose(plan, verbose));
+                    if is_clean(plan) { 0 } else { 2 }
                 }
                 Err(e) => {
                     let _ = writeln!(err, "error: {e}");
@@ -473,17 +480,23 @@ fn dispatch_plan(
 ) -> i32 {
     let local = crate::local::LocalFs::with_follow(vault, flags.follow_symlinks);
     match crate::build_plan(&local, store, mode, opts) {
-        Ok(plan) => {
+        Ok(report) => {
+            // H1 (W99): build_plan + store-listing warnings surface here, at
+            // the CLI layer - library code never writes to stderr.
+            for w in &report.warnings {
+                let _ = writeln!(err, "warning: {w}");
+            }
             print_walk_warnings(&local, flags.follow_symlinks, err);
+            let plan = &report.plan;
             let _ = write!(
                 out,
                 "{}",
-                crate::format_plan_human_verbose(&plan, flags.verbose)
+                crate::format_plan_human_verbose(plan, flags.verbose)
             );
             if flags.dry_run {
-                if is_clean(&plan) { 0 } else { 2 }
+                if is_clean(plan) { 0 } else { 2 }
             } else {
-                let report = crate::exec::execute_plan(&local, store, &plan, mode, opts);
+                let report = crate::exec::execute_plan(&local, store, plan, mode, opts);
                 for w in &report.warnings {
                     let _ = writeln!(err, "warning: {w}");
                 }
@@ -1234,7 +1247,7 @@ mod tests {
         inner: MemoryStore,
     }
     impl ObjectStore for FailPutStore {
-        fn list(&self, prefix: &str) -> Result<Vec<crate::entity::Entity>, crate::error::Error> {
+        fn list(&self, prefix: &str) -> Result<crate::store::Listing, crate::error::Error> {
             self.inner.list(prefix)
         }
         fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
@@ -1334,7 +1347,7 @@ mod tests {
         inner: MemoryStore,
     }
     impl ObjectStore for CheckFailStore {
-        fn list(&self, prefix: &str) -> Result<Vec<crate::entity::Entity>, crate::error::Error> {
+        fn list(&self, prefix: &str) -> Result<crate::store::Listing, crate::error::Error> {
             self.inner.list(prefix)
         }
         fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
@@ -1703,6 +1716,89 @@ mod tests {
         assert!(
             err.contains("warning:") && (err.contains("a/b") || err.contains("remove")),
             "cleanup warning missing from stderr: {err}"
+        );
+    }
+
+    /// A store whose `list` returns an injected advisory warning, to lock
+    /// that `Listing.warnings` (H1/W99, the S3 dropped-folder-key channel)
+    /// reaches stderr at CLI dispatch.
+    struct WarnListStore {
+        inner: MemoryStore,
+        warning: String,
+    }
+    impl ObjectStore for WarnListStore {
+        fn list(&self, prefix: &str) -> Result<crate::store::Listing, crate::error::Error> {
+            let mut listing = self.inner.list(prefix)?;
+            listing.warnings.push(self.warning.clone());
+            Ok(listing)
+        }
+        fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.head(key)
+        }
+        fn get_to(
+            &self,
+            key: &str,
+            w: &mut dyn std::io::Write,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime: Option<u64>,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.put_from(key, r, size, mtime)
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    #[test]
+    fn cli_listing_warning_reaches_stderr() {
+        // H1 (W99) mutation check: a `Listing.warnings` entry (the S3
+        // dropped-folder-key channel, W70/A-N2) must reach stderr at CLI
+        // dispatch as a `warning: ...` line. Teeth proven by deleting the
+        // dispatch print and watching this test fail.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = WarnListStore {
+            inner: MemoryStore::new(),
+            warning: "ignoring remote object odd/ (10 bytes): keys ending in '/' are folder markers; rename it to sync".to_string(),
+        };
+        let (code, _out, err) = run(Command::status(dir.path().into()), &store);
+        assert_eq!(code, 0, "warning must be non-fatal: {err}");
+        assert!(
+            err.contains("warning: ignoring remote object odd/ (10 bytes)")
+                && err.contains("folder markers"),
+            "listing warning missing from stderr: {err}"
+        );
+    }
+
+    #[test]
+    fn cli_reserved_namespace_warning_reaches_stderr() {
+        // H1 (W99) mutation check: the reserved-namespace warning (W79/r9-L1)
+        // must reach stderr at CLI dispatch as a `warning: ...` line instead
+        // of an eprintln from library code. Teeth proven by deleting the
+        // dispatch print and watching this test fail.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = MemoryStore::new();
+        store
+            .put_from(
+                ".vaultsync-check-1-2-3",
+                &mut std::io::Cursor::new(b"x".to_vec()),
+                1,
+                None,
+            )
+            .unwrap();
+        let (code, _out, err) = run(Command::status(dir.path().into()), &store);
+        assert_eq!(code, 0, "warning must be non-fatal: {err}");
+        assert!(
+            err.contains(
+                "warning: ignoring 1 remote object(s) under the reserved vaultsync namespace"
+            ) && err.contains(".vaultsync-check-1-2-3"),
+            "reserved-namespace warning missing from stderr: {err}"
         );
     }
 

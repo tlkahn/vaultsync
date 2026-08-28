@@ -12,6 +12,20 @@ use crate::error::Error;
 pub mod mock;
 pub mod s3;
 
+/// A listing result: the entities plus advisory warnings the backend wants
+/// surfaced (e.g. keys dropped while listing). A struct, not a tuple, so
+/// Phase 3 fields extend without another signature break. The CLI prints
+/// `warnings` (one `warning: ...` line each); library consumers may inspect
+/// or ignore them. Warnings never fail the listing - they describe what was
+/// silently dropped so nothing vanishes without a trace (W70/A-N2, H1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Listing {
+    /// The listed entities (sorted by key).
+    pub entities: Vec<Entity>,
+    /// Advisory warnings about the listing, printed by the CLI layer.
+    pub warnings: Vec<String>,
+}
+
 /// An object store holding a set of vault-relative keys.
 ///
 /// Implementations must be usable through `&self` (interior mutability) so the
@@ -38,7 +52,7 @@ pub trait ObjectStore {
     /// segment. Callers that want only the contents of a folder must pass a
     /// trailing `/` (e.g. `notes/`); passing `notes` will also match `notes.md`
     /// and any sibling whose key merely starts with `notes`.
-    fn list(&self, prefix: &str) -> Result<Vec<Entity>, Error>;
+    fn list(&self, prefix: &str) -> Result<Listing, Error>;
     /// Fetch metadata for a single object.
     fn head(&self, key: &str) -> Result<Entity, Error>;
     /// Stream object bytes into `w`, returning its metadata.

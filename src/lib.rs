@@ -19,6 +19,19 @@ use crate::local::LocalFs;
 use crate::plan::{ActionKind, Mode, Plan, PlanOpts};
 use crate::store::ObjectStore;
 
+/// A plan plus the advisory warnings surfaced while building it (dropped
+/// remote keys from the store listing, reserved-namespace leftovers). The CLI
+/// prints `warnings` (one `warning: ...` line each); library consumers may
+/// inspect or ignore them. A struct, not a tuple, so Phase 3 fields extend
+/// without another signature break (H1/W99).
+#[derive(Debug, Clone)]
+pub struct PlanReport {
+    /// The computed plan.
+    pub plan: Plan,
+    /// Advisory warnings about the inputs, printed by the CLI layer.
+    pub warnings: Vec<String>,
+}
+
 /// Build a [`Plan`] from a local walk + a store listing.
 ///
 /// Remote list keys are validated with `ensure_valid_key` before planning
@@ -30,9 +43,15 @@ pub fn build_plan(
     store: &dyn ObjectStore,
     mode: Mode,
     opts: &PlanOpts,
-) -> Result<Plan, Error> {
+) -> Result<PlanReport, Error> {
     let (local_entities, walk_report) = local.list_report()?;
-    let remote_entities = store.list("")?;
+    // H1 (W99): the store listing carries its own warnings (e.g. dropped
+    // non-empty `*/` keys) in `Listing.warnings`; `build_plan` aggregates
+    // them with its own into `PlanReport.warnings` for the CLI to print -
+    // library code must not write to process stderr.
+    let listing = store.list("")?;
+    let mut warnings = listing.warnings;
+    let remote_entities = listing.entities;
     // R4-M2: drop a remote empty key (the exact-prefix folder marker stripped
     // to `""`) before validation. W34 removes it at the S3 backend source, but
     // other backends could still surface one; an empty key is never a planned
@@ -43,9 +62,9 @@ pub fn build_plan(
         .collect();
     // W79/r9 L1: the reserved-namespace filter (W63/A-L3, R4-L4/W42 + W54/
     // A-L2) is factored into a pure, unit-testable partition so the dropped
-    // keys can be counted and surfaced on stderr instead of vanishing
-    // silently. A crashed `check` (SIGKILL between probe put and delete) can
-    // leave a `.vaultsync-check-*` object remotely, and a tmp-sibling key
+    // keys can be counted and surfaced instead of vanishing silently. A
+    // crashed `check` (SIGKILL between probe put and delete) can leave a
+    // `.vaultsync-check-*` object remotely, and a tmp-sibling key
     // (`.name.vaultsync-tmp-*`) can reach the store out-of-band; neither must
     // ever plan a Download (which would materialize a reserved dotfile
     // locally). Users must not create such keys (object-store.md reserved
@@ -62,10 +81,10 @@ pub fn build_plan(
         } else {
             String::new()
         };
-        eprintln!(
-            "warning: ignoring {} remote object(s) under the reserved vaultsync namespace: {shown}{suffix}",
+        warnings.push(format!(
+            "ignoring {} remote object(s) under the reserved vaultsync namespace: {shown}{suffix}",
             names.len()
-        );
+        ));
     }
     for e in &remote_entities {
         crate::entity::ensure_valid_key(&e.key)?;
@@ -113,16 +132,16 @@ pub fn build_plan(
         }
         p.stats = compute_stats(&p.actions);
     }
-    Ok(p)
+    Ok(PlanReport { plan: p, warnings })
 }
 
 /// Split remote entities into `(kept, dropped)` by the reserved vaultsync
 /// namespace filter (W63/A-L3 + W79/r9 L1): a tmp-sibling key
 /// (`.name.vaultsync-tmp-*`) or a `.vaultsync-check-*` probe leftover on the
-/// remote is never planned. Pure and unit-testable offline; the `eprintln!`
-/// side effect over the `dropped` list lives in `build_plan` (not
-/// capture-tested, same precedent as W70). Both output lists preserve the
-/// input order.
+/// remote is never planned. Pure and unit-testable offline; the warning
+/// side effect over the `dropped` list lives in `build_plan` (surfaced via
+/// `PlanReport.warnings`, not capture-tested, same precedent as W70). Both
+/// output lists preserve the input order.
 fn partition_reserved_remote_keys(entities: Vec<Entity>) -> (Vec<Entity>, Vec<Entity>) {
     let mut kept = Vec::new();
     let mut dropped = Vec::new();
@@ -164,7 +183,7 @@ pub fn status_with_store(
     opts: &PlanOpts,
 ) -> Result<Plan, Error> {
     let local = LocalFs::new(vault);
-    build_plan(&local, store, Mode::Status, opts)
+    build_plan(&local, store, Mode::Status, opts).map(|report| report.plan)
 }
 
 /// Connectivity probe: write a tiny probe object, read it back, delete it.
@@ -308,6 +327,7 @@ mod tests {
     use super::*;
     use crate::entity::Entity;
     use crate::plan::{ActionKind, PlanOpts};
+    use crate::store::Listing;
     use crate::store::ObjectStore;
     use crate::store::mock::MemoryStore;
     use crate::testutil::TempDir;
@@ -320,8 +340,11 @@ mod tests {
     }
 
     impl ObjectStore for StubStore {
-        fn list(&self, _prefix: &str) -> Result<Vec<Entity>, Error> {
-            Ok(self.listed.clone())
+        fn list(&self, _prefix: &str) -> Result<Listing, Error> {
+            Ok(Listing {
+                entities: self.listed.clone(),
+                warnings: Vec::new(),
+            })
         }
         fn head(&self, key: &str) -> Result<Entity, Error> {
             Err(Error::NotFound(key.to_string()))
@@ -385,7 +408,9 @@ mod tests {
                 crate::entity::file("ok.md", 25, Some(100)),
             ],
         };
-        let p = build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let p = build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
+            .unwrap()
+            .plan;
         assert!(
             !p.actions.iter().any(|a| {
                 a.key == ".a.md.vaultsync-tmp-1-2" || a.key == "notes/.vaultsync-check-1-2-3"
@@ -394,6 +419,45 @@ mod tests {
             p.actions
         );
         assert!(p.actions.iter().any(|a| a.key == "ok.md"));
+    }
+
+    #[test]
+    fn build_plan_surfaces_reserved_namespace_warning_in_report() {
+        // H1 (W99): the reserved-namespace warning must be carried in
+        // `PlanReport.warnings` (same W79/r9-L1 text as today's eprintln,
+        // minus the CLI "warning: " prefix) so the CLI layer prints it -
+        // library code must not write to process stderr. RED: `PlanReport`
+        // does not exist (compile failure).
+        let dir = TempDir::new("vaultsync-lib-test");
+        let local = LocalFs::new(dir.path());
+        let store = MemoryStore::new();
+        store
+            .put_from(
+                ".vaultsync-check-1-2-3",
+                &mut std::io::Cursor::new(b"x".to_vec()),
+                1,
+                None,
+            )
+            .unwrap();
+        let report = build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("reserved vaultsync namespace")
+                    && w.contains(".vaultsync-check-1-2-3")),
+            "reserved-namespace warning missing: {:?}",
+            report.warnings
+        );
+        assert!(
+            !report
+                .plan
+                .actions
+                .iter()
+                .any(|a| a.key.starts_with(".vaultsync-check-")),
+            "reserved key planned: {:?}",
+            report.plan.actions
+        );
     }
 
     #[test]
@@ -407,7 +471,9 @@ mod tests {
         let store = StubStore {
             listed: vec![crate::entity::file(".vaultsync-check-1-2-3", 25, Some(100))],
         };
-        let p = build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let p = build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
+            .unwrap()
+            .plan;
         assert!(
             !p.actions
                 .iter()
@@ -435,7 +501,9 @@ mod tests {
                 Some(100),
             )],
         };
-        let p = build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let p = build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
+            .unwrap()
+            .plan;
         assert!(
             !p.actions
                 .iter()
@@ -462,7 +530,9 @@ mod tests {
                 crate::entity::file("notes/.a.md.vaultsync-tmp-3-4", 25, Some(100)),
             ],
         };
-        let p = build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let p = build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
+            .unwrap()
+            .plan;
         assert!(
             !p.actions.iter().any(|a| {
                 a.key == ".a.md.vaultsync-tmp-1-2" || a.key == "notes/.a.md.vaultsync-tmp-3-4"
@@ -488,7 +558,9 @@ mod tests {
         std::os::unix::fs::symlink("realdir", dir.join("linkdir")).unwrap();
         let local = LocalFs::with_follow(dir.path(), true);
         let store = MemoryStore::new();
-        let p = build_plan(&local, &store, Mode::Push, &PlanOpts::default()).unwrap();
+        let p = build_plan(&local, &store, Mode::Push, &PlanOpts::default())
+            .unwrap()
+            .plan;
         let link = p.actions.iter().find(|a| a.key == "link.md").unwrap();
         assert_eq!(link.kind, ActionKind::Skip, "{:?}", link);
         assert_eq!(link.reason, "followed_symlink");
@@ -524,7 +596,9 @@ mod tests {
         // remote link.md much newer than the target's (remote_newer -> Download)
         put_str(&store, "link.md", "remote-new", base + 1_000_000);
         put_str(&store, "real.md", "r", 1);
-        let p = build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let p = build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
+            .unwrap()
+            .plan;
         let link = p
             .actions
             .iter()
@@ -551,7 +625,7 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let p = build_plan(&local, &store, Mode::Pull, &opts).unwrap();
+        let p = build_plan(&local, &store, Mode::Pull, &opts).unwrap().plan;
         let link = p.actions.iter().find(|a| a.key == "link.md").unwrap();
         assert_eq!(link.kind, ActionKind::Skip, "{:?}", link);
         assert_eq!(link.reason, "followed_symlink");
@@ -568,7 +642,9 @@ mod tests {
         std::os::unix::fs::symlink("real.md", dir.join("link.md")).unwrap();
         let local = LocalFs::with_follow(dir.path(), true);
         let store = MemoryStore::new();
-        let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default()).unwrap();
+        let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default())
+            .unwrap()
+            .plan;
         let link = p.actions.iter().find(|a| a.key == "link.md").unwrap();
         assert_eq!(
             link.kind,
@@ -595,7 +671,9 @@ mod tests {
                 etag: None,
             }],
         };
-        let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default()).unwrap();
+        let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default())
+            .unwrap()
+            .plan;
         assert!(
             !p.actions.iter().any(|a| a.key.is_empty()),
             "empty key planned: {:?}",
@@ -631,7 +709,9 @@ mod tests {
                 crate::entity::file("notes/a.md", 1, Some(1)),
             ],
         };
-        let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default()).unwrap();
+        let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default())
+            .unwrap()
+            .plan;
         let folder_act = p
             .actions
             .iter()
@@ -755,7 +835,7 @@ mod tests {
 
         let store = MemoryStore::new();
         put_str(&store, "notes/a.md", "x", 1000);
-        let remote_ents = store.list("").unwrap();
+        let remote_ents = store.list("").unwrap().entities;
         let remote_folder = remote_ents.iter().find(|e| e.key == "notes/").unwrap();
         assert_eq!(remote_folder.mtime_ms, None);
     }
@@ -805,7 +885,9 @@ mod tests {
                 crate::entity::file("notes/x", 1, Some(1)),
             ],
         };
-        let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default()).unwrap();
+        let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default())
+            .unwrap()
+            .plan;
         let file_act = p
             .actions
             .iter()
@@ -842,7 +924,9 @@ mod tests {
         let store = StubStore {
             listed: vec![crate::entity::file("note.md", 5, Some(1000))],
         };
-        let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default()).unwrap();
+        let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default())
+            .unwrap()
+            .plan;
         let note = p
             .actions
             .iter()
@@ -874,7 +958,9 @@ mod tests {
                 crate::entity::file("notes/x", 1, Some(1)),
             ],
         };
-        let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default()).unwrap();
+        let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default())
+            .unwrap()
+            .plan;
         let notes = p.actions.iter().find(|a| a.key == "Notes").expect("Notes");
         let notes_folder = p
             .actions
@@ -906,7 +992,9 @@ mod tests {
         let store = StubStore {
             listed: vec![crate::entity::file("LINK.md", 11, Some(100))],
         };
-        let p = build_plan(&local, &store, Mode::Push, &PlanOpts::default()).unwrap();
+        let p = build_plan(&local, &store, Mode::Push, &PlanOpts::default())
+            .unwrap()
+            .plan;
         let link = p
             .actions
             .iter()
@@ -932,7 +1020,9 @@ mod tests {
         std::fs::write(dir.join(".note.md.vaultsync-tmp-123-4"), "leftover").unwrap();
         let local = LocalFs::new(dir.path());
         let store = MemoryStore::new();
-        let p = build_plan(&local, &store, Mode::Push, &PlanOpts::default()).unwrap();
+        let p = build_plan(&local, &store, Mode::Push, &PlanOpts::default())
+            .unwrap()
+            .plan;
         assert_eq!(p.stats.upload, 1);
         assert!(p.actions.iter().any(|a| a.key == "note.md"));
         assert!(
@@ -975,7 +1065,7 @@ mod tests {
         let store = MemoryStore::new();
         crate::check_store(&store).unwrap();
         // probe object removed after the check
-        assert!(store.list("").unwrap().is_empty());
+        assert!(store.list("").unwrap().entities.is_empty());
     }
 
     /// A store whose `get_to` always errors after a successful put, to inject
@@ -984,7 +1074,7 @@ mod tests {
         inner: MemoryStore,
     }
     impl ObjectStore for GetFailStore {
-        fn list(&self, prefix: &str) -> Result<Vec<Entity>, Error> {
+        fn list(&self, prefix: &str) -> Result<Listing, Error> {
             self.inner.list(prefix)
         }
         fn head(&self, key: &str) -> Result<Entity, Error> {
@@ -1013,7 +1103,7 @@ mod tests {
         inner: MemoryStore,
     }
     impl ObjectStore for SizeCorruptStore {
-        fn list(&self, prefix: &str) -> Result<Vec<Entity>, Error> {
+        fn list(&self, prefix: &str) -> Result<Listing, Error> {
             self.inner.list(prefix)
         }
         fn head(&self, key: &str) -> Result<Entity, Error> {
@@ -1041,7 +1131,13 @@ mod tests {
     }
 
     fn assert_no_check_probe(store: &MemoryStore) {
-        let keys: Vec<String> = store.list("").unwrap().into_iter().map(|e| e.key).collect();
+        let keys: Vec<String> = store
+            .list("")
+            .unwrap()
+            .entities
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
         assert!(
             !keys.iter().any(|k| k.starts_with(".vaultsync-check-")),
             "probe leaked after failed check: {keys:?}"
@@ -1081,7 +1177,9 @@ mod tests {
         std::fs::write(dir.join("local-only.md"), "x").unwrap();
         let local = LocalFs::new(dir.path());
         let store = MemoryStore::new();
-        let p = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let p = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
+            .unwrap()
+            .plan;
         let verbose = format_plan_human_verbose(&p, 1);
         let s_line = verbose
             .lines()

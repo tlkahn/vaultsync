@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use crate::entity::Entity;
 use crate::error::Error;
-use crate::store::ObjectStore;
+use crate::store::{Listing, ObjectStore};
 
 /// A stored object's payload and metadata.
 struct MockObject {
@@ -88,7 +88,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 impl ObjectStore for MemoryStore {
-    fn list(&self, prefix: &str) -> Result<Vec<Entity>, Error> {
+    fn list(&self, prefix: &str) -> Result<Listing, Error> {
         let guard = self.objects.lock().unwrap();
         let mut keys: BTreeSet<String> = guard.keys().cloned().collect();
         let folders: Vec<String> = keys.iter().flat_map(|k| parent_folders(k)).collect();
@@ -112,7 +112,10 @@ impl ObjectStore for MemoryStore {
                 entities.push(self.entity_for(&key, obj));
             }
         }
-        Ok(entities)
+        Ok(Listing {
+            entities,
+            warnings: Vec::new(),
+        })
     }
 
     fn head(&self, key: &str) -> Result<Entity, Error> {
@@ -219,7 +222,7 @@ mod tests {
             "expected UnexpectedEof, got {err:?}"
         );
         // nothing must be stored
-        assert_eq!(store.list("").unwrap(), Vec::<Entity>::new());
+        assert_eq!(store.list("").unwrap().entities, Vec::<Entity>::new());
     }
 
     #[test]
@@ -237,7 +240,7 @@ mod tests {
             matches!(err, Error::Io(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof),
             "expected UnexpectedEof, got {err:?}"
         );
-        assert_eq!(store.list("").unwrap(), Vec::<Entity>::new());
+        assert_eq!(store.list("").unwrap().entities, Vec::<Entity>::new());
     }
 
     #[test]
@@ -248,7 +251,7 @@ mod tests {
         let mut cursor = std::io::Cursor::new(b"x".to_vec());
         let err = store.put_from("a/\nb", &mut cursor, 1, None).unwrap_err();
         assert!(matches!(err, Error::InvalidKey(_)));
-        assert_eq!(store.list("").unwrap(), Vec::<Entity>::new());
+        assert_eq!(store.list("").unwrap().entities, Vec::<Entity>::new());
     }
 
     #[test]
@@ -258,7 +261,7 @@ mod tests {
         let err = store.put_from("notes/", &mut cursor, 1, None).unwrap_err();
         assert!(matches!(err, Error::InvalidKey(_)));
         // nothing must be stored: list stays empty, head is NotFound
-        assert_eq!(store.list("").unwrap(), Vec::<Entity>::new());
+        assert_eq!(store.list("").unwrap().entities, Vec::<Entity>::new());
         assert!(matches!(
             store.head("notes/").unwrap_err(),
             Error::NotFound(_)
@@ -272,7 +275,7 @@ mod tests {
         let err = store.put_from("../x", &mut cursor, 1, None).unwrap_err();
         assert!(matches!(err, Error::InvalidKey(_)));
         // key must not have been inserted
-        assert_eq!(store.list("").unwrap(), Vec::<Entity>::new());
+        assert_eq!(store.list("").unwrap().entities, Vec::<Entity>::new());
     }
 
     #[test]
@@ -363,12 +366,12 @@ mod tests {
         let store = new_store();
         put_str(&store, "a.md", "a", None).unwrap();
         put_str(&store, "notes/b.md", "b", None).unwrap();
-        let all = store.list("").unwrap();
+        let all = store.list("").unwrap().entities;
         let keys: Vec<_> = all.iter().map(|e| e.key.clone()).collect();
         assert!(keys.iter().any(|k| k == "a.md"));
         assert!(keys.iter().any(|k| k == "notes/b.md"));
 
-        let notes = store.list("notes/").unwrap();
+        let notes = store.list("notes/").unwrap().entities;
         let nkeys: Vec<_> = notes.iter().map(|e| e.key.clone()).collect();
         assert!(nkeys.iter().any(|k| k == "notes/b.md"));
         assert!(!nkeys.iter().any(|k| k == "a.md"));
@@ -382,7 +385,7 @@ mod tests {
         let store = new_store();
         put_str(&store, "note.md", "a", None).unwrap();
         put_str(&store, "notes/b.md", "b", None).unwrap();
-        let got = store.list("note").unwrap();
+        let got = store.list("note").unwrap().entities;
         let keys: Vec<_> = got.iter().map(|e| e.key.clone()).collect();
         assert!(keys.iter().any(|k| k == "note.md"));
         assert!(keys.iter().any(|k| k == "notes/"));
@@ -391,6 +394,7 @@ mod tests {
         let skinny: Vec<_> = store
             .list("notes/")
             .unwrap()
+            .entities
             .iter()
             .map(|e| e.key.clone())
             .collect();
@@ -402,7 +406,7 @@ mod tests {
     fn mock_list_synthesizes_folder_prefixes() {
         let store = new_store();
         put_str(&store, "notes/b.md", "b", None).unwrap();
-        let all = store.list("").unwrap();
+        let all = store.list("").unwrap().entities;
         let folder = all.iter().find(|e| e.key == "notes/").expect("folder");
         assert_eq!(folder.size, 0);
         assert!(folder.is_folder());
@@ -446,7 +450,7 @@ mod tests {
         // A-low-1/B3 contract; callers branch on Entity::is_folder()).
         let store = new_store();
         put_str(&store, "notes/a.md", "a", None).unwrap();
-        let all = store.list("").unwrap();
+        let all = store.list("").unwrap().entities;
         assert!(all.iter().any(|e| e.key == "notes/"));
         assert!(matches!(
             store.head("notes/").unwrap_err(),

@@ -341,6 +341,7 @@ mod tests {
     use super::*;
     use crate::entity::Entity;
     use crate::plan::PlanOpts;
+    use crate::store::Listing;
     use crate::store::mock::MemoryStore;
     use crate::testutil::TempDir;
     use std::sync::Mutex;
@@ -398,7 +399,7 @@ mod tests {
         }
     }
     impl ObjectStore for RecordingStore {
-        fn list(&self, prefix: &str) -> Result<Vec<Entity>, Error> {
+        fn list(&self, prefix: &str) -> Result<Listing, Error> {
             self.inner.list(prefix)
         }
         fn head(&self, key: &str) -> Result<Entity, Error> {
@@ -431,7 +432,9 @@ mod tests {
         let mt = mtime_ms(&dir.join("a.md"));
         let local = LocalFs::new(dir.path());
         let store = MemoryStore::new();
-        let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default()).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default())
+            .unwrap()
+            .plan;
         let rep = execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default());
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert_eq!(rep.executed, 1);
@@ -464,7 +467,9 @@ mod tests {
             mtime_tolerance_ms: 5000,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Push, &opts).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Push, &opts)
+            .unwrap()
+            .plan;
         // drift the file 3000 ms after the plan captured its mtime
         set_mtime_ms(&p, base + 3000);
         let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Push, &opts);
@@ -488,7 +493,9 @@ mod tests {
         let local = LocalFs::with_follow(dir.path(), true);
         let store = MemoryStore::new();
         let opts = PlanOpts::default();
-        let plan = crate::build_plan(&local, &store, Mode::Push, &opts).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Push, &opts)
+            .unwrap()
+            .plan;
         let link = plan.actions.iter().find(|a| a.key == "link.md").unwrap();
         assert_eq!(link.kind, ActionKind::Skip, "link.md must be planned skip");
         let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Push, &opts);
@@ -515,7 +522,9 @@ mod tests {
         let store = MemoryStore::new();
         put_str(&store, &key, "hello", Some(1_700_000_000_000));
         let local = LocalFs::new(dir.path());
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
+            .unwrap()
+            .plan;
         let rep = execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert_eq!(rep.executed, 1, "{:?}", rep);
@@ -534,7 +543,9 @@ mod tests {
         let store = MemoryStore::new();
         put_str(&store, "n/b.md", "remote-bytes", Some(1_700_000_000_123));
         let local = LocalFs::new(dir.path());
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
+            .unwrap()
+            .plan;
         let rep = execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert_eq!(std::fs::read(dir.join("n/b.md")).unwrap(), b"remote-bytes");
@@ -555,7 +566,9 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Push, &opts).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Push, &opts)
+            .unwrap()
+            .plan;
         let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert!(matches!(
@@ -579,7 +592,9 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts)
+            .unwrap()
+            .plan;
         assert!(
             plan.actions
                 .iter()
@@ -616,7 +631,9 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts)
+            .unwrap()
+            .plan;
         let link = plan.actions.iter().find(|a| a.key == "link.md").unwrap();
         assert_eq!(link.kind, ActionKind::Skip, "{:?}", link);
         assert_eq!(link.reason, "followed_symlink");
@@ -644,7 +661,9 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts)
+            .unwrap()
+            .plan;
         assert!(
             plan.actions
                 .iter()
@@ -686,7 +705,9 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts)
+            .unwrap()
+            .plan;
         assert!(
             plan.actions
                 .iter()
@@ -723,7 +744,9 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts)
+            .unwrap()
+            .plan;
         let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &opts);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert!(!dir.join("gone.md").exists());
@@ -742,7 +765,9 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts)
+            .unwrap()
+            .plan;
         let rep = execute_plan(&local, &store, &plan, Mode::Pull, &opts);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert!(!dir.join("n/gone.md").exists());
@@ -769,7 +794,9 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts)
+            .unwrap()
+            .plan;
         let folder_row = plan
             .actions
             .iter()
@@ -810,7 +837,9 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts)
+            .unwrap()
+            .plan;
         let rep = execute_plan(&local, &store, &plan, Mode::Pull, &opts);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert!(!dir.join("a/b/c").exists(), "deepest ancestor not removed");
@@ -840,7 +869,9 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts)
+            .unwrap()
+            .plan;
         assert!(
             plan.actions
                 .iter()
@@ -870,7 +901,9 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts)
+            .unwrap()
+            .plan;
         // the file vanishes before execution (pre-cleaned by another process)
         std::fs::remove_file(dir.join("n/sub/gone.md")).unwrap();
         let rep = execute_plan(&local, &store, &plan, Mode::Pull, &opts);
@@ -905,7 +938,9 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Push, &opts).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Push, &opts)
+            .unwrap()
+            .plan;
         assert!(
             plan.actions
                 .iter()
@@ -942,7 +977,9 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Push, &opts).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Push, &opts)
+            .unwrap()
+            .plan;
         let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert!(matches!(
@@ -964,7 +1001,9 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Push, &opts).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Push, &opts)
+            .unwrap()
+            .plan;
         let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         let log = store.log();
@@ -989,7 +1028,9 @@ mod tests {
         // a.md: same content+size+mtime -> equal skip
         put_str(&store, "a.md", "same", Some(mtime_ms(&dir.join("a.md"))));
         let local = LocalFs::new(dir.path());
-        let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default()).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default())
+            .unwrap()
+            .plan;
         let before_c = store.head("c.md").unwrap();
         let before_a = store.head("a.md").unwrap();
         let rep = execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default());
@@ -1007,7 +1048,9 @@ mod tests {
         std::fs::write(dir.join("ok.md"), "stable").unwrap();
         let local = LocalFs::new(dir.path());
         let store = MemoryStore::new();
-        let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default()).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default())
+            .unwrap()
+            .plan;
         // File grows between plan (walks size 3) and open -> per-key failure.
         let mut f = std::fs::OpenOptions::new()
             .append(true)
@@ -1039,7 +1082,7 @@ mod tests {
         bad_key: String,
     }
     impl ObjectStore for ShortBodyStore {
-        fn list(&self, prefix: &str) -> Result<Vec<Entity>, Error> {
+        fn list(&self, prefix: &str) -> Result<Listing, Error> {
             self.inner.list(prefix)
         }
         fn head(&self, key: &str) -> Result<Entity, Error> {
@@ -1088,7 +1131,9 @@ mod tests {
             bad_key: "bad.md".to_string(),
         };
         let local = LocalFs::new(dir.path());
-        let plan = crate::build_plan(&local, &wrapper, Mode::Pull, &PlanOpts::default()).unwrap();
+        let plan = crate::build_plan(&local, &wrapper, Mode::Pull, &PlanOpts::default())
+            .unwrap()
+            .plan;
         let rep =
             crate::exec::execute_plan(&local, &wrapper, &plan, Mode::Pull, &PlanOpts::default());
         assert!(
@@ -1121,7 +1166,9 @@ mod tests {
         let store = MemoryStore::new();
         put_str(&store, "a/b/c.md", "x", Some(100));
         let local = LocalFs::new(dir.path());
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
+            .unwrap()
+            .plan;
         // remote vanishes between plan and execute
         store.delete("a/b/c.md").unwrap();
         let rep = execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
@@ -1151,7 +1198,9 @@ mod tests {
         let store = MemoryStore::new();
         put_str(&store, "keep/sub/x.md", "x", Some(100));
         let local = LocalFs::new(dir.path());
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
+            .unwrap()
+            .plan;
         store.delete("keep/sub/x.md").unwrap();
         let rep = execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
         assert!(
@@ -1183,7 +1232,9 @@ mod tests {
         let store = RecordingStore::new();
         store.seed_mtime("a.md", "remote-new-body", 1_700_000_005_000);
         let local = LocalFs::new(dir.path());
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
+            .unwrap()
+            .plan;
         let act = plan.actions.iter().find(|a| a.key == "a.md").unwrap();
         assert_eq!(act.kind, ActionKind::Download);
         // user edits the destination after planning (size changes)
@@ -1221,7 +1272,9 @@ mod tests {
         let store = RecordingStore::new();
         store.seed_mtime("b.md", "remote-bytes", 1_700_000_000_123);
         let local = LocalFs::new(dir.path());
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
+            .unwrap()
+            .plan;
         let act = plan.actions.iter().find(|a| a.key == "b.md").unwrap();
         assert_eq!(act.kind, ActionKind::Download);
         assert!(act.local.is_none(), "remote-only pull");
@@ -1257,7 +1310,9 @@ mod tests {
         let store = MemoryStore::new();
         put_str(&store, "a.md", "remote-new-body", Some(1_700_000_005_000));
         let local = LocalFs::new(dir.path());
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
+            .unwrap()
+            .plan;
         let act = plan.actions.iter().find(|a| a.key == "a.md").unwrap();
         assert_eq!(
             act.kind,
@@ -1293,7 +1348,9 @@ mod tests {
         let store = MemoryStore::new();
         put_str(&store, "b.md", "remote-bytes", Some(1_700_000_000_123));
         let local = LocalFs::new(dir.path());
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
+            .unwrap()
+            .plan;
         let act = plan.actions.iter().find(|a| a.key == "b.md").unwrap();
         assert_eq!(act.kind, ActionKind::Download);
         assert!(act.local.is_none(), "remote-only pull must have no local");
@@ -1321,7 +1378,9 @@ mod tests {
         let store = MemoryStore::new();
         put_str(&store, "b.md", "remote-bytes", Some(1_700_000_000_123));
         let local = LocalFs::new(dir.path());
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
+            .unwrap()
+            .plan;
         let rep =
             crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep.failed);
@@ -1340,7 +1399,9 @@ mod tests {
         let store = MemoryStore::new();
         put_str(&store, "a.md", "remote-new-body", Some(1_700_000_005_000));
         let local = LocalFs::new(dir.path());
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
+            .unwrap()
+            .plan;
         std::fs::remove_file(&p).unwrap();
         let rep =
             crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
@@ -1383,7 +1444,9 @@ mod tests {
         let store = MemoryStore::new();
         put_str(&store, "a.md", "remote-new-body", Some(1_700_000_005_000));
         let local = LocalFs::new(dir.path());
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
+            .unwrap()
+            .plan;
         // swap the destination for a symlink to an outside target
         std::fs::remove_file(&p).unwrap();
         std::os::unix::fs::symlink(outside.join("secret"), &p).unwrap();
@@ -1416,7 +1479,9 @@ mod tests {
         let store = MemoryStore::new();
         put_str(&store, "a.md", "remote-bytes", Some(1_700_000_000_123));
         let local = LocalFs::new(dir.path()); // follow off
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
+            .unwrap()
+            .plan;
         let act = plan.actions.iter().find(|a| a.key == "a.md").unwrap();
         assert_eq!(act.kind, ActionKind::Download);
         assert!(
@@ -1450,7 +1515,9 @@ mod tests {
         let store = MemoryStore::new();
         put_str(&store, "a.md", "x", Some(100));
         let local = LocalFs::new(dir.path());
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
+            .unwrap()
+            .plan;
         // remote vanishes between plan and execute
         store.delete("a.md").unwrap();
         let rep = execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
@@ -1481,7 +1548,9 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts)
+            .unwrap()
+            .plan;
         assert!(
             plan.actions
                 .iter()
@@ -1518,7 +1587,9 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Push, &opts).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Push, &opts)
+            .unwrap()
+            .plan;
         // remote vanishes before execution -> the planned delete sees NotFound
         store.delete("gone.md").unwrap();
         let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Push, &opts);
@@ -1533,7 +1604,9 @@ mod tests {
         std::fs::write(dir.join("bad.md"), "abc").unwrap();
         let local = LocalFs::new(dir.path());
         let store = MemoryStore::new();
-        let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default()).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default())
+            .unwrap()
+            .plan;
         // grow bad.md after planning
         let mut f = std::fs::OpenOptions::new()
             .append(true)
@@ -1557,7 +1630,9 @@ mod tests {
         let store = MemoryStore::new();
         put_str(&store, "K/x", "child", Some(100));
         let local = LocalFs::new(dir.path());
-        let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default()).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default())
+            .unwrap()
+            .plan;
         let rep = execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default());
         assert_eq!(rep.executed, 0);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new());
@@ -1573,7 +1648,9 @@ mod tests {
         let store = MemoryStore::new();
         put_str(&store, "b.md", "remote", Some(100));
         let local = LocalFs::new(dir.path());
-        let plan = crate::build_plan(&local, &store, Mode::Status, &PlanOpts::default()).unwrap();
+        let plan = crate::build_plan(&local, &store, Mode::Status, &PlanOpts::default())
+            .unwrap()
+            .plan;
         let rep = execute_plan(&local, &store, &plan, Mode::Status, &PlanOpts::default());
         assert_eq!(rep.executed, 0);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new());

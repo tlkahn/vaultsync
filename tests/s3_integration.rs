@@ -85,8 +85,8 @@ where
     let result = f(&store);
 
     // Cleanup: list + delete everything (files only; folders are views).
-    if let Ok(ents) = store.list("") {
-        for e in ents {
+    if let Ok(listing) = store.list("") {
+        for e in listing.entities {
             if !e.is_folder() {
                 let _ = store.delete(&e.key);
             }
@@ -143,7 +143,7 @@ fn s3_integ_list_paginates() {
                 });
             }
         });
-        let ents = s.list("").map_err(|e| format!("{e}"))?;
+        let ents = s.list("").map_err(|e| format!("{e}"))?.entities;
         // files + synthesized folder views
         let files: Vec<_> = ents.iter().filter(|e| !e.is_folder()).collect();
         assert_eq!(files.len(), n, "all paged objects returned");
@@ -187,7 +187,13 @@ fn s3_integ_prefix_isolation() {
         // the shared bucket - `with_store`'s sweeper covers only the primary
         // prefix, so an assertion failure used to leave
         // `vaultsync-other-prefix-<ts>/secret.txt` behind.
-        let keys: Vec<String> = s.list("").unwrap().iter().map(|e| e.key.clone()).collect();
+        let keys: Vec<String> = s
+            .list("")
+            .unwrap()
+            .entities
+            .iter()
+            .map(|e| e.key.clone())
+            .collect();
         let _ = other.delete("secret.txt");
         // our store must not see it
         assert!(
@@ -218,6 +224,7 @@ fn path_style_roundtrip(flavor: &str, s: &S3Store) -> Result<(), String> {
     let n = s
         .list("")
         .unwrap()
+        .entities
         .iter()
         .filter(|e| !e.is_folder())
         .count();
@@ -225,8 +232,8 @@ fn path_style_roundtrip(flavor: &str, s: &S3Store) -> Result<(), String> {
         return Err(format!("path-style {flavor}: expected 1 file, got {n}"));
     }
     // cleanup the probe
-    if let Ok(ents) = s.list("") {
-        for e in ents {
+    if let Ok(listing) = s.list("") {
+        for e in listing.entities {
             if !e.is_folder() {
                 let _ = s.delete(&e.key);
             }
@@ -450,7 +457,8 @@ fn s3_integ_e2e_push_pull() {
         // push
         let local = LocalFs::new(src.path());
         let plan = vaultsync::build_plan(&local, s, Mode::Push, &PlanOpts::default())
-            .map_err(|e| format!("{e}"))?;
+            .map_err(|e| format!("{e}"))?
+            .plan;
         let rep = vaultsync::exec::execute_plan(&local, s, &plan, Mode::Push, &PlanOpts::default());
         assert!(rep.failed.is_empty(), "push failures: {:?}", rep.failed);
 
@@ -459,7 +467,8 @@ fn s3_integ_e2e_push_pull() {
         let dst = TestDir::new("dst");
         let ldst = LocalFs::new(dst.path());
         let plan2 = vaultsync::build_plan(&ldst, s, Mode::Pull, &PlanOpts::default())
-            .map_err(|e| format!("{e}"))?;
+            .map_err(|e| format!("{e}"))?
+            .plan;
         let rep2 =
             vaultsync::exec::execute_plan(&ldst, s, &plan2, Mode::Pull, &PlanOpts::default());
         assert!(rep2.failed.is_empty(), "pull failures: {:?}", rep2.failed);
