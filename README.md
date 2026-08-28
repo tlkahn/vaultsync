@@ -90,9 +90,10 @@ action a plan - or delete files - against a non-existent store).
   (or was replaced) after the plan is refused mid-stream: a download that
   exceeds its planned size errors before the extra bytes are written to disk.
 - **Pull overwrite resets permission bits.** A download writes a fresh temp
-  file (`0666 & umask`) and renames it over the destination, so a
-  previously-`0600` local note returns as `0644`. v1 has no permission model;
-  only content and mtime are preserved.
+  sibling (owner-only `0600` while buffering, W108) and renames it over the
+  destination, so the destination's permission bits are replaced by the
+  temp's: a previously-`0644` note returns as `0600`. v1 has no permission
+  model; only content and mtime are preserved.
 - **Planner identity is codepoint-exact (no NFC fold).** APFS folds NFD/NFC
   (a note named in decomposed form appears under its composed name), while S3
   does not, so a vault round-tripped through another machine can show a false

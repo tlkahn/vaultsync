@@ -451,25 +451,12 @@ fn reap_stale_upload_temps(dir: &std::path::Path, max_age_secs: u64) {
 }
 
 /// Create a single upload temp buffer file (**not** retried). Owner-only
-/// `0o600` perms (W14/A-L1/B-L1) and `create_new` (no reuse). On non-unix it
+/// `0o600` perms (W14/A-L1/B-L1) and `create_new` (no reuse). Delegates to
+/// the shared [`crate::local::create_new_owner_only`] so the upload-buffer
+/// and download-sibling temp policies cannot drift (W108/L1). On non-unix it
 /// is plain `create_new`.
 fn create_temp_upload_file_at(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-    }
+    crate::local::create_new_owner_only(path)
 }
 
 /// Allocate the first free candidate path exclusively (W29/N4). A stale

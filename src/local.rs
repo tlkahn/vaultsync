@@ -308,7 +308,8 @@ impl LocalFs {
     /// swapped for a symlink or other node type after the writer handle drops
     /// is refused before open/sync/rename, and the accidental-collision case
     /// (a pre-planted symlink or stale leftover at a candidate name) is
-    /// covered by the unique `create_new` allocation (W40).
+    /// covered by the unique `create_new` allocation (W40). The temp is also
+    /// owner-only `0600` (W108), matching the upload buffer policy (W14).
     pub fn finalize_write(
         &self,
         key: &str,
@@ -939,16 +940,39 @@ fn alloc_temp_sibling(final_path: &Path) -> Result<(PathBuf, std::fs::File), Err
     alloc_temp_sibling_from(&temp_sibling_candidates(final_path))
 }
 
+/// Create a file exclusively (`create_new`, no reuse, no follow) with
+/// owner-only `0o600` perms on unix. The single implementation of the
+/// owner-only temp policy shared by the upload buffers (W14) and the
+/// download temp siblings (W108) so the two sides cannot drift again: one
+/// policy, two call sites. On non-unix it is plain `create_new` (no mode
+/// bits in std).
+pub(crate) fn create_new_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    }
+}
+
 /// Slice variant of [`alloc_temp_sibling`] that consumes an explicit candidate
 /// list, so tests can plant a leftover/symlink in a known candidate and verify
 /// the allocator skips it and moves to the next.
 fn alloc_temp_sibling_from(candidates: &[PathBuf]) -> Result<(PathBuf, std::fs::File), Error> {
     for p in candidates {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(p)
-        {
+        // W108/L1: owner-only `0600`, same policy as the upload buffers (W14,
+        // shared helper so the two sides cannot drift).
+        match create_new_owner_only(p) {
             Ok(f) => return Ok((p.clone(), f)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(Error::Io(e)),
@@ -2104,6 +2128,26 @@ mod tests {
             "no non-regular refusal: {err}"
         );
         assert!(!dir.join("a.md").exists(), "directory renamed onto the key");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmp_path_for_temp_is_owner_only() {
+        // W108/L1: download temp siblings must be owner-only `0600` like the
+        // upload buffer policy (W14) - one policy, two sides. The default
+        // `0666 & umask` leaves them readable by other users in a shared
+        // vault directory. Fails today: `0644` under the default umask.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("vaultsync-test");
+        let fs = LocalFs::new(dir.path());
+        let (tmp, f, _created) = fs.tmp_path_for("a.md").unwrap();
+        drop(f);
+        let mode = std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "download temp perms must be 0600, got {mode:o}"
+        );
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
