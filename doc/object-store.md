@@ -103,6 +103,18 @@ indistinguishable from a complete one, and `pull --delete` would classify
 genuinely-remote files missing from the partial page as local extras and
 delete them locally.
 
+## Design constraints
+
+**In-memory listing and planning (H3).** `ObjectStore::list` collects the
+full prefixed listing into one `Vec` (`list_prefix_objects` pages through
+`ListObjectsV2` but accumulates every page in memory), and `build_plan`
+holds all local and remote entities in `HashMap`s while planning. Total
+memory is O(remote objects + local files), which is the deliberate v1
+trade: the vault-scale target is tens of thousands of objects, where full
+in-memory planning is comfortable. Streaming or paged planning (plan
+increments as pages arrive, bounded memory regardless of store size) is a
+Phase 3 concern and must start from this explicit assumption.
+
 ### Metadata
 
 - Store client mtime in object metadata key `vaultsync-mtime` (or `mtime`) as decimal ms.
