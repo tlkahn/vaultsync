@@ -79,13 +79,64 @@ pub fn execute_plan(
     // already-gone key achieves the goal state, so NotFound is normalized to a
     // success here (S3 delete is idempotent; LocalFs.delete_file still reports
     // NotFound for a missing key, and the executor absorbs it).
+    //
+    // W62/A-M2: head-before-delete. The list-time entity alone is stale
+    // authority for a delete (the local side got `delete_file_guarded` for
+    // exactly this race class). Re-verify the remote object immediately
+    // before unlinking it: a NotFound means the goal state (absent) is
+    // already achieved (counts as success, matching W10); a size drift means
+    // the object changed since the plan - the key fails and the new remote
+    // content survives. mtime is deliberately NOT compared (R-c): the
+    // planned entity's `mtime_ms` comes from the listing's `LastModified`
+    // while `head` prefers the `vaultsync-mtime` client metadata, so an
+    // mtime comparison would systematically false-fail every key whose
+    // client mtime differs from its upload time beyond the tolerance (the
+    // documented list-skew limitation). Same-size replacement between list
+    // and delete remains a documented residual.
     for a in plan
         .actions
         .iter()
         .filter(|a| a.kind == ActionKind::DeleteRemote)
     {
+        let Some(planned_remote) = &a.remote else {
+            fail(
+                &mut rep,
+                &a.key,
+                Error::Other(format!(
+                    "delete-remote planned without remote entity: {}",
+                    a.key
+                )),
+            );
+            continue;
+        };
+        match store.head(&a.key) {
+            Ok(cur) => {
+                if cur.size != planned_remote.size {
+                    fail(
+                        &mut rep,
+                        &a.key,
+                        Error::Other(format!(
+                            "remote changed since plan for {}; not deleting",
+                            a.key
+                        )),
+                    );
+                    continue;
+                }
+            }
+            Err(Error::NotFound(_)) => {
+                // goal state already achieved (W10 idempotent-delete arm)
+                rep.executed += 1;
+                continue;
+            }
+            Err(e) => {
+                fail(&mut rep, &a.key, e);
+                continue;
+            }
+        }
         match store.delete(&a.key) {
             Ok(()) => rep.executed += 1,
+            // W10: head is best-effort; a delete-time NotFound still means
+            // the goal state was reached.
             Err(Error::NotFound(_)) => rep.executed += 1,
             Err(e) => fail(&mut rep, &a.key, e),
         }
@@ -673,6 +724,70 @@ mod tests {
         // both `sub` and `n` are now empty -> removed bottom-up; root stays.
         assert!(!dir.join("n").exists(), "empty n not cleaned");
         assert!(dir.exists());
+    }
+
+    #[test]
+    fn exec_push_delete_refuses_remote_replaced_since_plan() {
+        // W62/A-M2: DeleteRemote re-verifies the remote object
+        // (head-before-delete) before unlinking it - the list-time entity
+        // alone is stale authority for a delete (the local side got
+        // delete_file_guarded for exactly this race class). An object
+        // replaced with different-size content between plan and execute must
+        // fail the key with a "changed since plan" message and the new
+        // remote content survives. Fails today (delete proceeds on the
+        // plan's say-so alone).
+        let dir = TempDir::new("vaultsync-exec");
+        let store = MemoryStore::new();
+        put_str(&store, "gone.md", "abc", Some(100)); // size 3
+        let local = LocalFs::new(dir.path());
+        let opts = PlanOpts {
+            delete: true,
+            ..Default::default()
+        };
+        let plan = crate::build_plan(&local, &store, Mode::Push, &opts).unwrap();
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| a.key == "gone.md" && a.kind == ActionKind::DeleteRemote)
+        );
+        // replace the object with different-size content after planning
+        put_str(&store, "gone.md", "replacement-bytes-xyz", Some(200));
+        let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts);
+        assert!(
+            rep.failed.iter().any(|fl| fl.key == "gone.md"),
+            "gone.md not failed: {:?}",
+            rep.failed
+        );
+        assert!(
+            rep.failed
+                .iter()
+                .any(|fl| fl.message.contains("changed since plan")),
+            "no changed-since-plan message: {:?}",
+            rep.failed
+        );
+        // the new remote content survives (not deleted)
+        assert_eq!(get_bytes(&store, "gone.md"), b"replacement-bytes-xyz");
+    }
+
+    #[test]
+    fn exec_push_delete_unchanged_remote_deletes() {
+        // W62/A-M2: the head-before-delete guard must not regress the normal
+        // path - an unchanged object still deletes cleanly.
+        let dir = TempDir::new("vaultsync-exec");
+        let store = MemoryStore::new();
+        put_str(&store, "gone.md", "abc", Some(100));
+        let local = LocalFs::new(dir.path());
+        let opts = PlanOpts {
+            delete: true,
+            ..Default::default()
+        };
+        let plan = crate::build_plan(&local, &store, Mode::Push, &opts).unwrap();
+        let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts);
+        assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
+        assert!(matches!(
+            store.head("gone.md").unwrap_err(),
+            Error::NotFound(_)
+        ));
     }
 
     #[test]
