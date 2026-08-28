@@ -617,9 +617,39 @@ fn command_name(cmd: &Command) -> &'static str {
 /// Dispatch a fully-resolved command + settings. W5 (A-M2/B-L5): push/pull/
 /// check refuse loudly when no `[store]` is configured (the in-memory mock is
 /// `status`-only); `status` keeps the mock for offline play.
+///
+/// W92 (r2-M3) seam: store construction (the only non-injectable part) stays
+/// here; the dispatch body lives in [`run_with_settings_store`] so tests can
+/// drive the full TOML -> resolve_settings -> dispatch wiring against an
+/// injected store.
 fn run_with_settings(
     cmd: Command,
     settings: &crate::config::Settings,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    // Build the store: a real `[store]` bucket -> S3Store; otherwise the mock.
+    let store: Box<dyn ObjectStore> = if settings.store.bucket.is_empty() {
+        Box::new(MemoryStore::new())
+    } else {
+        match crate::store::s3::S3Store::new(&settings.store) {
+            Ok(s) => Box::new(s),
+            Err(e) => {
+                let _ = writeln!(err, "error: {e}");
+                return 1;
+            }
+        }
+    };
+    run_with_settings_store(cmd, settings, store.as_ref(), out, err)
+}
+
+/// The dispatch body of [`run_with_settings`] with an externally-provided
+/// store (W92/r2-M3 seam): every pre-flight check, the vault merge, and the
+/// `run_with_io` handoff are exercised with a test-injectable store.
+fn run_with_settings_store(
+    cmd: Command,
+    settings: &crate::config::Settings,
+    store: &dyn ObjectStore,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
@@ -671,19 +701,7 @@ fn run_with_settings(
     // Merge the config vault_root into the command when --vault was unset.
     let cmd = resolve_vault_from_config(cmd, settings);
 
-    // Build the store: a real `[store]` bucket -> S3Store; otherwise the mock.
-    let store: Box<dyn ObjectStore> = if settings.store.bucket.is_empty() {
-        Box::new(MemoryStore::new())
-    } else {
-        match crate::store::s3::S3Store::new(&settings.store) {
-            Ok(s) => Box::new(s),
-            Err(e) => {
-                let _ = writeln!(err, "error: {e}");
-                return 1;
-            }
-        }
-    };
-    run_with_io(cmd, store.as_ref(), settings.mtime_tolerance_ms, out, err)
+    run_with_io(cmd, store, settings.mtime_tolerance_ms, out, err)
 }
 
 /// Entry point used by `main`: args from env, config load, store dispatch,
@@ -1588,6 +1606,76 @@ mod tests {
         assert!(
             !String::from_utf8(out).unwrap().contains("check: ok"),
             "must not be a mock green check"
+        );
+    }
+
+    #[test]
+    fn run_with_settings_applies_toml_tolerance() {
+        // r2-M3 (W92): resolve_settings' tolerance output must reach the
+        // plan end to end through the run_with_settings dispatch. Local
+        // `a.md` is 4000 ms newer than the remote; with
+        // `[transfer].mtime_tolerance_ms = 5000` (resolved from TOML) the
+        // row is Skip, and the default Settings (1000) plans an Upload for
+        // the same file/remote state. The store is injected via the W92
+        // seam (run_with_settings builds its own store internally - S3
+        // needing credentials, or an empty mock - so a naive test cannot
+        // observe the tolerance). RED: the seam does not exist (compile
+        // failure).
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "same").unwrap();
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_700_000_004_000);
+        std::fs::File::open(dir.join("a.md"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(t))
+            .unwrap();
+        let cfg = crate::config::parse_config_str(
+            "[store]\nbucket = \"b\"\n[transfer]\nmtime_tolerance_ms = 5000\n",
+        )
+        .unwrap();
+        let settings =
+            crate::config::resolve_settings(&cfg, &crate::config::EnvSnapshot::default())
+                .unwrap();
+        assert_eq!(settings.mtime_tolerance_ms, 5000, "TOML tolerance resolved");
+        let store = MemoryStore::new();
+        let mut cursor = std::io::Cursor::new(b"same".to_vec());
+        store
+            .put_from("a.md", &mut cursor, 4, Some(1_700_000_000_000))
+            .unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings_store(
+            Command::push(dir.path().into(), false),
+            &settings,
+            &store,
+            &mut out,
+            &mut err,
+        );
+        let out = String::from_utf8(out).unwrap();
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(
+            !out.lines().any(|l| l.starts_with("U  a.md")),
+            "expected Skip under TOML tolerance 5000: {out}"
+        );
+        // control: the default Settings (1000) plans an Upload for the same
+        // file/remote state
+        let mut defaults = no_store_settings(dir.path());
+        defaults.store.bucket = "b".to_string(); // avoid the no-store refusal; the store is injected anyway
+        let mut out2 = Vec::new();
+        let mut err2 = Vec::new();
+        let code2 = run_with_settings_store(
+            Command::push(dir.path().into(), false),
+            &defaults,
+            &store,
+            &mut out2,
+            &mut err2,
+        );
+        let out2 = String::from_utf8(out2).unwrap();
+        let err2 = String::from_utf8(err2).unwrap();
+        assert_eq!(code2, 0, "stderr: {err2}");
+        assert!(
+            out2.lines().any(|l| l.starts_with("U  a.md")),
+            "expected Upload under default tolerance: {out2}"
         );
     }
 
