@@ -34,7 +34,37 @@ pub fn build_plan(
     for e in &remote_entities {
         crate::entity::ensure_valid_key(&e.key)?;
     }
-    Ok(plan::plan(&local_entities, &remote_entities, mode, opts))
+    let mut p = plan::plan(&local_entities, &remote_entities, mode, opts);
+    // 4c: case-only-collision preflight overrides the affected rows to
+    // Conflict `case_collision` (never auto-paired with a differently-cased
+    // sibling).
+    let collided = plan::case_collision_keys(&local_entities, &remote_entities);
+    if !collided.is_empty() {
+        for a in &mut p.actions {
+            if collided.contains(&a.key) {
+                a.kind = plan::ActionKind::Conflict;
+                a.reason = "case_collision";
+            }
+        }
+        p.stats = compute_stats(&p.actions);
+    }
+    Ok(p)
+}
+
+fn compute_stats(actions: &[plan::Action]) -> plan::PlanStats {
+    use plan::ActionKind::*;
+    let mut s = plan::PlanStats::default();
+    for a in actions {
+        match a.kind {
+            Upload => s.upload += 1,
+            Download => s.download += 1,
+            DeleteLocal => s.delete_local += 1,
+            DeleteRemote => s.delete_remote += 1,
+            Skip => s.skip += 1,
+            Conflict => s.conflict += 1,
+        }
+    }
+    s
 }
 
 /// Build a [`Plan`] against a store for a real vault directory (Status mode).
@@ -347,4 +377,31 @@ mod tests {
 
         assert_eq!(p.stats.upload, 1);
     }
+    #[test]
+    fn build_plan_case_collision_cross_side_conflicts() {
+        // 4c: local `Note.md` vs remote `note.md` (different size/mtime) ->
+        // both rows Conflict `case_collision`; they are never auto-paired as
+        // Equal. (Cross-side form: platform-safe, unlike two same-side files
+        // differing only by case on a case-insensitive FS.)
+        let dir = TempDir::new("vaultsync-lib-test");
+        std::fs::write(dir.join("Note.md"), "local-case").unwrap();
+        let local = LocalFs::new(dir.path());
+        let store = StubStore {
+            listed: vec![crate::entity::file("note.md", 5, Some(1000))],
+        };
+        let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default()).unwrap();
+        let note = p.actions.iter().find(|a| a.key == "Note.md").expect("Note.md");
+        let note_lower = p
+            .actions
+            .iter()
+            .find(|a| a.key == "note.md")
+            .expect("note.md");
+        assert_eq!(note.kind, ActionKind::Conflict);
+        assert_eq!(note.reason, "case_collision");
+        assert_eq!(note_lower.kind, ActionKind::Conflict);
+        assert_eq!(note_lower.reason, "case_collision");
+        assert_eq!(p.stats.conflict, 2);
+    }
+
+
 }
