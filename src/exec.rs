@@ -161,12 +161,10 @@ fn exec_download(
     a: &crate::plan::Action,
     tolerance_ms: u64,
 ) -> Result<(), Error> {
-    let tmp = local.tmp_path_for(&a.key)?;
+    let (tmp, mut f) = local.tmp_path_for(&a.key)?;
     let result = (|| -> Result<Option<u64>, Error> {
         let remote_mtime = {
-            let mut f = std::fs::File::create(&tmp)?;
             let remote = store.get_to(&a.key, &mut f)?;
-            f.sync_all()?;
             // A-H1/B-L3: truth-check the bytes actually on disk (not just the
             // backend's declared size or the planned remote entity). A backend
             // that truncates the body while returning a clean EOF is caught
@@ -180,6 +178,7 @@ fn exec_download(
                     a.key
                 )));
             }
+            f.sync_all()?;
             remote.mtime_ms
         };
         Ok(remote_mtime)

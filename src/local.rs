@@ -216,10 +216,12 @@ impl LocalFs {
         Ok(f)
     }
 
-    /// Validate a download target and create its parents, returning a unique
-    /// temp path whose later rename is the atomic commit. The path stays under
-    /// the canonical vault root (P1r7 download half).
-    pub fn tmp_path_for(&self, key: &str) -> Result<PathBuf, Error> {
+    /// Validate a download target and create its parents, allocating a unique
+    /// temp file whose later rename is the atomic commit. The path stays under
+    /// the canonical vault root (P1r7 download half). The file is created with
+    /// `create_new` + bounded retry (R4-L2/W40) so a pre-planted symlink or
+    /// stale leftover at a predictable name is skipped, never followed.
+    pub fn tmp_path_for(&self, key: &str) -> Result<(PathBuf, std::fs::File), Error> {
         let path = key_to_local_path(&self.root, key)?;
         let parent = path.parent().ok_or_else(|| {
             Error::Other(format!(
@@ -230,7 +232,7 @@ impl LocalFs {
         self.ensure_locality(parent)?;
         std::fs::create_dir_all(parent)?;
         self.ensure_locality(parent)?;
-        Ok(temp_sibling(&path))
+        alloc_temp_sibling(&path)
     }
 
     /// Commit a temp file written by a download to its final path, applying
@@ -355,9 +357,8 @@ impl LocalFs {
         // Re-check after dir creation, in case create_dir_all resolved a symlink.
         self.ensure_locality(parent)?;
 
-        let tmp = temp_sibling(&path);
+        let (tmp, mut f) = alloc_temp_sibling(&path)?;
         let write_result = (|| -> Result<(), Error> {
-            let mut f = std::fs::File::create(&tmp)?;
             let copied = std::io::copy(&mut r.take(expected_size), &mut f)?;
             if copied != expected_size {
                 return Err(Error::Other(format!(
@@ -536,17 +537,52 @@ pub fn key_to_local_path(root: &Path, key: &str) -> Result<PathBuf, Error> {
     Ok(root.join(key))
 }
 
-/// A unique temp sibling path (`.name.vaultsync-tmp-<pid>-<n>`) used so an
-/// atomic rename replaces the final path only on success.
-fn temp_sibling(final_path: &Path) -> PathBuf {
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+/// 100 unique temp-sibling candidate paths (`.name.vaultsync-tmp-<pid>-<n>`),
+/// so the allocator can skip a stale leftover or a pre-planted symlink and
+/// retry at the next candidate instead of following/truncating through it
+/// (R4-L2/W40, mirroring the W29 upload-side `alloc_first` pattern).
+fn temp_sibling_candidates(final_path: &Path) -> Vec<PathBuf> {
     let name = final_path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "obj".to_string());
     let dir = final_path.parent().unwrap_or_else(|| Path::new("."));
-    dir.join(format!(".{name}.vaultsync-tmp-{}-{n}", std::process::id()))
+    let pid = std::process::id();
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let start = COUNTER.fetch_add(100, std::sync::atomic::Ordering::Relaxed);
+    (0..100)
+        .map(|i| dir.join(format!(".{name}.vaultsync-tmp-{pid}-{}", start + i as u64)))
+        .collect()
+}
+
+/// Allocate the first free temp-sibling candidate exclusively with `create_new`
+/// (R4-L2/W40): a pre-planted symlink or stale leftover at an earlier
+/// candidate is skipped untouched - never followed/truncated - and the fresh
+/// file is created at the next free one. Bounded (100 candidates); only if
+/// every candidate is taken is it a loud error (never an infinite loop).
+fn alloc_temp_sibling(final_path: &Path) -> Result<(PathBuf, std::fs::File), Error> {
+    alloc_temp_sibling_from(&temp_sibling_candidates(final_path))
+}
+
+/// Slice variant of [`alloc_temp_sibling`] that consumes an explicit candidate
+/// list, so tests can plant a leftover/symlink in a known candidate and verify
+/// the allocator skips it and moves to the next.
+fn alloc_temp_sibling_from(candidates: &[PathBuf]) -> Result<(PathBuf, std::fs::File), Error> {
+    for p in candidates {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(p)
+        {
+            Ok(f) => return Ok((p.clone(), f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(Error::Io(e)),
+        }
+    }
+    Err(Error::Io(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique temp file",
+    )))
 }
 
 /// Whether a file name is a reserved vaultsync temp sibling (W23/M1): a
@@ -1368,7 +1404,7 @@ mod tests {
         let dir = TempDir::new("vaultsync-test");
         let outside = TempDir::new("vaultsync-outside");
         let fs = LocalFs::new(dir.path());
-        let tmp = fs.tmp_path_for("sub/a.md").unwrap(); // creates root/sub
+        let (tmp, _f) = fs.tmp_path_for("sub/a.md").unwrap(); // creates root/sub
         // swap `sub` for an out-of-vault symlink; the tmp now resolves to
         // outside/.a.md.tmp, which we repopulate so finalize's open()/sync
         // succeed and only the locality re-check can refuse.
@@ -1396,7 +1432,7 @@ mod tests {
         // read-only-parent variant would also block remove_file).
         let dir = TempDir::new("vaultsync-test");
         let fs = LocalFs::new(dir.path());
-        let tmp = fs.tmp_path_for("sub/a.md").unwrap();
+        let (tmp, _f) = fs.tmp_path_for("sub/a.md").unwrap();
         std::fs::write(&tmp, "payload").unwrap();
         std::fs::create_dir_all(dir.join("sub/a.md")).unwrap();
         let err = fs.finalize_write("sub/a.md", &tmp, None).unwrap_err();
@@ -1408,6 +1444,48 @@ mod tests {
         );
         // the directory (final path) is untouched
         assert!(dir.join("sub/a.md").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_sibling_create_new_skips_preplanted_symlink() {
+        // R4-L2/W40: a pre-planted symlink at an earlier temp candidate
+        // (pointing at a victim outside the vault) must be skipped by the
+        // allocator (`create_new` -> AlreadyExists), the fresh file created at
+        // the next candidate, and the victim left untouched. The old
+        // `File::create` semantics would truncate through the link.
+        let dir = TempDir::new("vaultsync-test");
+        let outside = TempDir::new("vaultsync-outside");
+        std::fs::write(outside.join("victim"), "secret").unwrap();
+        let final_path = dir.join("f.md");
+        let candidates = temp_sibling_candidates(&final_path);
+        std::os::unix::fs::symlink(outside.join("victim"), &candidates[0]).unwrap();
+        let (tmp, _f) = alloc_temp_sibling_from(&candidates).unwrap();
+        assert_ne!(tmp, candidates[0], "must skip the planted symlink");
+        assert_eq!(tmp, candidates[1], "fresh file at next candidate");
+        // the victim file is untouched (never truncated through the link)
+        assert_eq!(std::fs::read(outside.join("victim")).unwrap(), b"secret");
+        for c in &candidates {
+            let _ = std::fs::remove_file(c);
+        }
+    }
+
+    #[test]
+    fn temp_sibling_create_new_skips_stale_leftover() {
+        // R4-L2/W40: a stale regular file at an earlier candidate (a crashed
+        // run's leftover) is left untouched and skipped; the fresh file is
+        // allocated at the next candidate.
+        let dir = TempDir::new("vaultsync-test");
+        let final_path = dir.join("f.md");
+        let candidates = temp_sibling_candidates(&final_path);
+        std::fs::write(&candidates[0], "stale").unwrap();
+        let (tmp, _f) = alloc_temp_sibling_from(&candidates).unwrap();
+        assert_ne!(tmp, candidates[0], "must skip the stale candidate");
+        assert_eq!(tmp, candidates[1], "fresh file at next candidate");
+        assert_eq!(std::fs::read(&candidates[0]).unwrap(), b"stale");
+        for c in &candidates {
+            let _ = std::fs::remove_file(c);
+        }
     }
 
     #[test]
