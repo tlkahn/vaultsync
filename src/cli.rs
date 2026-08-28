@@ -419,6 +419,15 @@ fn print_walk_warnings(local: &crate::local::LocalFs, follow: bool, err: &mut dy
             rep.skipped_symlinks
         );
     }
+    if rep.skipped_temp_files > 0 {
+        // R4-L3/W41: a reserved temp/probe leftover is a crash signal, so it
+        // is always surfaced (not just under -v).
+        let _ = writeln!(
+            err,
+            "warning: skipped {} vaultsync temp/probe file(s) (crash leftovers); remove them manually",
+            rep.skipped_temp_files
+        );
+    }
 }
 
 /// Push/pull value flags bundled so `dispatch_plan` stays under clippy's
@@ -1082,6 +1091,22 @@ mod tests {
             String::from_utf8(out).unwrap(),
             String::from_utf8(err).unwrap(),
         )
+    }
+
+    #[test]
+    fn status_reports_skipped_temp_files() {
+        // R4-L3/W41: the walker counts skipped vaultsync temp/probe leftovers
+        // but the CLI never surfaced the count. A vault containing one must
+        // warn on stderr (a crash signal, not just debug noise).
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("note.md"), "real").unwrap();
+        std::fs::write(dir.join(".note.md.vaultsync-tmp-1-1"), "crash-leftover").unwrap();
+        let (code, _, err) = run(Command::status(dir.path().into()), &MemoryStore::new());
+        assert_ne!(code, 1, "unexpected error exit");
+        assert!(
+            err.contains("skipped 1 vaultsync temp/probe file(s)"),
+            "skipped-temp warning missing: {err}"
+        );
     }
 
     #[test]
