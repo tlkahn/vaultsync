@@ -15,6 +15,7 @@
 //!   chars and whitespace-only segments, P1r4-key-ctl) fails the walk loud
 //!   instead of emitting a corrupt key.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -56,6 +57,228 @@ impl LocalFs {
         out.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(out)
     }
+
+    /// Open a local file for reading (upload side), verifying it is still a
+    /// regular, non-symlink file of the expected size after walking (R3.3 /
+    /// P1r7-symlink-swap TOCTOU guard).
+    ///
+    /// - type recheck: the path must not currently be a symlink (no-follow
+    ///   look via `symlink_metadata`) and the opened descriptor must be a
+    ///   regular file;
+    /// - size recheck: the opened descriptor's own size must equal
+    ///   `expected_size` (a file that grew/shrunk between walk and open is a
+    ///   per-key error, never a silently-truncated object).
+    pub fn open_verified(&self, key: &str, expected_size: u64) -> Result<std::fs::File, Error> {
+        let path = key_to_local_path(&self.root, key)?;
+        // No-follow type check: reject a symlink swapped in after the walk.
+        let smd = match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::NotFound(key.to_string()));
+            }
+            Err(e) => return Err(e.into()),
+            Ok(md) => md,
+        };
+        if smd.file_type().is_symlink() {
+            return Err(Error::Other(format!(
+                "refusing to open symlink (was listed as a file): {}",
+                path.display()
+            )));
+        }
+        let f = std::fs::File::open(&path)?;
+        // Stats the OPENED descriptor (not a second path stat): a re-stat of
+        // the path could describe a different file that replaced it.
+        let fmd = f.metadata()?;
+        if !fmd.is_file() {
+            return Err(Error::Other(format!(
+                "open_verified: not a regular file: {}",
+                path.display()
+            )));
+        }
+        if fmd.len() != expected_size {
+            return Err(Error::Other(format!(
+                "open_verified: size changed for {} (expected {expected_size}, found {})",
+                key,
+                fmd.len()
+            )));
+        }
+        Ok(f)
+    }
+
+    /// Atomically write `expected_size` bytes from `r` to `key`'s file and set
+    /// its mtime. Created via a temp sibling + rename so a partial write is
+    /// never visible at the final path. Rejects a path escaping the canonical
+    /// vault root (P1r7 download half).
+    pub fn write_atomic(
+        &self,
+        key: &str,
+        r: &mut dyn std::io::Read,
+        expected_size: u64,
+        mtime_ms: Option<u64>,
+    ) -> Result<(), Error> {
+        let path = key_to_local_path(&self.root, key)?;
+        let parent = path.parent().ok_or_else(|| {
+            Error::Other(format!("write_atomic has no parent dir: {}", path.display()))
+        })?;
+        // Refuse to write outside the canonicalized vault root even when a
+        // parent component has been swapped for an out-of-vault symlink.
+        self.ensure_locality(parent)?;
+
+        std::fs::create_dir_all(parent)?;
+        // Re-check after dir creation, in case create_dir_all resolved a symlink.
+        self.ensure_locality(parent)?;
+
+        let tmp = temp_sibling(&path);
+        let write_result = (|| -> Result<(), Error> {
+            let mut f = std::fs::File::create(&tmp)?;
+            let copied = std::io::copy(&mut r.take(expected_size), &mut f)?;
+            if copied != expected_size {
+                return Err(Error::Other(format!(
+                    "write_atomic: short write for {key} (expected {expected_size}, got {copied})"
+                )));
+            }
+            if let Some(ms) = mtime_ms {
+                set_file_mtime_ms(&f, ms)?;
+            }
+            f.sync_all()?;
+            Ok(())
+        })();
+
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            // Surface the underlying short-write as such, not a rename failure.
+            return write_result;
+        }
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// Delete a single file (never a directory). Missing keys are
+    /// [`Error::NotFound`] (not idempotent, matching the store trait).
+    pub fn delete_file(&self, key: &str) -> Result<(), Error> {
+        let path = key_to_local_path(&self.root, key)?;
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(Error::NotFound(key.to_string()))
+            }
+            Err(e) => Err(e.into()),
+            Ok(()) => Ok(()),
+        }
+    }
+
+    /// Remove now-empty directories bottom-up (R2.1 option a): children-first,
+    /// stop at any non-empty dir, never remove the vault root. Returns how
+    /// many directories were removed. Only touches dirs that are currently
+    /// empty; file deletes are planned separately by the executor.
+    pub fn remove_empty_dirs_bottom_up(&self) -> Result<u32, Error> {
+        let root_canon = std::fs::canonicalize(&self.root)?;
+        let mut removed = 0u32;
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        collect_dirs(&self.root, &mut dirs)?;
+        // Post-order: deepest first (reverse of pre-order accumulation, which
+        // pushes parents before children).
+        for d in dirs.iter().rev() {
+            let canon = match std::fs::canonicalize(d) {
+                Ok(c) => c,
+                Err(_) => continue, // vanished mid-pass
+            };
+            if canon == root_canon {
+                continue; // never remove the root
+            }
+            if canon.starts_with(&root_canon) && is_empty_dir(d) {
+                match std::fs::remove_dir(d) {
+                    Ok(()) => removed += 1,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => {}
+                }
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Guard: the deepest existing ancestor of `dir` must canonicalize to stay
+    /// under the canonicalized vault root. A parent swapped for an out-of-vault
+    /// symlink canonicalizes outside and is refused before any mkdir/write.
+    fn ensure_locality(&self, dir: &Path) -> Result<(), Error> {
+        let root_canon = std::fs::canonicalize(&self.root)?;
+        let mut probe: &Path = dir;
+        loop {
+            if probe.exists() {
+                let canon = std::fs::canonicalize(probe)?;
+                if !canon.starts_with(&root_canon) {
+                    return Err(Error::Other(format!(
+                        "refusing to write outside the vault root: {}",
+                        probe.display()
+                    )));
+                }
+                return Ok(());
+            }
+            match probe.parent() {
+                Some(p) if !p.as_os_str().is_empty() => probe = p,
+                _ => return Ok(()),
+            }
+        }
+    }
+}
+
+/// The single vault-relative -> local-path join site (R2.2 lock). All file
+/// operations (reader, writer, deletes) route through here so a key is
+/// validated exactly once before any filesystem action. Rejects invalid keys
+/// (`..`, absolute, control chars via [`crate::entity::ensure_valid_key`]) and
+/// folder keys (trailing `/`) which are not valid file-operation targets.
+pub fn key_to_local_path(root: &Path, key: &str) -> Result<PathBuf, Error> {
+    crate::entity::ensure_valid_key(key)?;
+    if key.ends_with('/') {
+        return Err(Error::InvalidKey(format!(
+            "folder keys are not valid for file operations: {key:?}"
+        )));
+    }
+    Ok(root.join(key))
+}
+
+/// A unique temp sibling path (`.name.vaultsync-tmp-<pid>-<n>`) used so an
+/// atomic rename replaces the final path only on success.
+fn temp_sibling(final_path: &Path) -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = final_path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "obj".to_string());
+    let dir = final_path.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(format!(".{name}.vaultsync-tmp-{}-{n}", std::process::id()))
+}
+
+/// Set a file's mtime in ms since epoch (std `File::set_times`, stable).
+fn set_file_mtime_ms(f: &std::fs::File, ms: u64) -> Result<(), Error> {
+    let t = UNIX_EPOCH + std::time::Duration::from_millis(ms);
+    let times = std::fs::FileTimes::new().set_modified(t);
+    f.set_times(times)?;
+    Ok(())
+}
+
+/// Whether a directory currently has no entries.
+fn is_empty_dir(d: &Path) -> bool {
+    std::fs::read_dir(d).map(|mut rd| rd.next().is_none()).unwrap_or(false)
+}
+
+/// Pre-order accumulate of all directories under `root` (root included).
+fn collect_dirs(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> {
+    let rd = match std::fs::read_dir(root) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+        Ok(rd) => rd,
+    };
+    for entry in rd {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        let p = entry.path();
+        if ft.is_dir() {
+            out.push(p.clone());
+            collect_dirs(&p, out)?;
+        }
+    }
+    out.push(root.to_path_buf());
+    Ok(())
 }
 
 fn walk(dir: &Path, root: &Path, out: &mut Vec<Entity>) -> Result<(), Error> {
@@ -491,4 +714,173 @@ mod tests {
         let fs = LocalFs::new(&missing);
         assert!(fs.list().is_err());
     }
+    // --- Phase 2 Slice 3: key_to_local_path, reader, writer, delete ---
+
+    #[test]
+    fn key_to_local_path_joins_under_root() {
+        let dir = TempDir::new("vaultsync-test");
+        let p = key_to_local_path(dir.path(), "notes/a.md").unwrap();
+        assert_eq!(p, dir.join("notes/a.md"));
+    }
+
+    #[test]
+    fn key_to_local_path_rejects_traversal() {
+        // `..`, absolute, control-char keys are rejected *before* any join -
+        // the single validation site for all file operations.
+        let dir = TempDir::new("vaultsync-test");
+        for bad in ["../evil.md", "/abs.md", "a/\nb.md", "a/../b.md", ".."] {
+            let err = key_to_local_path(dir.path(), bad).unwrap_err();
+            assert!(matches!(err, Error::InvalidKey(_)), "key {bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn key_to_local_path_rejects_folder_key_for_file_ops() {
+        // A trailing `/` (folder key) is not a valid file-operation target.
+        let dir = TempDir::new("vaultsync-test");
+        let err = key_to_local_path(dir.path(), "notes/").unwrap_err();
+        assert!(matches!(err, Error::InvalidKey(_)));
+    }
+
+    #[test]
+    fn local_read_streams_bytes() {
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::write(dir.join("a.md"), "hello world").unwrap();
+        let fs = LocalFs::new(dir.path());
+        let mut f = fs.open_verified("a.md", 11).unwrap();
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut f, &mut buf).unwrap();
+        assert_eq!(buf, "hello world");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_open_rechecks_type_not_symlink() {
+        // A listed file replaced by a symlink between list and open must fail
+        // open loud (no-follow). Driven by creating the symlink directly at
+        // open time; the TOCTOU window itself is not timing-tested.
+        let dir = TempDir::new("vaultsync-test");
+        let outside = TempDir::new("vaultsync-outside");
+        std::fs::write(outside.join("secret"), "s").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), dir.join("a.md")).unwrap();
+        let fs = LocalFs::new(dir.path());
+        let err = fs.open_verified("a.md", 1).unwrap_err();
+        assert!(
+            format!("{err}").contains("symlink"),
+            "expected symlink refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn local_open_verified_rejects_size_mismatch() {
+        // The opened descriptor's size must match the expected size (R3.3).
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::write(dir.join("a.md"), "12345").unwrap();
+        let fs = LocalFs::new(dir.path());
+        assert!(fs.open_verified("a.md", 5).is_ok());
+        assert!(fs.open_verified("a.md", 6).is_err(), "size mismatch not caught");
+    }
+
+    #[test]
+    fn local_open_verified_missing_not_found() {
+        let dir = TempDir::new("vaultsync-test");
+        let fs = LocalFs::new(dir.path());
+        assert!(matches!(
+            fs.open_verified("gone.md", 1).unwrap_err(),
+            Error::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn local_write_creates_parents_and_bytes() {
+        let dir = TempDir::new("vaultsync-test");
+        let fs = LocalFs::new(dir.path());
+        let mut r = std::io::Cursor::new(b"deebee".to_vec());
+        fs.write_atomic("n/deep/b.md", &mut r, 6, None).unwrap();
+        assert_eq!(std::fs::read(dir.join("n/deep/b.md")).unwrap(), b"deebee");
+    }
+
+    #[test]
+    fn local_write_sets_mtime() {
+        let dir = TempDir::new("vaultsync-test");
+        let fs = LocalFs::new(dir.path());
+        let target_ms = 1_700_000_000_123u64;
+        let mut r = std::io::Cursor::new(b"x".to_vec());
+        fs.write_atomic("a.md", &mut r, 1, Some(target_ms)).unwrap();
+        let got = std::fs::metadata(dir.join("a.md"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(
+            got.abs_diff(target_ms) < 2000,
+            "mtime {got} not near {target_ms}"
+        );
+    }
+
+    #[test]
+    fn local_write_atomic_tmp_rename() {
+        // A short write (reader ends early) must not leave a partial file at
+        // the final path, and must surface the short-write error.
+        let dir = TempDir::new("vaultsync-test");
+        let fs = LocalFs::new(dir.path());
+        let mut r = std::io::Cursor::new(b"tiny".to_vec());
+        let err = fs.write_atomic("a.md", &mut r, 100, None).unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("short"), "err: {err}");
+        assert!(!dir.join("a.md").exists(), "partial file visible at final path");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_write_stays_under_root() {
+        // A key_to_local_path-validated path whose parent is an out-of-vault
+        // symlink is detected (canonicalize parent under canonicalized root)
+        // and refused before writing (P1r7 download half).
+        let dir = TempDir::new("vaultsync-test");
+        let outside = TempDir::new("vaultsync-outside");
+        std::os::unix::fs::symlink(outside.path(), dir.join("sub")).unwrap();
+        let fs = LocalFs::new(dir.path());
+        let mut r = std::io::Cursor::new(b"x".to_vec());
+        let err = fs.write_atomic("sub/a.md", &mut r, 1, None).unwrap_err();
+        assert!(
+            format!("{err}").contains("outside"),
+            "expected locality refusal, got: {err}"
+        );
+        assert!(!outside.join("a.md").exists() || !dir.join("sub/a.md").exists());
+    }
+
+    #[test]
+    fn local_delete_file() {
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::write(dir.join("a.md"), "x").unwrap();
+        let fs = LocalFs::new(dir.path());
+        fs.delete_file("a.md").unwrap();
+        assert!(!dir.join("a.md").exists());
+        // missing -> NotFound (not idempotent)
+        assert!(matches!(
+            fs.delete_file("a.md").unwrap_err(),
+            Error::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn local_remove_empty_dirs_bottom_up() {
+        // Empty nested dirs are removed children-first; the root is never
+        // removed; a non-empty sibling stops the pass for that branch.
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::create_dir_all(dir.join("a/b/c")).unwrap();
+        std::fs::create_dir_all(dir.join("keep/sub")).unwrap();
+        std::fs::write(dir.join("keep/sub/file.md"), "x").unwrap();
+        let fs = LocalFs::new(dir.path());
+        let removed = fs.remove_empty_dirs_bottom_up().unwrap();
+        assert!(!dir.join("a/b/c").exists());
+        assert!(!dir.join("a/b").exists());
+        assert!(!dir.join("a").exists());
+        assert!(dir.exists(), "root must remain");
+        assert!(dir.join("keep/sub/file.md").exists(), "non-empty kept");
+        assert!(removed >= 3, "removed {removed}");
+    }
 }
+
