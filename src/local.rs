@@ -202,6 +202,20 @@ impl LocalFs {
             let _ = std::fs::remove_file(tmp);
             return result;
         }
+        // W6/B-M3: re-verify locality immediately before the atomic rename
+        // (mirrors write_atomic's post-create_dir_all re-check). A parent
+        // swapped for an out-of-vault symlink since `tmp_path_for` must not
+        // be renamed through; on refusal the temp sibling is removed.
+        let parent = path.parent().ok_or_else(|| {
+            Error::Other(format!(
+                "finalize_write has no parent dir: {}",
+                path.display()
+            ))
+        })?;
+        if let Err(e) = self.ensure_locality(parent) {
+            let _ = std::fs::remove_file(tmp);
+            return Err(e);
+        }
         std::fs::rename(tmp, &path)?;
         Ok(())
     }
@@ -1051,6 +1065,35 @@ mod tests {
             "expected locality refusal, got: {err}"
         );
         assert!(!outside.join("a.md").exists() || !dir.join("sub/a.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finalize_write_rechecks_locality_before_rename() {
+        // W6/B-M3: a parent swapped for an out-of-vault symlink between tmp
+        // allocation and finalize must be refused (locality) before the rename,
+        // and the temp sibling removed; nothing is written outside. Fails
+        // today (rename commits through the swapped parent).
+        let dir = TempDir::new("vaultsync-test");
+        let outside = TempDir::new("vaultsync-outside");
+        let fs = LocalFs::new(dir.path());
+        let tmp = fs.tmp_path_for("sub/a.md").unwrap(); // creates root/sub
+        // swap `sub` for an out-of-vault symlink; the tmp now resolves to
+        // outside/.a.md.tmp, which we repopulate so finalize's open()/sync
+        // succeed and only the locality re-check can refuse.
+        std::fs::remove_dir_all(dir.join("sub")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.join("sub")).unwrap();
+        std::fs::write(&tmp, "payload").unwrap();
+        let err = fs.finalize_write("sub/a.md", &tmp, None).unwrap_err();
+        assert!(
+            format!("{err}").contains("outside"),
+            "expected locality refusal: {err}"
+        );
+        assert!(!tmp.exists(), "tmp not removed on locality refusal");
+        assert!(
+            !outside.join("a.md").exists(),
+            "renamed through the swapped parent into outside"
+        );
     }
 
     #[test]
