@@ -242,6 +242,9 @@ fn classify_error(timeout: bool, status: Option<u16>, msg: &str) -> Error {
     match status {
         Some(404) => Error::NotFound(msg.to_string()),
         Some(401) | Some(403) => Error::Unauthorized(msg.to_string()),
+        // W9/A-M5/B-M4: 5xx and 429 (throttle) are transient provider
+        // unavailability, not generic Other.
+        Some(s) if s >= 500 || s == 429 => Error::Unavailable(msg.to_string()),
         _ => Error::Other(msg.to_string()),
     }
 }
@@ -505,11 +508,17 @@ mod tests {
 
     #[test]
     fn s3_error_mapping() {
+        // Amended for W9/A-M5/B-M4 (PR2): 5xx and 429 map to Unavailable
+        // (previously Other); 404/401/403/timeout mappings unchanged.
         assert!(matches!(classify_error(false, Some(404), "x"), Error::NotFound(_)));
         assert!(matches!(classify_error(false, Some(403), "x"), Error::Unauthorized(_)));
         assert!(matches!(classify_error(false, Some(401), "x"), Error::Unauthorized(_)));
         assert!(matches!(classify_error(true, Some(500), "x"), Error::Timeout(_)));
-        assert!(matches!(classify_error(false, Some(500), "x"), Error::Other(_)));
+        assert!(matches!(classify_error(false, Some(500), "x"), Error::Unavailable(_)));
+        assert!(matches!(classify_error(false, Some(503), "x"), Error::Unavailable(_)));
+        assert!(matches!(classify_error(false, Some(429), "x"), Error::Unavailable(_)));
+        assert!(matches!(classify_error(false, Some(599), "x"), Error::Unavailable(_)));
+        assert!(matches!(classify_error(false, Some(499), "x"), Error::Other(_)));
         assert!(matches!(classify_error(false, None, "x"), Error::Other(_)));
     }
 
