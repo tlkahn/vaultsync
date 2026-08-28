@@ -143,6 +143,11 @@ fn s3_integ_list_paginates() {
 #[test]
 fn s3_integ_prefix_isolation() {
     // Objects under another (non-store) prefix are invisible to this store.
+    // The "other" store must mirror the primary's endpoint / region / path
+    // style, from the same env-derived settings as `with_store`, with a
+    // normalized sibling prefix (R5-M2): otherwise it would not even talk to
+    // the primary's endpoint on MinIO/R2, or would drop the path-style
+    // requirement, and the leak assertion would be vacuous.
     with_store("isolation", |s| {
         put_bytes(s, "mine.txt", b"m", None)?;
         // write something under a sibling prefix directly via a second store
@@ -150,12 +155,19 @@ fn s3_integ_prefix_isolation() {
         let bucket = std::env::var("VAULTSYNC_TEST_S3_BUCKET").unwrap();
         let region =
             std::env::var("VAULTSYNC_TEST_S3_REGION").unwrap_or_else(|_| "us-west-1".into());
+        let endpoint = std::env::var("VAULTSYNC_TEST_S3_ENDPOINT").ok();
+        let path_style = std::env::var("VAULTSYNC_TEST_S3_PATH_STYLE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let base = std::env::var("VAULTSYNC_TEST_S3_PREFIX").unwrap_or_default();
         let other = S3Store::new(&StoreSettings {
             bucket,
             region: Some(region),
-            endpoint: None,
-            prefix: format!("vaultsync-other-prefix-{}", unique_num()),
-            path_style: false,
+            endpoint: endpoint.clone(),
+            // normalized trailing `/` (R5-M2): an unnormalized sibling prefix
+            // would actually share the primary prefix on a raw-concat.
+            prefix: format!("{base}vaultsync-other-prefix-{}/", unique_num()),
+            path_style,
         })
         .expect("other store");
         put_bytes(&other, "secret.txt", b"s", None)?;
