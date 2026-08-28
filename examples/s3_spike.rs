@@ -27,10 +27,6 @@ const MTIME_KEY: &str = "vaultsync-mtime";
 fn println_ok(tag: &str, msg: &str) {
     println!("[ok] {tag}: {msg}");
 }
-fn println_fail(tag: &str, msg: &str) {
-    println!("[FAIL] {tag}: {msg}");
-}
-
 async fn put_bytes(
     client: &Client,
     bucket: &str,

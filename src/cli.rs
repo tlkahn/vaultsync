@@ -318,7 +318,7 @@ pub fn run_with_io(
             vault,
             json,
             config: _c,
-            verbose: _v,
+            verbose,
             follow_symlinks,
         } => {
             if json {
@@ -329,7 +329,7 @@ pub fn run_with_io(
             match crate::build_plan(&local, store, Mode::Status, &opts) {
                 Ok(plan) => {
                     print_walk_warnings(&local, follow_symlinks, err);
-                    let _ = write!(out, "{}", crate::format_plan_human(&plan));
+                    let _ = write!(out, "{}", crate::format_plan_human_verbose(&plan, verbose));
                     if is_clean(&plan) { 0 } else { 2 }
                 }
                 Err(e) => {
@@ -346,7 +346,7 @@ pub fn run_with_io(
             force_remote,
             json,
             config: _c,
-            verbose: _v,
+            verbose,
             follow_symlinks,
         } => {
             if json {
@@ -358,7 +358,7 @@ pub fn run_with_io(
                 force_remote,
                 ..Default::default()
             };
-            dispatch_plan(&vault, store, Mode::Push, &opts, dry_run, follow_symlinks, out, err)
+            dispatch_plan(&vault, store, Mode::Push, &opts, dry_run, follow_symlinks, verbose, out, err)
         }
         Command::Pull {
             vault,
@@ -368,7 +368,7 @@ pub fn run_with_io(
             force_remote,
             json,
             config: _c,
-            verbose: _v,
+            verbose,
             follow_symlinks,
         } => {
             if json {
@@ -380,7 +380,7 @@ pub fn run_with_io(
                 force_remote,
                 ..Default::default()
             };
-            dispatch_plan(&vault, store, Mode::Pull, &opts, dry_run, follow_symlinks, out, err)
+            dispatch_plan(&vault, store, Mode::Pull, &opts, dry_run, follow_symlinks, verbose, out, err)
         }
     }
 }
@@ -416,6 +416,7 @@ fn dispatch_plan(
     opts: &PlanOpts,
     dry_run: bool,
     follow_symlinks: bool,
+    verbose: u8,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
@@ -423,7 +424,7 @@ fn dispatch_plan(
     match crate::build_plan(&local, store, mode, opts) {
         Ok(plan) => {
             print_walk_warnings(&local, follow_symlinks, err);
-            let _ = write!(out, "{}", crate::format_plan_human(&plan));
+            let _ = write!(out, "{}", crate::format_plan_human_verbose(&plan, verbose));
             if dry_run {
                 if is_clean(&plan) { 0 } else { 2 }
             } else {

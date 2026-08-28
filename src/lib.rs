@@ -102,13 +102,22 @@ pub fn probe_key() -> String {
 
 /// Format a plan as human-readable text (Phase 1 subset of [cli.md]).
 pub fn format_plan_human(plan: &Plan) -> String {
+    format_plan_human_verbose(plan, 0)
+}
+
+/// Format a plan; skip (S) rows are hidden unless `verbosity > 0` (R3 low).
+pub fn format_plan_human_verbose(plan: &Plan, verbosity: u8) -> String {
     let s = &plan.stats;
     let mut out = String::new();
     out.push_str(&format!(
         "plan: {} upload, {} download, {} delete_local, {} delete_remote, {} skip, {} conflict\n",
         s.upload, s.download, s.delete_local, s.delete_remote, s.skip, s.conflict
     ));
+    let show_skips = verbosity > 0;
     for a in &plan.actions {
+        if a.kind == ActionKind::Skip && !show_skips {
+            continue;
+        }
         let prefix = match a.kind {
             ActionKind::Upload => "U  ",
             ActionKind::Download => "D  ",
@@ -441,6 +450,34 @@ mod tests {
         crate::check_store(&store).unwrap();
         // probe object removed after the check
         assert!(store.list("").unwrap().is_empty());
+    }
+
+
+    #[test]
+    fn format_plan_human_hides_skips_by_default() {
+        // R3 low: S rows hidden by default (stats line still counts them);
+        // -v shows them.
+        let dir = TempDir::new("vaultsync-lib-test");
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join("notes/a.md"), "x").unwrap();
+        std::fs::write(dir.join("a.md"), "same").unwrap();
+        let store = MemoryStore::new();
+        put_str(&store, "a.md", "same", 1); // placeholder, mtime replaced below
+        // seed equal a.md so it skips
+        let mt = std::fs::metadata(dir.join("a.md"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let ms = mt.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        {
+            let mut c = std::io::Cursor::new(b"same".to_vec());
+            store.put_from("a.md", &mut c, 4, Some(ms)).unwrap();
+        }
+        let p = status_with_store(&dir, &store, &PlanOpts::default()).unwrap();
+        let default = format_plan_human(&p);
+        assert!(!default.lines().any(|l| l.starts_with("S  ")), "skips leaked: {default}");
+        let verbose = format_plan_human_verbose(&p, 1);
+        assert!(verbose.lines().any(|l| l.starts_with("S  ")), "skips hidden with -v: {verbose}");
     }
 
 

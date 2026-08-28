@@ -23,13 +23,22 @@ This repository is past Phase 0 design. Start here:
 
 ## Status
 
-Phase 0 design locked and Phase 1 skeleton complete (planner + module tree + CLI stubs against an in-memory mock store; `cargo test` green). Phase 2 (real local FS + S3) is next.
+Phase 2 complete: real local FS + real S3 backend (`aws-sdk-s3` + `aws-config` +
+`tokio`, D1 closed), TOML config, real `push`/`pull`/`check`, planner
+collision/mtime/case policies, `--follow-symlinks`, and an env-gated S3
+integration suite. Verified on AWS S3 (byte-identical + exact mtimes); the
+Cloudflare R2 matrix row is pending (no R2 endpoint this session). `cargo test`
+green offline (no network in the default suite). Phase 3 (delete safety, ignore
+patterns, concurrency, CI) is next.
 
 ```text
 cargo build
 cargo run -- version
-cargo run -- status --vault <vault-dir>   # human plan against mock, exit 2 when dirty
-cargo run -- push --vault <vault-dir>     # dry-run stub, no store/disk mutation
-cargo run -- pull --vault <vault-dir>
-cargo run -- check                         # mock connectivity stub
+cargo run -- status --config <cfg>      # human plan against the real store; 0/2/1
+cargo run -- push --config <cfg>        # upload local-newer; real mutation
+cargo run -- pull --config <cfg>        # download remote-newer
+cargo run -- check --config <cfg>       # connectivity probe (put/get/delete)
 ```
+
+Without `--config`, commands run against an in-memory mock store (useful for
+status/dry-run against a local dir).

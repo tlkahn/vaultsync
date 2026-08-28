@@ -2,6 +2,9 @@
 name = "vaultsync"
 version = "0.1.0"
 edition = "2024"
+# MSRV: the edition-2024 floor; exact verification against the final dep tree
+# is Phase 3 (CI) per the roadmap note.
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "Minimal, Unix-style sync of a plain directory (Obsidian vault) to object storage"
 readme = "README.md"

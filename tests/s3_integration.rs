@@ -16,6 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use vaultsync::config::StoreSettings;
 use vaultsync::error::Error;
+use vaultsync::local::LocalFs;
+use vaultsync::plan::{Mode, PlanOpts};
 use vaultsync::store::ObjectStore;
 use vaultsync::store::s3::S3Store;
 
@@ -218,6 +220,86 @@ fn s3_integ_streaming_put_large() {
         let h = s.head("big.bin").map_err(|e| format!("{e}"))?;
         assert_eq!(h.size, size, "stored size");
         assert_eq!(h.mtime_ms, Some(1_700_000_000_999));
+        Ok(())
+    });
+}
+
+fn temp_dir(label: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("vaultsync-itest-dir-{}-{}", unique_num(), label));
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+fn mtime_ms(p: &std::path::Path) -> u64 {
+    std::fs::metadata(p)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+fn set_mtime(p: &std::path::Path, ms: u64) {
+    let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms);
+    let times = std::fs::FileTimes::new().set_modified(t);
+    std::fs::File::open(p).unwrap().set_times(times).unwrap();
+}
+
+#[test]
+fn s3_integ_check() {
+    // Real check (Slice 8) through the shared probe path: put/get/delete.
+    with_store("check", |s| {
+        vaultsync::check_store(s).map_err(|e| format!("{e}"))?;
+        Ok(())
+    });
+}
+
+#[test]
+fn s3_integ_e2e_push_pull() {
+    // The automated half of the exit criteria: push a sample vault (nested
+    // folders + binary + unicode), wipe local, pull into a fresh dir, and
+    // byte- and mtime-compare.
+    with_store("e2e", |s| {
+        let src = temp_dir("src");
+        std::fs::create_dir_all(src.join("notes")).unwrap();
+        let files: Vec<(&str, Vec<u8>)> = vec![
+            ("note.md", b"hello world\n".to_vec()),
+            ("notes/img.png", vec![0x89, 0x50, 0x4e, 0x47, 0x00, 0x0a, 0xff, 0xfe]),
+            ("notes/\u{4e2d}\u{6587}.md", "\u{63a8}\u{8350}\u{ff01}\n".to_string().into_bytes()),
+        ];
+        let fixed = 1_600_000_000_123u64;
+        for (rel, bytes) in &files {
+            let path = src.join(rel);
+            std::fs::write(&path, bytes).unwrap();
+            set_mtime(&path, fixed);
+        }
+
+        // push
+        let local = LocalFs::new(&src);
+        let plan = vaultsync::build_plan(&local, s, Mode::Push, &PlanOpts::default())
+            .map_err(|e| format!("{e}"))?;
+        let rep = vaultsync::exec::execute_plan(&local, s, &plan, Mode::Push);
+        assert!(rep.failed.is_empty(), "push failures: {:?}", rep.failed);
+
+        // wipe the source, pull into a fresh dir
+        let _ = std::fs::remove_dir_all(&src);
+        let dst = temp_dir("dst");
+        let ldst = LocalFs::new(&dst);
+        let plan2 = vaultsync::build_plan(&ldst, s, Mode::Pull, &PlanOpts::default())
+            .map_err(|e| format!("{e}"))?;
+        let rep2 = vaultsync::exec::execute_plan(&ldst, s, &plan2, Mode::Pull);
+        assert!(rep2.failed.is_empty(), "pull failures: {:?}", rep2.failed);
+
+        // byte- and mtime-compare each expected file
+        for (rel, bytes) in &files {
+            let got = std::fs::read(dst.join(rel)).map_err(|e| format!("{rel}: {e}"))?;
+            assert_eq!(&got, bytes, "byte mismatch for {rel}");
+            let gm = mtime_ms(&dst.join(rel));
+            assert!(gm.abs_diff(fixed) < 2000, "{rel} mtime {gm} != {fixed}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dst);
         Ok(())
     });
 }
