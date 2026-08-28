@@ -495,8 +495,14 @@ impl LocalFs {
                 }
             }
         }
-        std::fs::remove_file(&path)?;
-        Ok(())
+        // W76 (r8b M1 / r8a-5): route the unlink through the shared seam
+        // (`unlink_local_file`) like `delete_file` does. This closes the
+        // stat-to-unlink parent-swap window on the only executor-used delete
+        // path (mirroring `commit_temp`) and maps a mid-window vanish to
+        // `Error::NotFound` (the W32 goal-state arm) instead of a raw IO
+        // error. The entry-time `ensure_locality` above stays - it guards the
+        // freshness stat itself (W50).
+        self.unlink_local_file(parent, &path, key)
     }
 
     /// Shared unlink tail for both delete APIs (`delete_file` and
@@ -509,6 +515,10 @@ impl LocalFs {
     /// entry checks already close the walk-to-stat window; the stat-to-
     /// unlink leaf window remains, fd-based delete is post-v1).
     fn unlink_local_file(&self, parent: &Path, path: &Path, key: &str) -> Result<(), Error> {
+        // W76/r8b M1: fire the test-only pre-unlink hook (if any) so tests
+        // can inject the stat-to-unlink race through production APIs.
+        #[cfg(test)]
+        run_pre_unlink_hook();
         self.ensure_locality(parent)?;
         match std::fs::remove_file(path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -608,6 +618,58 @@ impl LocalFs {
             return Err(e.into());
         }
         Ok(())
+    }
+}
+
+// Test-only pre-unlink hook machinery (W76/r8b M1): the stat-to-unlink race
+// window of a delete lives *inside* one call, so it cannot be injected from
+// outside the process. The hook fires inside [`LocalFs::unlink_local_file`]
+// immediately before its pre-unlink locality re-check, letting a test swap
+// the parent (or vanish the file) deterministically through ANY production
+// API that routes through the seam. Because the hook lives in the seam, a
+// future drift (a delete API ending in a bare `remove_file`) fails those
+// tests loudly instead of silently skipping them - the reviewer's "thin
+// test-only hook that cannot drift from the production tail" shape.
+#[cfg(test)]
+thread_local! {
+    static PRE_UNLINK_HOOK: std::cell::RefCell<Option<Box<dyn FnMut() + 'static>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Run the currently-installed pre-unlink hook, if any. Called inside
+/// `unlink_local_file` under `#[cfg(test)]`; a no-op when no hook is set.
+#[cfg(test)]
+fn run_pre_unlink_hook() {
+    PRE_UNLINK_HOOK.with(|h| {
+        if let Some(f) = h.borrow_mut().as_mut() {
+            f();
+        }
+    });
+}
+
+/// Install a pre-unlink hook for the current test thread; the returned guard
+/// restores the previous hook on drop (cargo test runs tests on parallel
+/// threads, so the thread-local scoping keeps hooks from leaking between
+/// tests). The hook fires exactly once, inside the seam, after the guarded
+/// delete's freshness stat and before its pre-unlink locality re-check.
+#[cfg(test)]
+fn with_pre_unlink_hook(f: impl FnMut() + 'static) -> PreUnlinkHookGuard {
+    PRE_UNLINK_HOOK.with(|h| {
+        let prev = h.borrow_mut().take();
+        *h.borrow_mut() = Some(Box::new(f));
+        PreUnlinkHookGuard { prev }
+    })
+}
+
+#[cfg(test)]
+struct PreUnlinkHookGuard {
+    prev: Option<Box<dyn FnMut() + 'static>>,
+}
+
+#[cfg(test)]
+impl Drop for PreUnlinkHookGuard {
+    fn drop(&mut self) {
+        PRE_UNLINK_HOOK.with(|h| *h.borrow_mut() = self.prev.take());
     }
 }
 
@@ -1763,30 +1825,49 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn delete_file_guarded_rechecks_locality_before_unlink() {
-        // W60 (B-M1): the entry-time locality check guards the freshness
-        // stat, but the unlink itself must re-check immediately before
-        // `remove_file` (mirroring `commit_temp`). Simulate the plan-to-
-        // execute race window deterministically: the parent is swapped for an
-        // out-of-vault symlink AFTER the entry-time check passes, then the
-        // seam (the final pre-unlink check) is called directly. The outside
+        // W60 (B-M1) + W76 (r8b M1): the entry-time locality check guards the
+        // freshness stat, but the unlink itself must re-check immediately
+        // before `remove_file` (mirroring `commit_temp`). This test exercises
+        // the PRODUCTION `delete_file_guarded` API: the `#[cfg(test)]` hook
+        // inside the shared seam (`unlink_local_file`) swaps the parent for
+        // an out-of-vault symlink in the stat-to-unlink window. The outside
         // file must survive - a parent swapped after the entry check must
-        // never be unlinked through.
+        // never be unlinked through. RED before W76: the guarded API ended in
+        // a bare `remove_file` and never reached the seam, so the hook never
+        // fired, the in-vault file was unlinked, `Ok` was returned, and the
+        // `unwrap_err` below failed.
         let dir = TempDir::new("vaultsync-test");
         let outside = TempDir::new("vaultsync-outside");
         std::fs::create_dir_all(dir.join("notes")).unwrap();
         std::fs::write(dir.join("notes/a.md"), "in-vault").unwrap();
         std::fs::create_dir_all(outside.join("notes")).unwrap();
-        std::fs::write(outside.join("notes/a.md"), "outside-plant").unwrap();
+        // plant a matching outside file: same size + mtime, so only the
+        // locality re-check can refuse (freshness would authenticate it).
+        let md = std::fs::metadata(dir.join("notes/a.md")).unwrap();
+        std::fs::write(outside.join("notes/a.md"), "in-vault").unwrap();
+        {
+            let f = std::fs::File::open(outside.join("notes/a.md")).unwrap();
+            f.set_times(std::fs::FileTimes::new().set_modified(md.modified().unwrap()))
+                .unwrap();
+        }
         let fs = LocalFs::new(dir.path());
-        let parent = dir.join("notes");
-        // the entry-time check passes against the real in-vault dir
-        fs.ensure_locality(&parent).unwrap();
-        // swap the parent for a symlink to the outside dir (the race window)
-        std::fs::remove_dir_all(&parent).unwrap();
-        std::os::unix::fs::symlink(outside.join("notes"), &parent).unwrap();
-        let path = parent.join("a.md");
+        // the pre-unlink hook fires inside the seam, in the stat-to-unlink
+        // window (after the entry-time check + freshness stat pass against
+        // the real in-vault dir): swap the parent for a symlink to the
+        // outside dir.
+        let hook_parent = dir.join("notes");
+        let hook_outside = outside.join("notes");
+        let _guard = with_pre_unlink_hook(move || {
+            std::fs::remove_dir_all(&hook_parent).unwrap();
+            std::os::unix::fs::symlink(&hook_outside, &hook_parent).unwrap();
+        });
         let err = fs
-            .unlink_local_file(&parent, &path, "notes/a.md")
+            .delete_file_guarded(
+                "notes/a.md",
+                md.len(),
+                system_time_to_ms(md.modified().unwrap()),
+                1000,
+            )
             .unwrap_err();
         assert!(
             format!("{err}").contains("outside"),
@@ -1796,16 +1877,49 @@ mod tests {
         // parent)
         assert_eq!(
             std::fs::read(outside.join("notes/a.md")).unwrap(),
-            b"outside-plant"
+            b"in-vault"
         );
+    }
+
+    #[test]
+    fn delete_file_guarded_mid_unlink_vanish_is_not_found() {
+        // W76 (r8b M1 secondary fallout): a file that vanishes in the
+        // stat-to-unlink window (deleted by another process between the
+        // guarded freshness stat and the unlink) must map to
+        // `Error::NotFound` (the W32 goal-state arm in the executor), never a
+        // raw IO error. Exercised through the production `delete_file_guarded`
+        // API via the pre-unlink seam hook. RED before W76: the hook never
+        // fired (bare `remove_file` tail), the file was unlinked, and `Ok`
+        // was returned.
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::write(dir.join("a.md"), "bye").unwrap();
+        let md = std::fs::metadata(dir.join("a.md")).unwrap();
+        let fs = LocalFs::new(dir.path());
+        let hook_file = dir.join("a.md");
+        let _guard = with_pre_unlink_hook(move || {
+            std::fs::remove_file(&hook_file).unwrap();
+        });
+        let err = fs
+            .delete_file_guarded(
+                "a.md",
+                md.len(),
+                system_time_to_ms(md.modified().unwrap()),
+                1000,
+            )
+            .unwrap_err();
+        let is_not_found = matches!(&err, Error::NotFound(k) if k == "a.md");
+        assert!(is_not_found, "expected NotFound, got: {err}");
     }
 
     #[cfg(unix)]
     #[test]
     fn delete_file_rechecks_locality_before_unlink() {
-        // W60 (B-M1): same pre-unlink locality re-check for the unguarded
-        // `delete_file` API (test-only callers today, but public). The seam
-        // must refuse a parent swapped after the entry-time check.
+        // W60 (B-M1) + W76: same pre-unlink locality re-check for the
+        // unguarded `delete_file` API, now exercised through the production
+        // API via the pre-unlink seam hook (the entry-time check passes, the
+        // hook swaps the parent in the window, the seam must refuse). Kept as
+        // a lower-level lock: `delete_file` already routed through the seam,
+        // so this test is green both before and after W76.
         let dir = TempDir::new("vaultsync-test");
         let outside = TempDir::new("vaultsync-outside");
         std::fs::create_dir_all(dir.join("notes")).unwrap();
@@ -1813,16 +1927,13 @@ mod tests {
         std::fs::create_dir_all(outside.join("notes")).unwrap();
         std::fs::write(outside.join("notes/a.md"), "outside-plant").unwrap();
         let fs = LocalFs::new(dir.path());
-        let parent = dir.join("notes");
-        // the entry-time check passes against the real in-vault dir
-        fs.ensure_locality(&parent).unwrap();
-        // swap the parent for a symlink to the outside dir (the race window)
-        std::fs::remove_dir_all(&parent).unwrap();
-        std::os::unix::fs::symlink(outside.join("notes"), &parent).unwrap();
-        let path = parent.join("a.md");
-        let err = fs
-            .unlink_local_file(&parent, &path, "notes/a.md")
-            .unwrap_err();
+        let hook_parent = dir.join("notes");
+        let hook_outside = outside.join("notes");
+        let _guard = with_pre_unlink_hook(move || {
+            std::fs::remove_dir_all(&hook_parent).unwrap();
+            std::os::unix::fs::symlink(&hook_outside, &hook_parent).unwrap();
+        });
+        let err = fs.delete_file("notes/a.md").unwrap_err();
         assert!(
             format!("{err}").contains("outside"),
             "expected locality refusal: {err}"
