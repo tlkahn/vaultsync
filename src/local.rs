@@ -29,6 +29,17 @@ pub struct LocalFs {
     report: std::cell::RefCell<WalkReport>,
 }
 
+/// Pull destination state relative to the plan (W13/B-L4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    /// Destination still matches the planned size/mtime.
+    Fresh,
+    /// Destination changed since the plan - do not overwrite.
+    Changed,
+    /// Destination vanished since the plan - recreate it.
+    Vanished,
+}
+
 /// Report surfaced from a walk (symlink policy, Slice 9).
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct WalkReport {
@@ -223,6 +234,53 @@ impl LocalFs {
             return Err(e.into());
         }
         Ok(())
+    }
+
+    /// Pull destination freshness (W13/B-L4, symmetric to upload R3.3): before
+    /// a download overwrites, re-stat the destination and report whether it
+    /// still matches the plan (size + mtime within `tolerance_ms`). A vanished
+    /// destination returns [`Freshness::Vanished`] (recreate it); a symlinked
+    /// or non-regular destination is an error (fail closed). A destination
+    /// that changed since planning returns [`Freshness::Changed`] (do NOT
+    /// overwrite the user's newer edits).
+    pub fn destination_freshness(
+        &self,
+        key: &str,
+        expected_size: u64,
+        expected_mtime_ms: Option<u64>,
+        tolerance_ms: u64,
+    ) -> Result<Freshness, Error> {
+        let path = key_to_local_path(&self.root, key)?;
+        let smd = match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Freshness::Vanished),
+            Err(e) => return Err(e.into()),
+            Ok(md) => md,
+        };
+        if smd.file_type().is_symlink() {
+            return Err(Error::Other(format!(
+                "download destination is now a symlink: {}",
+                path.display()
+            )));
+        }
+        if !smd.is_file() {
+            return Err(Error::Other(format!(
+                "download destination is no longer a regular file: {}",
+                path.display()
+            )));
+        }
+        if smd.len() != expected_size {
+            return Ok(Freshness::Changed);
+        }
+        if let Some(expect_ms) = expected_mtime_ms {
+            if let Ok(mt) = smd.modified() {
+                if let Some(actual_ms) = system_time_to_ms(mt) {
+                    if actual_ms.abs_diff(expect_ms) > tolerance_ms {
+                        return Ok(Freshness::Changed);
+                    }
+                }
+            }
+        }
+        Ok(Freshness::Fresh)
     }
 
     /// Atomically write `expected_size` bytes from `r` to `key`'s file and set

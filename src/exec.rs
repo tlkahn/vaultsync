@@ -54,7 +54,7 @@ pub fn execute_plan(
 
     // Pass 1: downloads (pull).
     for a in plan.actions.iter().filter(|a| a.kind == ActionKind::Download) {
-        match exec_download(local, store, a) {
+        match exec_download(local, store, a, opts.mtime_tolerance_ms) {
             Ok(()) => rep.executed += 1,
             Err(e) => fail(&mut rep, &a.key, e),
         }
@@ -109,7 +109,12 @@ fn fail(rep: &mut ExecReport, key: &str, e: Error) {
 /// Download one key into an atomic temp + rename, applying the remote mtime
 /// from the `get_to` metadata (which carries the client `vaultsync-mtime`, not
 /// the list's LastModified).
-fn exec_download(local: &LocalFs, store: &dyn ObjectStore, a: &crate::plan::Action) -> Result<(), Error> {
+fn exec_download(
+    local: &LocalFs,
+    store: &dyn ObjectStore,
+    a: &crate::plan::Action,
+    tolerance_ms: u64,
+) -> Result<(), Error> {
     let tmp = local.tmp_path_for(&a.key)?;
     let result = (|| -> Result<Option<u64>, Error> {
         let remote_mtime = {
@@ -142,6 +147,21 @@ fn exec_download(local: &LocalFs, store: &dyn ObjectStore, a: &crate::plan::Acti
     };
     if let Some(e) = err {
         return Err(e);
+    }
+    // W13/B-L4: pull destination-freshness guard (symmetric to upload R3.3).
+    // A destination that changed since the plan is NOT overwritten - the
+    // user's newer edits survive; a vanished destination is recreated.
+    if let Some(planned) = &a.local {
+        match local.destination_freshness(&a.key, planned.size, planned.mtime_ms, tolerance_ms)? {
+            crate::local::Freshness::Changed => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(Error::Other(format!(
+                    "destination changed since plan for {}; not overwriting",
+                    a.key
+                )));
+            }
+            crate::local::Freshness::Fresh | crate::local::Freshness::Vanished => {}
+        }
     }
     local.finalize_write(&a.key, &tmp, remote_mtime)
 }
@@ -502,6 +522,87 @@ mod tests {
         // other keys still download
         assert!(dir.join("ok.md").exists());
         assert_eq!(rep.executed, 1, "{:?}", rep);
+    }
+
+    #[test]
+    fn exec_download_refuses_to_overwrite_dest_changed_since_plan() {
+        // W13/B-L4: a pull whose destination changed (size) after planning must
+        // fail the key and leave the user's newer content on disk untouched
+        // (symmetric to upload R3.3). Fails today (rename silently overwrites).
+        let dir = TempDir::new("vaultsync-exec");
+        let p = dir.join("a.md");
+        std::fs::write(&p, "old-local").unwrap();
+        set_mtime_ms(&p, 1_700_000_000_000);
+        let store = MemoryStore::new();
+        put_str(&store, "a.md", "remote-new-body", Some(1_700_000_005_000));
+        let local = LocalFs::new(dir.path());
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let act = plan.actions.iter().find(|a| a.key == "a.md").unwrap();
+        assert_eq!(act.kind, ActionKind::Download, "expected remote_newer download");
+        assert!(act.local.is_some());
+        // user edits the local file after planning (size changes)
+        std::fs::write(&p, "user-edit-since-plan-123").unwrap();
+        let rep =
+            crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+        assert!(
+            rep.failed.iter().any(|fl| fl.key == "a.md"),
+            "a.md not failed: {:?}",
+            rep.failed
+        );
+        // the user's newer content survives on disk (not overwritten)
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            b"user-edit-since-plan-123",
+            "download overwrote the changed destination"
+        );
+    }
+
+    #[test]
+    fn exec_download_recreates_vanished_destination() {
+        // W13/B-L4: a pull whose destination vanished since the plan recreates
+        // it (Vanished -> proceed), not an error.
+        let dir = TempDir::new("vaultsync-exec");
+        let p = dir.join("a.md");
+        std::fs::write(&p, "old-local").unwrap();
+        set_mtime_ms(&p, 1_700_000_000_000);
+        let store = MemoryStore::new();
+        put_str(&store, "a.md", "remote-new-body", Some(1_700_000_005_000));
+        let local = LocalFs::new(dir.path());
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        std::fs::remove_file(&p).unwrap();
+        let rep =
+            crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+        assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep.failed);
+        assert_eq!(std::fs::read(&p).unwrap(), b"remote-new-body");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_download_destination_symlink_fails_closed() {
+        // W13/B-L4: a destination that became a symlink after planning fails
+        // closed (never followed / written through).
+        let dir = TempDir::new("vaultsync-exec");
+        let outside = TempDir::new("vaultsync-outside");
+        let p = dir.join("a.md");
+        std::fs::write(&p, "old-local").unwrap();
+        set_mtime_ms(&p, 1_700_000_000_000);
+        std::fs::write(outside.join("secret"), "s").unwrap();
+        let store = MemoryStore::new();
+        put_str(&store, "a.md", "remote-new-body", Some(1_700_000_005_000));
+        let local = LocalFs::new(dir.path());
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        // swap the destination for a symlink to an outside target
+        std::fs::remove_file(&p).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), &p).unwrap();
+        let rep =
+            crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+        assert!(
+            rep.failed.iter().any(|fl| fl.key == "a.md"),
+            "a.md not failed: {:?}",
+            rep.failed
+        );
+        // the outside target survives (not overwritten through the link)
+        assert_eq!(std::fs::read(outside.join("secret")).unwrap(), b"s");
     }
 
     #[test]
