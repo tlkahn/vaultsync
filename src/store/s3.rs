@@ -119,7 +119,7 @@ impl S3Store {
                     let last = obj.last_modified().and_then(dt_millis);
                     out.push((
                         rel.to_string(),
-                        obj.size().map(|s| s as u64).unwrap_or(0),
+                        obj.size().map(nonneg_size).unwrap_or(0),
                         last,
                     ));
                 }
@@ -173,7 +173,14 @@ fn strip_prefix<'a>(prefix: &str, full: &'a str) -> Option<&'a str> {
 /// the truncation check; when absent, the true streamed byte count is used so
 /// the reported size is never a bogus 0.
 fn effective_get_size(content_len: Option<i64>, written: u64) -> u64 {
-    content_len.map(|c| c.max(0) as u64).unwrap_or(written)
+    content_len.map(nonneg_size).unwrap_or(written)
+}
+
+/// Clamp a backend size to a non-negative `u64` (W64/A-L6): a pathological
+/// negative `Content-Length`/`Size` must never wrap to a huge u64. One shared
+/// helper for `head`, listing rows, and `get_to` so the policy cannot drift.
+fn nonneg_size(s: i64) -> u64 {
+    s.max(0) as u64
 }
 
 /// Full S3 key for a vault-relative key.
@@ -397,7 +404,7 @@ impl ObjectStore for S3Store {
                 .send()
                 .await
                 .map_err(|e| map_sdk_err(&e, "head"))?;
-            let size = resp.content_length().unwrap_or(0) as u64;
+            let size = resp.content_length().map(nonneg_size).unwrap_or(0);
             let meta = resp.metadata();
             let meta_val = meta.and_then(|m| m.get(MTIME_KEY).map(String::as_str));
             let last = resp.last_modified().and_then(dt_millis);
@@ -448,7 +455,7 @@ impl ObjectStore for S3Store {
                 written += chunk.len() as u64;
             }
             if let Some(cl) = content_len {
-                let cl = cl.max(0) as u64;
+                let cl = nonneg_size(cl);
                 if written != cl {
                     return Err(Error::Other(format!(
                         "get: truncated body for {rel} (expected {cl}, got {written})"
@@ -735,6 +742,18 @@ mod tests {
         assert_eq!(next_continuation(Some(false), None).unwrap(), None);
         assert_eq!(next_continuation(Some(false), Some("tok")).unwrap(), None);
         assert_eq!(next_continuation(None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn nonneg_size_clamps_negative() {
+        // W64/A-L6: head and listing sizes must never wrap a pathological
+        // negative to a huge u64. The shared clamp mirrors effective_get_size's
+        // `.max(0)` policy.
+        assert_eq!(nonneg_size(-1), 0);
+        assert_eq!(nonneg_size(-10_000), 0);
+        assert_eq!(nonneg_size(0), 0);
+        assert_eq!(nonneg_size(5), 5);
+        assert_eq!(nonneg_size(i64::MAX), i64::MAX as u64);
     }
 
     #[test]
