@@ -207,7 +207,10 @@ pub fn format_plan_human_verbose(plan: &Plan, verbosity: u8) -> String {
             ActionKind::Conflict => "*  ",
         };
         match a.kind {
-            ActionKind::Conflict => {
+            // W71/A-N3: Conflict AND Skip rows (the latter only visible under
+            // -v) carry their planner reason - the diagnosis a debugging user
+            // looks for, same shape on both row kinds.
+            ActionKind::Conflict | ActionKind::Skip => {
                 out.push_str(&format!("{prefix}{}    {}\n", a.key, a.reason));
             }
             _ => {
@@ -939,6 +942,28 @@ mod tests {
         };
         assert!(crate::check_store(&store).is_err());
         assert_no_check_probe(&store.inner);
+    }
+
+    #[test]
+    fn format_plan_verbose_shows_skip_reasons() {
+        // W71/A-N3: under -v the Skip rows must show their planner reason
+        // (local_only under pull without --delete) - the diagnosis a
+        // debugging user looks for, same shape as the Conflict row. Fails
+        // today: S rows print the key only.
+        let dir = TempDir::new("vaultsync-lib-test");
+        std::fs::write(dir.join("local-only.md"), "x").unwrap();
+        let local = LocalFs::new(dir.path());
+        let store = MemoryStore::new();
+        let p = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let verbose = format_plan_human_verbose(&p, 1);
+        let s_line = verbose
+            .lines()
+            .find(|l| l.starts_with("S  ") && l.contains("local-only.md"))
+            .unwrap_or_else(|| panic!("no S line for local-only.md: {verbose}"));
+        assert!(
+            s_line.contains("local_only"),
+            "S line lacks reason: {s_line:?}"
+        );
     }
 
     #[test]

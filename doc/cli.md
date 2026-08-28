@@ -223,7 +223,8 @@ D  notes/b.md
 *  notes/c.md    conflict_mtime_size
 ```
 
-(`-v` additionally shows the two skip rows, e.g. `S  notes/`.)
+(`-v` additionally shows the skip rows with their planner reasons, e.g.
+`S  notes/    folder`.)
 
 ### JSON (`--json`)
 
