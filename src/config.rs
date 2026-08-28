@@ -238,17 +238,21 @@ fn resolve_store(store: Option<&StoreConfig>, env: &EnvSnapshot) -> Result<Store
             // (existing hand-written configs must not newly fail), and must
             // never reach `Region::new("")`.
             let region = env_region.or_else(|| nonblank(s.region.clone()));
-            // W58/A nit: reject a configured prefix with an empty path
-            // segment ("a//b", "/a") loudly before normalize_prefix - such a
-            // prefix would produce keys `ensure_valid_key` rejects. A single
-            // trailing empty segment ("a/") is the normalized form and is
-            // allowed.
+            // W58/A nit + r11-L3 (W105): the configured prefix must itself
+            // be a valid vault key prefix - one policy, `ensure_valid_key`
+            // after normalization (an empty, whitespace-only, control-char,
+            // or `..` segment fails fast at resolution, naming the config
+            // key, instead of silently writing odd keys to the remote; this
+            // subsumes the old empty-segment-only check). The normalized
+            // form's trailing `/` is a folder marker, not a segment, and
+            // `ensure_valid_key` allows it. An empty prefix (no prefix
+            // configured) skips validation.
             let prefix = s.prefix.as_deref().unwrap_or("");
-            let segments: Vec<&str> = prefix.split('/').collect();
-            for (i, seg) in segments.iter().enumerate() {
-                if seg.is_empty() && i + 1 != segments.len() {
+            let normalized = normalize_prefix(prefix);
+            if !normalized.is_empty() {
+                if let Err(e) = crate::entity::ensure_valid_key(&normalized) {
                     return Err(Error::Other(format!(
-                        "store.prefix contains an empty path segment: {prefix:?}"
+                        "store.prefix is not a valid key prefix: {prefix:?} ({e})"
                     )));
                 }
             }
@@ -258,7 +262,7 @@ fn resolve_store(store: Option<&StoreConfig>, env: &EnvSnapshot) -> Result<Store
                 // r10-M2/W86: empty/whitespace endpoint is unset - an
                 // `endpoint_url("")` fails late with an opaque SDK error.
                 endpoint: nonblank(s.endpoint.clone()),
-                prefix: normalize_prefix(prefix),
+                prefix: normalized,
                 path_style: s.path_style.unwrap_or(false),
             })
         }
@@ -596,6 +600,45 @@ mtime_tolerance_ms = 1000
         let text = "[store]\nbucket = \"b\"\nprefix = \"a/\"\n";
         let cfg = parse_config_str(text).unwrap();
         assert_eq!(settings(&cfg).unwrap().store.prefix, "a/");
+    }
+
+    #[test]
+    fn config_prefix_validated_against_ensure_valid_key() {
+        // r11-L3 (W105, rescoped): the configured prefix must itself be a
+        // valid vault key prefix (`ensure_valid_key` semantics) so a
+        // whitespace-only or control-char segment fails fast at config
+        // resolution with an error naming `store.prefix`, instead of
+        // silently writing oddly-segmented keys to the remote. This subsumes
+        // the W58 empty-segment check with one policy. RED: resolves with no
+        // error today.
+        for bad in ["a/ /b", "a/\\u0007b"] {
+            let text = format!("[store]\nbucket = \"b\"\nprefix = \"{bad}\"\n");
+            let cfg = parse_config_str(&text).unwrap();
+            let err = settings(&cfg).unwrap_err();
+            assert!(
+                format!("{err}").contains("store.prefix"),
+                "prefix {bad:?} must error naming store.prefix: {err}"
+            );
+        }
+        // W58 empty-segment rejections keep their existing message class
+        // (still an error naming the config key).
+        for bad in ["a//b", "/a"] {
+            let text = format!("[store]\nbucket = \"b\"\nprefix = \"{bad}\"\n");
+            let cfg = parse_config_str(&text).unwrap();
+            let err = settings(&cfg).unwrap_err();
+            assert!(format!("{err}").contains("prefix"), "prefix {bad:?}: {err}");
+        }
+        // valid prefixes still resolve: plain, trailing-slash, unicode, empty
+        for good in ["notes", "a/b/", "tagebuch/", ""] {
+            let text = format!("[store]\nbucket = \"b\"\nprefix = \"{good}\"\n");
+            let cfg = parse_config_str(&text).unwrap();
+            let s = settings(&cfg).unwrap();
+            assert!(
+                s.store.prefix.is_empty() || s.store.prefix.ends_with('/'),
+                "prefix {good:?} resolved to {:?}",
+                s.store.prefix
+            );
+        }
     }
 
     #[test]
