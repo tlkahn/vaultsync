@@ -172,15 +172,80 @@ fn s3_integ_prefix_isolation() {
 }
 
 #[test]
-fn s3_integ_path_style_toggle() {
-    // Exercise the path-style setting (works regardless of which addressing
-    // the endpoint defaults to; the assertion is that put/list succeed).
-    with_store("pathstyle", |s| {
-        put_bytes(s, "f.txt", b"ps", None)?;
-        let n = s.list("").unwrap().iter().filter(|e| !e.is_folder()).count();
-        assert_eq!(n, 1, "path-style put/list");
-        Ok(())
-    });
+fn s3_integ_path_style_toggle() -> Result<(), String> {
+    // W12/A-M8: build the same bucket/prefix with BOTH path-style flavors and
+    // require a put/list round-trip on each. The old test asserted only that
+    // one configured flavor put/list succeeded and could not fail either way.
+    let Some(bucket) = std::env::var("VAULTSYNC_TEST_S3_BUCKET").ok() else {
+        eprintln!("[skip] pathstyle: VAULTSYNC_TEST_S3_BUCKET not set (set to run real S3 tests)");
+        return Ok(());
+    };
+    let region = std::env::var("VAULTSYNC_TEST_S3_REGION").unwrap_or_else(|_| "us-west-1".into());
+    let endpoint = std::env::var("VAULTSYNC_TEST_S3_ENDPOINT").ok();
+    let base = std::env::var("VAULTSYNC_TEST_S3_PREFIX").unwrap_or_default();
+    let prefix = format!("{base}vaultsync-itest-pathstyle-{}", unique_num());
+
+    let mut stores: Vec<(bool, S3Store)> = Vec::new();
+    stores.push((
+        true,
+        S3Store::new(&StoreSettings {
+            bucket: bucket.clone(),
+            region: Some(region.clone()),
+            endpoint: endpoint.clone(),
+            prefix: prefix.clone(),
+            path_style: true,
+        })
+        .map_err(|e| format!("path-style true store: {e}"))?,
+    ));
+    // Skip the false flavor only when a custom endpoint is known to require
+    // path-style addressing (the true flavor above still exercised).
+    if endpoint.is_none() {
+        stores.push((
+            false,
+            S3Store::new(&StoreSettings {
+                bucket: bucket.clone(),
+                region: Some(region.clone()),
+                endpoint: None,
+                prefix: prefix.clone(),
+                path_style: false,
+            })
+            .map_err(|e| format!("path-style false store: {e}"))?,
+        ));
+    }
+
+    let mut roundtrip = 0usize;
+    let mut result: Result<(), String> = Ok(());
+    for (flavor, s) in &stores {
+        if let Err(e) = (|| -> Result<(), String> {
+            put_bytes(s, "f.txt", b"ps", None)?;
+            let n = s.list("").unwrap().iter().filter(|e| !e.is_folder()).count();
+            if n != 1 {
+                return Err(format!("path-style {flavor}: expected 1 file, got {n}"));
+            }
+            Ok(())
+        })() {
+            result = Err(format!("path-style {flavor}: {e}"));
+            break;
+        }
+        roundtrip += 1;
+    }
+
+    // cleanup both stores' objects (same prefix)
+    for (_, s) in &stores {
+        if let Ok(ents) = s.list("") {
+            for e in ents {
+                if !e.is_folder() {
+                    let _ = s.delete(&e.key);
+                }
+            }
+        }
+    }
+
+    if roundtrip == 0 {
+        return Err("no path-style flavor was exercised".to_string());
+    }
+    eprintln!("[ok] pathstyle");
+    result
 }
 
 #[test]
