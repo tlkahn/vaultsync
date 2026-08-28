@@ -139,12 +139,6 @@ pub fn parse_config_str(text: &str) -> Result<FileConfig, toml::de::Error> {
     toml::from_str(text)
 }
 
-/// CLI overrides feeding resolution (Phase 2: only `--vault`).
-#[derive(Debug, Default)]
-pub struct Cli<'a> {
-    pub vault: Option<&'a Path>,
-}
-
 /// Snapshot of the relevant env vars, injected so resolution is testable
 /// without real env. Phase 2 cares about `AWS_REGION` only (credentials
 /// themselves stay in the AWS chain).
@@ -153,12 +147,15 @@ pub struct EnvSnapshot {
     pub aws_region: Option<String>,
 }
 
-/// Merge config + CLI + env into a [`Settings`]. Pure: no IO, no network.
-pub fn resolve_settings(cfg: &FileConfig, cli: &Cli, env: &EnvSnapshot) -> Result<Settings, Error> {
-    let vault_root = match cli.vault {
-        Some(v) => v.to_path_buf(),
-        None => cfg.vault_root.clone().unwrap_or_else(|| PathBuf::from(".")),
-    };
+/// Merge config + env into a [`Settings`]. Pure: no IO, no network.
+///
+/// W83/r9 N1: the `--vault`/config merge no longer lives here (the old
+/// `cli: &Cli` parameter was test-only in production - the sole production
+/// call passed `Cli::default()`); the single merge site is
+/// `resolve_vault_from_config` in the CLI layer, which only applies the
+/// config vault root when `--vault` was left at its unset sentinel.
+pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings, Error> {
+    let vault_root = cfg.vault_root.clone().unwrap_or_else(|| PathBuf::from("."));
     let store = resolve_store(cfg.store.as_ref(), env)?;
     let mtime_tolerance_ms = cfg
         .transfer
@@ -265,7 +262,7 @@ mod tests {
     use crate::testutil::TempDir;
 
     fn settings(cfg: &FileConfig) -> Result<Settings, Error> {
-        resolve_settings(cfg, &Cli::default(), &EnvSnapshot::default())
+        resolve_settings(cfg, &EnvSnapshot::default())
     }
 
     #[test]
@@ -392,23 +389,6 @@ mtime_tolerance_ms = 1000
     }
 
     #[test]
-    fn config_cli_vault_overrides_config() {
-        let cfg = FileConfig {
-            vault_root: Some(PathBuf::from("/cfg/vault")),
-            ..Default::default()
-        };
-        let cli = Cli {
-            vault: Some(Path::new("/cli/vault")),
-        };
-        let s = resolve_settings(&cfg, &cli, &EnvSnapshot::default()).unwrap();
-        assert_eq!(s.vault_root, PathBuf::from("/cli/vault"));
-
-        let cli_none = Cli::default();
-        let s2 = resolve_settings(&cfg, &cli_none, &EnvSnapshot::default()).unwrap();
-        assert_eq!(s2.vault_root, PathBuf::from("/cfg/vault"));
-    }
-
-    #[test]
     fn config_mtime_tolerance_default_1000() {
         let cfg = FileConfig::default();
         let s = settings(&cfg).unwrap();
@@ -420,13 +400,12 @@ mtime_tolerance_ms = 1000
         // Slice 8 lock: env `AWS_REGION` overrides an explicit config region.
         let text = "[store]\nbucket = \"b\"\nregion = \"us-east-1\"\n";
         let cfg = parse_config_str(text).unwrap();
-        let cwd = Cli::default();
-        let no_env = resolve_settings(&cfg, &cwd, &EnvSnapshot::default()).unwrap();
+        let no_env = resolve_settings(&cfg, &EnvSnapshot::default()).unwrap();
         assert_eq!(no_env.store.region.as_deref(), Some("us-east-1"));
         let env = EnvSnapshot {
             aws_region: Some("eu-west-3".to_string()),
         };
-        let with_env = resolve_settings(&cfg, &cwd, &env).unwrap();
+        let with_env = resolve_settings(&cfg, &env).unwrap();
         assert_eq!(
             with_env.store.region.as_deref(),
             Some("eu-west-3"),
@@ -442,11 +421,10 @@ mtime_tolerance_ms = 1000
         // `Region::new("")` and break the whole default chain.
         let text = "[store]\nbucket = \"b\"\nregion = \"eu-west-3\"\n";
         let cfg = parse_config_str(text).unwrap();
-        let cwd = Cli::default();
         let empty_env = EnvSnapshot {
             aws_region: Some(String::new()),
         };
-        let with_config = resolve_settings(&cfg, &cwd, &empty_env).unwrap();
+        let with_config = resolve_settings(&cfg, &empty_env).unwrap();
         assert_eq!(
             with_config.store.region.as_deref(),
             Some("eu-west-3"),
@@ -456,11 +434,11 @@ mtime_tolerance_ms = 1000
         let ws_env = EnvSnapshot {
             aws_region: Some("   ".to_string()),
         };
-        let with_config_ws = resolve_settings(&cfg, &cwd, &ws_env).unwrap();
+        let with_config_ws = resolve_settings(&cfg, &ws_env).unwrap();
         assert_eq!(with_config_ws.store.region.as_deref(), Some("eu-west-3"));
         // and with no config region the result stays None (default chain)
         let no_cfg = parse_config_str("[store]\nbucket = \"b\"\n").unwrap();
-        let no_region = resolve_settings(&no_cfg, &cwd, &empty_env).unwrap();
+        let no_region = resolve_settings(&no_cfg, &empty_env).unwrap();
         assert_eq!(no_region.store.region, None);
     }
 

@@ -736,7 +736,7 @@ pub fn run_from_env() -> i32 {
         let envsnap = crate::config::EnvSnapshot {
             aws_region: std::env::var("AWS_REGION").ok(),
         };
-        match crate::config::resolve_settings(&cfg, &crate::config::Cli::default(), &envsnap) {
+        match crate::config::resolve_settings(&cfg, &envsnap) {
             Ok(s) => s,
             Err(e) => {
                 let _ = writeln!(err, "error: {e}");
@@ -755,6 +755,46 @@ mod tests {
 
     fn a() -> Vec<String> {
         vec!["vaultsync".to_string()]
+    }
+
+    #[test]
+    fn vault_precedence_cli_over_config() {
+        // W83/r9 N1: the --vault/config merge lives in ONE place -
+        // `resolve_vault_from_config` (the old `Cli` merge arm inside
+        // `resolve_settings` was test-only; production always passed
+        // `Cli::default()`). An explicit `--vault` wins; an unset `--vault`
+        // (the VAULT_UNSET sentinel) is replaced by the config vault root.
+        let cfg_root = PathBuf::from("/cfg/vault");
+        let settings = crate::config::Settings {
+            vault_root: cfg_root.clone(),
+            store: crate::config::StoreSettings {
+                bucket: String::new(),
+                region: None,
+                endpoint: None,
+                prefix: String::new(),
+                path_style: false,
+            },
+            mtime_tolerance_ms: 1000,
+            concurrency: 4,
+            ignore_patterns: Vec::new(),
+            concurrency_explicitly_set: false,
+        };
+        // explicit --vault wins over the config root
+        let cli_explicit = Command::status(PathBuf::from("/cli/vault"));
+        let resolved = resolve_vault_from_config(cli_explicit, &settings);
+        match resolved {
+            Command::Status { vault, .. } => {
+                assert_eq!(vault, PathBuf::from("/cli/vault"))
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+        // unset --vault (the sentinel) is replaced by the config vault root
+        let cli_unset = Command::status(PathBuf::from(VAULT_UNSET));
+        let resolved = resolve_vault_from_config(cli_unset, &settings);
+        match resolved {
+            Command::Status { vault, .. } => assert_eq!(vault, cfg_root),
+            other => panic!("expected Status, got {other:?}"),
+        }
     }
 
     // --- parse ---
