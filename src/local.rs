@@ -291,6 +291,20 @@ impl LocalFs {
         Ok(Freshness::Fresh)
     }
 
+    /// Whether a pull destination is currently absent (W22/N2/L3). Used to
+    /// guard a `remote_only` download that had no planned local entity: a
+    /// destination that appeared since the plan (a regular file, directory, or
+    /// symlink) must never be clobbered by the rename. `NotFound` is the only
+    /// "absent" case; anything that exists counts as present (fail closed).
+    pub fn destination_absent(&self, key: &str) -> Result<bool, Error> {
+        let path = key_to_local_path(&self.root, key)?;
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(e) => Err(e.into()),
+            Ok(_) => Ok(false),
+        }
+    }
+
     /// Atomically write `expected_size` bytes from `r` to `key`'s file and set
     /// its mtime. Created via a temp sibling + rename so a partial write is
     /// never visible at the final path. Rejects a path escaping the canonical
@@ -1210,6 +1224,27 @@ mod tests {
         );
         // the directory (final path) is untouched
         assert!(dir.join("sub/a.md").is_dir());
+    }
+
+    #[test]
+    fn local_destination_absent() {
+        // W22/N2/L3: `NotFound` is the only "absent" case; anything that
+        // exists - file, dir, or symlink - counts as present (fail closed).
+        let dir = TempDir::new("vaultsync-test");
+        let fs = LocalFs::new(dir.path());
+        assert!(fs.destination_absent("a.md").unwrap());
+        std::fs::write(dir.join("a.md"), "x").unwrap();
+        assert!(!fs.destination_absent("a.md").unwrap(), "file present");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        assert!(!fs.destination_absent("sub").unwrap(), "dir present");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("a.md"), dir.join("link")).unwrap();
+            assert!(
+                !fs.destination_absent("link").unwrap(),
+                "symlink present (fail closed)"
+            );
+        }
     }
 
     #[test]

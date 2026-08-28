@@ -166,6 +166,27 @@ fn exec_download(
     if let Some(e) = err {
         return Err(e);
     }
+    // W22/N2/L3: a pull key with no planned local entity (remote only) still
+    // guards the destination. A file/dir/symlink that appeared since the plan
+    // is never clobbered by the rename - the key fails, the appeared content
+    // survives.
+    if a.local.is_none() {
+        let absent = match local.destination_absent(&a.key) {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        };
+        if !absent {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(Error::Other(format!(
+                "destination appeared since plan for {}; not overwriting",
+                a.key
+            )));
+        }
+    }
+
     // W13/B-L4: pull destination-freshness guard (symmetric to upload R3.3).
     // A destination that changed since the plan is NOT overwritten - the
     // user's newer edits survive; a vanished destination is recreated.
@@ -598,6 +619,53 @@ mod tests {
             b"user-edit-since-plan-123",
             "download overwrote the changed destination"
         );
+    }
+
+    #[test]
+    fn exec_download_remote_only_refuses_appeared_destination() {
+        // W22/N2/L3: a pull for a key that had NO planned local entity (remote
+        // only) must still guard the destination. If a regular file appears at
+        // the destination between plan and execute (an editor save, another
+        // tool), the key fails and the planted content survives - it is never
+        // clobbered by the rename.
+        let dir = TempDir::new("vaultsync-exec");
+        let store = MemoryStore::new();
+        put_str(&store, "b.md", "remote-bytes", Some(1_700_000_000_123));
+        let local = LocalFs::new(dir.path());
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let act = plan.actions.iter().find(|a| a.key == "b.md").unwrap();
+        assert_eq!(act.kind, ActionKind::Download);
+        assert!(act.local.is_none(), "remote-only pull must have no local");
+        // a regular file appears at the destination after planning
+        let p = dir.join("b.md");
+        std::fs::write(&p, "editor-saved-since-plan").unwrap();
+        let rep =
+            crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+        assert!(
+            rep.failed.iter().any(|fl| fl.key == "b.md"),
+            "b.md not failed: {:?}",
+            rep.failed
+        );
+        // the planted content survives byte-for-byte
+        assert_eq!(std::fs::read(&p).unwrap(), b"editor-saved-since-plan");
+        // no temp sibling leaks
+        assert_no_tmp_leftovers(dir.path());
+    }
+
+    #[test]
+    fn exec_download_remote_only_proceeds_when_absent() {
+        // W22/N2/L3: for a remote-only key whose destination is still absent,
+        // the guard must not regress the normal path - the download succeeds.
+        let dir = TempDir::new("vaultsync-exec");
+        let store = MemoryStore::new();
+        put_str(&store, "b.md", "remote-bytes", Some(1_700_000_000_123));
+        let local = LocalFs::new(dir.path());
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let rep =
+            crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+        assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep.failed);
+        assert_eq!(std::fs::read(dir.join("b.md")).unwrap(), b"remote-bytes");
+        assert_no_tmp_leftovers(dir.path());
     }
 
     #[test]
