@@ -170,7 +170,19 @@ fn exec_download(
     // A destination that changed since the plan is NOT overwritten - the
     // user's newer edits survive; a vanished destination is recreated.
     if let Some(planned) = &a.local {
-        match local.destination_freshness(&a.key, planned.size, planned.mtime_ms, tolerance_ms)? {
+        let freshness = local
+            .destination_freshness(&a.key, planned.size, planned.mtime_ms, tolerance_ms);
+        // W21/N1: every error path after the temp was written must remove it,
+        // including a refusal from `destination_freshness` itself (e.g. the
+        // destination became a symlink) - mirroring the `Changed` arm below.
+        let freshness = match freshness {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        };
+        match freshness {
             crate::local::Freshness::Changed => {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(Error::Other(format!(
@@ -607,6 +619,27 @@ mod tests {
         assert_eq!(std::fs::read(&p).unwrap(), b"remote-new-body");
     }
 
+    /// Recursively scan a vault for any `vaultsync-tmp` temp-sibling leftover
+    /// (download temps are `.name.vaultsync-tmp-<pid>-<n>` next to the final
+    /// path). Used to lock the no-leak property on download error paths.
+    fn assert_no_tmp_leftovers(dir: &std::path::Path) {
+        fn scan(d: &std::path::Path, found: &mut Vec<String>) {
+            if let Ok(rd) = std::fs::read_dir(d) {
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        scan(&e.path(), found);
+                    } else if name.contains("vaultsync-tmp") {
+                        found.push(e.path().display().to_string());
+                    }
+                }
+            }
+        }
+        let mut found = Vec::new();
+        scan(dir, &mut found);
+        assert!(found.is_empty(), "temp siblings leaked: {found:?}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn exec_download_destination_symlink_fails_closed() {
@@ -634,6 +667,9 @@ mod tests {
         );
         // the outside target survives (not overwritten through the link)
         assert_eq!(std::fs::read(outside.join("secret")).unwrap(), b"s");
+        // W21/N1: the freshness-guard error path must not leave the temp
+        // sibling behind (the symlink destination errors before rename).
+        assert_no_tmp_leftovers(dir.path());
     }
 
     #[test]
