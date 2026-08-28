@@ -85,12 +85,23 @@ where
     let result = f(&store);
 
     // Cleanup: list + delete everything (files only; folders are views).
-    if let Ok(listing) = store.list("") {
-        for e in listing.entities {
-            if !e.is_folder() {
-                let _ = store.delete(&e.key);
+    // L12 (W104): a failed cleanup must be reported on stderr, never silently
+    // swallowed - leaked objects make CI flakes hard to diagnose (a later run
+    // re-encounters them under a fresh unique prefix, but the bucket slowly
+    // fills). Reporting never fails the test outcome; the harness already
+    // eprintln!s its skip path, so this matches the file's convention.
+    match store.list("") {
+        Ok(listing) => {
+            for e in listing.entities {
+                if e.is_folder() {
+                    continue;
+                }
+                if let Err(err) = store.delete(&e.key) {
+                    eprintln!("cleanup: failed to delete {}: {err}", e.key);
+                }
             }
         }
+        Err(err) => eprintln!("cleanup: failed to list for cleanup: {err}"),
     }
 
     if let Err(e) = result {
