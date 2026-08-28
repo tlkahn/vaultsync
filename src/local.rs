@@ -371,17 +371,10 @@ impl LocalFs {
                 path.display()
             )));
         }
-        if smd.len() != expected_size {
+        // M5/W102: size + mtime-within-tolerance core shared with
+        // `delete_file_guarded` (same semantics as before the extraction).
+        if is_stale(&smd, expected_size, expected_mtime_ms, tolerance_ms) {
             return Ok(Freshness::Changed);
-        }
-        if let Some(expect_ms) = expected_mtime_ms {
-            if let Ok(mt) = smd.modified() {
-                if let Some(actual_ms) = system_time_to_ms(mt) {
-                    if actual_ms.abs_diff(expect_ms) > tolerance_ms {
-                        return Ok(Freshness::Changed);
-                    }
-                }
-            }
         }
         Ok(Freshness::Fresh)
     }
@@ -545,21 +538,12 @@ impl LocalFs {
                 path.display()
             )));
         }
-        if smd.len() != expected_size {
+        // M5/W102: size + mtime-within-tolerance core shared with
+        // `destination_freshness` (same semantics as before the extraction).
+        if is_stale(&smd, expected_size, expected_mtime_ms, tolerance_ms) {
             return Err(Error::Other(format!(
                 "local file changed since plan for {key}; not deleting"
             )));
-        }
-        if let Some(expect_ms) = expected_mtime_ms {
-            if let Ok(mt) = smd.modified() {
-                if let Some(actual_ms) = system_time_to_ms(mt) {
-                    if actual_ms.abs_diff(expect_ms) > tolerance_ms {
-                        return Err(Error::Other(format!(
-                            "local file changed since plan for {key}; not deleting"
-                        )));
-                    }
-                }
-            }
         }
         // W76 (r8b M1 / r8a-5): route the unlink through the shared seam
         // (`unlink_local_file`) like `delete_file` does. This closes the
@@ -1325,6 +1309,36 @@ fn system_time_to_ms(t: SystemTime) -> Option<u64> {
     )
 }
 
+/// Shared size+mtime staleness predicate (M5/W102), extracted from
+/// `destination_freshness` and `delete_file_guarded`: true when on-disk
+/// metadata no longer matches the plan (size differs, or the mtime drifts
+/// beyond `tolerance_ms` when one is expected). `expected_mtime_ms: None` is
+/// size-only. A failed `modified()` read is tolerated exactly as the two call
+/// sites tolerated it before - treated as fresh by size (the timestamp is
+/// simply unavailable). The two call sites intentionally differ around this
+/// predicate (symlink/non-regular handling, NotFound mapping, Changed vs
+/// Err); only the size+mtime core is shared.
+fn is_stale(
+    smd: &std::fs::Metadata,
+    expected_size: u64,
+    expected_mtime_ms: Option<u64>,
+    tolerance_ms: u64,
+) -> bool {
+    if smd.len() != expected_size {
+        return true;
+    }
+    if let Some(expect_ms) = expected_mtime_ms {
+        if let Ok(mt) = smd.modified() {
+            if let Some(actual_ms) = system_time_to_ms(mt) {
+                if actual_ms.abs_diff(expect_ms) > tolerance_ms {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1749,6 +1763,79 @@ mod tests {
             .open_verified("a.md", 5, Some(base + 3000), 1000)
             .unwrap_err();
         assert!(format!("{err}").contains("mtime changed"), "err: {err}");
+    }
+
+    #[test]
+    fn is_stale_size_mismatch() {
+        // M5 (W102): the shared size+mtime staleness predicate - a size
+        // mismatch is stale regardless of mtime. RED: `is_stale` does not
+        // exist (compile failure).
+        let dir = TempDir::new("vaultsync-test");
+        let f = dir.join("a.md");
+        std::fs::write(&f, "ab").unwrap(); // 2 bytes
+        let md = std::fs::metadata(&f).unwrap();
+        assert!(is_stale(&md, 3, None, 5_000), "size mismatch must be stale");
+    }
+
+    #[test]
+    fn is_stale_mtime_beyond_tolerance() {
+        // A size match with an mtime drift beyond tolerance is stale.
+        let dir = TempDir::new("vaultsync-test");
+        let f = dir.join("a.md");
+        std::fs::write(&f, "ab").unwrap();
+        let base = 1_700_000_000_000u64;
+        {
+            let fh = std::fs::File::open(&f).unwrap();
+            set_file_mtime_ms(&fh, base).unwrap();
+        }
+        let md = std::fs::metadata(&f).unwrap();
+        // expected mtime 60s earlier than actual -> beyond the 5s tolerance
+        assert!(
+            is_stale(&md, 2, Some(base - 60_000), 5_000),
+            "mtime drift beyond tolerance must be stale"
+        );
+    }
+
+    #[test]
+    fn is_stale_mtime_within_tolerance() {
+        // A size match with an mtime drift inside the tolerance is fresh.
+        let dir = TempDir::new("vaultsync-test");
+        let f = dir.join("a.md");
+        std::fs::write(&f, "ab").unwrap();
+        let base = 1_700_000_000_000u64;
+        {
+            let fh = std::fs::File::open(&f).unwrap();
+            set_file_mtime_ms(&fh, base).unwrap();
+        }
+        let md = std::fs::metadata(&f).unwrap();
+        assert!(!is_stale(&md, 2, Some(base), 5_000), "exact mtime is fresh");
+        assert!(
+            !is_stale(&md, 2, Some(base + 4_999), 5_000),
+            "mtime inside tolerance is fresh"
+        );
+    }
+
+    #[test]
+    fn is_stale_no_expected_mtime_is_size_only() {
+        // `expected_mtime_ms: None` falls back to size-only: a wildly
+        // different mtime is ignored when the size matches. (The sibling
+        // "unreadable mtime" branch - `modified()` Err - cannot be
+        // constructed portably: std reports mtimes even for device nodes on
+        // macOS. It is carried verbatim from the two call sites and covered
+        // by inspection; its outcome is this same size-only fresh result.)
+        let dir = TempDir::new("vaultsync-test");
+        let f = dir.join("a.md");
+        std::fs::write(&f, "ab").unwrap();
+        let base = 1_700_000_000_000u64;
+        {
+            let fh = std::fs::File::open(&f).unwrap();
+            set_file_mtime_ms(&fh, base).unwrap();
+        }
+        let md = std::fs::metadata(&f).unwrap();
+        assert!(
+            !is_stale(&md, 2, None, 5_000),
+            "no expected mtime => size-only fresh"
+        );
     }
 
     #[test]
