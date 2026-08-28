@@ -1633,8 +1633,7 @@ mod tests {
         )
         .unwrap();
         let settings =
-            crate::config::resolve_settings(&cfg, &crate::config::EnvSnapshot::default())
-                .unwrap();
+            crate::config::resolve_settings(&cfg, &crate::config::EnvSnapshot::default()).unwrap();
         assert_eq!(settings.mtime_tolerance_ms, 5000, "TOML tolerance resolved");
         let store = MemoryStore::new();
         let mut cursor = std::io::Cursor::new(b"same".to_vec());
@@ -1702,8 +1701,7 @@ mod tests {
         std::fs::set_permissions(dir.join("a"), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(code, 0, "cleanup warning is non-fatal: {err}");
         assert!(
-            err.contains("warning:")
-                && (err.contains("a/b") || err.contains("remove")),
+            err.contains("warning:") && (err.contains("a/b") || err.contains("remove")),
             "cleanup warning missing from stderr: {err}"
         );
     }

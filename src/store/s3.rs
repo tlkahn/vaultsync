@@ -399,8 +399,12 @@ fn reap_stale_upload_temps(dir: &std::path::Path, max_age_secs: u64) {
         if !md.is_file() {
             continue;
         }
-        let Ok(modified) = md.modified() else { continue };
-        let Ok(age) = now.duration_since(modified) else { continue };
+        let Ok(modified) = md.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
         if age.as_secs() > max_age_secs {
             let _ = std::fs::remove_file(entry.path());
         }

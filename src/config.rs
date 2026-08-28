@@ -423,16 +423,14 @@ mtime_tolerance_ms = 1000
             );
         }
         // a real value still passes through
-        let cfg =
-            parse_config_str("[store]\nbucket = \"b\"\nregion = \"us-east-1\"\n").unwrap();
+        let cfg = parse_config_str("[store]\nbucket = \"b\"\nregion = \"us-east-1\"\n").unwrap();
         assert_eq!(
             settings(&cfg).unwrap().store.region.as_deref(),
             Some("us-east-1")
         );
         // env-region precedence over a whitespace config region is unchanged:
         // the env value wins (whitespace config is unset, not a hard error)
-        let cfg =
-            parse_config_str("[store]\nbucket = \"b\"\nregion = \"   \"\n").unwrap();
+        let cfg = parse_config_str("[store]\nbucket = \"b\"\nregion = \"   \"\n").unwrap();
         let env = EnvSnapshot {
             aws_region: Some("eu-west-3".to_string()),
         };
@@ -456,10 +454,8 @@ mtime_tolerance_ms = 1000
             );
         }
         // a real value still passes through
-        let cfg = parse_config_str(
-            "[store]\nbucket = \"b\"\nendpoint = \"https://minio.local\"\n",
-        )
-        .unwrap();
+        let cfg = parse_config_str("[store]\nbucket = \"b\"\nendpoint = \"https://minio.local\"\n")
+            .unwrap();
         assert_eq!(
             settings(&cfg).unwrap().store.endpoint.as_deref(),
             Some("https://minio.local")

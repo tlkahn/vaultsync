@@ -913,7 +913,12 @@ fn temp_sibling_candidates(final_path: &Path) -> Vec<PathBuf> {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let start = COUNTER.fetch_add(100, std::sync::atomic::Ordering::Relaxed);
     (0..100)
-        .map(|i| dir.join(format!(".{name_part}.vaultsync-tmp-{pid}-{}", start + i as u64)))
+        .map(|i| {
+            dir.join(format!(
+                ".{name_part}.vaultsync-tmp-{pid}-{}",
+                start + i as u64
+            ))
+        })
         .collect()
 }
 
@@ -2103,10 +2108,12 @@ mod tests {
         let shared: String = "a".repeat(190);
         let leaf1 = format!("{shared}AAA");
         let leaf2 = format!("{shared}BBB");
-        let set1: std::collections::HashSet<PathBuf> =
-            temp_sibling_candidates(&dir.join(&leaf1)).into_iter().collect();
-        let set2: std::collections::HashSet<PathBuf> =
-            temp_sibling_candidates(&dir.join(&leaf2)).into_iter().collect();
+        let set1: std::collections::HashSet<PathBuf> = temp_sibling_candidates(&dir.join(&leaf1))
+            .into_iter()
+            .collect();
+        let set2: std::collections::HashSet<PathBuf> = temp_sibling_candidates(&dir.join(&leaf2))
+            .into_iter()
+            .collect();
         assert!(
             set1.is_disjoint(&set2),
             "candidate sets must be disjoint (hash uniqueness)"
@@ -2429,10 +2436,7 @@ mod tests {
         std::fs::write(dir.join("keep/sub/file.md"), "x").unwrap();
         let fs = LocalFs::new(dir.path());
         let (removed, _warnings) = fs
-            .remove_empty_ancestor_dirs(&[
-                "a/b/c/one.md".to_string(),
-                "a/b/c/two.md".to_string(),
-            ])
+            .remove_empty_ancestor_dirs(&["a/b/c/one.md".to_string(), "a/b/c/two.md".to_string()])
             .unwrap();
         assert!(!dir.join("a/b/c").exists(), "deepest dir removed");
         assert!(!dir.join("a/b").exists(), "middle dir removed");
