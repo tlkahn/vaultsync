@@ -86,13 +86,33 @@ pub fn check_store(store: &dyn ObjectStore) -> Result<(), Error> {
     let body: &[u8] = b"vaultsync-connectivity-probe";
     let mut writer = std::io::Cursor::new(body.to_vec());
     let _ = store.put_from(&key, &mut writer, body.len() as u64, None)?;
-    let mut buf = Vec::new();
-    let ent = store.get_to(&key, &mut buf)?;
-    if buf != body || ent.size != body.len() as u64 {
-        return Err(Error::Other("check: read-back mismatch".to_string()));
+    // W24/M2: after a successful put, every exit path attempts to delete the
+    // probe, so a failed/partial check never leaves `.vaultsync-check-*`
+    // litter (which would otherwise list as a remote_only row later). A delete
+    // failure on an already-erroring path is secondary context, never masking
+    // the primary error; a delete failure on the success path remains the
+    // returned error.
+    match (|| -> Result<(), Error> {
+        let mut buf = Vec::new();
+        let ent = store.get_to(&key, &mut buf)?;
+        if buf != body || ent.size != body.len() as u64 {
+            return Err(Error::Other("check: read-back mismatch".to_string()));
+        }
+        Ok(())
+    })() {
+        Ok(()) => {
+            store.delete(&key)?;
+            Ok(())
+        }
+        Err(primary) => {
+            if let Err(de) = store.delete(&key) {
+                return Err(Error::Other(format!(
+                    "{primary} (also failed to remove probe {key}: {de})"
+                )));
+            }
+            Err(primary)
+        }
     }
-    store.delete(&key)?;
-    Ok(())
 }
 
 /// The vault-relative probe key used by `check`. Predictable names (pid-only)
@@ -528,6 +548,104 @@ mod tests {
         crate::check_store(&store).unwrap();
         // probe object removed after the check
         assert!(store.list("").unwrap().is_empty());
+    }
+
+    /// A store whose `get_to` always errors after a successful put, to inject
+    /// a probe read failure (W24/M2).
+    struct GetFailStore {
+        inner: MemoryStore,
+    }
+    impl ObjectStore for GetFailStore {
+        fn list(&self, prefix: &str) -> Result<Vec<Entity>, Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<Entity, Error> {
+            self.inner.head(key)
+        }
+        fn get_to(&self, _key: &str, _w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            Err(Error::Other("injected get failure".to_string()))
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime: Option<u64>,
+        ) -> Result<Entity, Error> {
+            self.inner.put_from(key, r, size, mtime)
+        }
+        fn delete(&self, key: &str) -> Result<(), Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// A store whose `get_to` returns a corrupted size for the probe (bytes
+    /// round-trip, header disagrees) - the read-back mismatch path (W24/M2).
+    struct SizeCorruptStore {
+        inner: MemoryStore,
+    }
+    impl ObjectStore for SizeCorruptStore {
+        fn list(&self, prefix: &str) -> Result<Vec<Entity>, Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<Entity, Error> {
+            self.inner.head(key)
+        }
+        fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            let ent = self.inner.get_to(key, w)?;
+            Ok(Entity {
+                size: ent.size + 999,
+                ..ent
+            })
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime: Option<u64>,
+        ) -> Result<Entity, Error> {
+            self.inner.put_from(key, r, size, mtime)
+        }
+        fn delete(&self, key: &str) -> Result<(), Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    fn assert_no_check_probe(store: &MemoryStore) {
+        let keys: Vec<String> = store
+            .list("")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        assert!(
+            !keys.iter().any(|k| k.starts_with(".vaultsync-check-")),
+            "probe leaked after failed check: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn check_store_cleans_probe_when_get_fails() {
+        // W24/M2: even when `get_to` fails after a successful put, `check_store`
+        // errors AND removes the probe so `.vaultsync-check-*` never lists as a
+        // remote_only row later.
+        let store = GetFailStore {
+            inner: MemoryStore::new(),
+        };
+        assert!(crate::check_store(&store).is_err());
+        assert_no_check_probe(&store.inner);
+    }
+
+    #[test]
+    fn check_store_cleans_probe_on_readback_mismatch() {
+        // W24/M2: a read-back mismatch (corrupted size) is an error that must
+        // still delete the probe.
+        let store = SizeCorruptStore {
+            inner: MemoryStore::new(),
+        };
+        assert!(crate::check_store(&store).is_err());
+        assert_no_check_probe(&store.inner);
     }
 
     #[test]
