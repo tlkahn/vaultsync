@@ -59,6 +59,10 @@ impl S3Store {
     /// Build from resolved store settings. Credentials come from the ambient
     /// AWS default chain (env, shared config, profile) - never from the TOML.
     pub fn new(settings: &StoreSettings) -> Result<S3Store, Error> {
+        // W88/r10-L2: best-effort reap of stale upload temp buffers left by a
+        // crashed run in the shared temp dir. Conservative 24h age; every
+        // error is swallowed (hygiene, not an operation the user can act on).
+        reap_stale_upload_temps(&std::env::temp_dir(), UPLOAD_TEMP_MAX_AGE_SECS);
         // W48: a current-thread runtime matches the one-`block_on`-at-a-time
         // sync architecture (each call `block_on`s once); a multi-thread
         // runtime would add worker threads with no parallelization benefit.
@@ -363,6 +367,46 @@ fn temp_upload_path() -> PathBuf {
     std::env::temp_dir().join(format!("vaultsync-upload-{}-{n}", std::process::id()))
 }
 
+/// Conservative age (seconds) at which an upload temp buffer is considered
+/// stale and reaped (W88/r10-L2). 24h is far longer than any single
+/// buffering+upload of a sub-5 GiB object should take, so a live buffer is
+/// never at risk; only crash leftovers from an older process qualify.
+const UPLOAD_TEMP_MAX_AGE_SECS: u64 = 24 * 3600;
+
+/// Reap stale upload temp buffers in `dir` (W88/r10-L2). Best-effort
+/// hygiene: a crash/SIGKILL between buffering and `remove_file` leaks a full
+/// buffered object in the shared temp dir, and no cross-run cleanup existed
+/// (contrast the vault-side temp siblings, which the walker counts and the
+/// CLI surfaces - W23/W41). Only regular files whose name matches
+/// `vaultsync-upload-*` AND whose mtime is older than `max_age_secs` are
+/// removed; fresh buffers (a concurrent process's in-flight upload) and
+/// unrelated files are never touched. Every IO error is swallowed: this is
+/// hygiene, not an operation the user can act on.
+fn reap_stale_upload_temps(dir: &std::path::Path, max_age_secs: u64) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return; // nonexistent/unreadable dir: nothing to reap
+    };
+    let now = std::time::SystemTime::now();
+    for entry in rd.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("vaultsync-upload-") {
+            continue;
+        }
+        let Ok(md) = entry.metadata() else { continue };
+        if !md.is_file() {
+            continue;
+        }
+        let Ok(modified) = md.modified() else { continue };
+        let Ok(age) = now.duration_since(modified) else { continue };
+        if age.as_secs() > max_age_secs {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Create a single upload temp buffer file (**not** retried). Owner-only
 /// `0o600` perms (W14/A-L1/B-L1) and `create_new` (no reuse). On non-unix it
 /// is plain `create_new`.
@@ -611,6 +655,46 @@ impl ObjectStore for S3Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::TempDir;
+
+    #[test]
+    fn reap_stale_upload_temps_removes_old_leftovers() {
+        // r10-L2 (W88): a crash/SIGKILL between buffering and remove_file
+        // leaks a full buffered object in the shared temp dir; no cross-run
+        // cleanup existed. The reap must remove only stale
+        // `vaultsync-upload-*` files (older than max_age), keep fresh ones
+        // (a concurrent process's in-flight upload), and never touch
+        // unrelated files or the dir itself. RED: the function does not
+        // exist (compile failure).
+        let dir = TempDir::new("vaultsync-s3-test");
+        let stale = dir.join("vaultsync-upload-999999-0");
+        let fresh = dir.join("vaultsync-upload-999999-1");
+        let other = dir.join("other-file");
+        std::fs::write(&stale, "leak").unwrap();
+        std::fs::write(&fresh, "in-flight").unwrap();
+        std::fs::write(&other, "unrelated").unwrap();
+        // 48h old mtime on the stale file
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 3600);
+        std::fs::File::open(&stale)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+
+        reap_stale_upload_temps(dir.path(), 24 * 3600);
+
+        assert!(!stale.exists(), "stale leftover must be reaped");
+        assert!(fresh.exists(), "fresh in-flight buffer must survive");
+        assert!(other.exists(), "unrelated file must survive");
+        assert!(dir.exists(), "the reap dir itself must survive");
+    }
+
+    #[test]
+    fn reap_stale_upload_temps_ignores_errors() {
+        // r10-L2 (W88): the reap is best-effort hygiene - a nonexistent dir
+        // must be silent, never an error and never a panic.
+        let dir = TempDir::new("vaultsync-s3-test");
+        reap_stale_upload_temps(&dir.join("no-such-dir"), 24 * 3600);
+    }
 
     #[test]
     fn s3_put_from_rejects_above_single_put_ceiling() {

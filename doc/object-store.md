@@ -67,6 +67,14 @@ Practical options (pick in Phase 2 spike, not earlier):
 | head | `HeadObject` |
 | get_to | `GetObject` (stream body into the caller's writer) |
 | put_from | `PutObject` single-PUT via `ByteStream::from_path` (buffered to a disk temp, never a `size`-sized memory buffer); 5 GiB ceiling. Multipart is a post-v1 item. |
+
+Upload temp buffers live in the OS temp dir as `vaultsync-upload-<pid>-<n>`
+(owner-only `0o600`, `create_new`). Their lifecycle includes a 24h reap
+(W88/r10-L2): each `S3Store` construction best-effort removes
+`vaultsync-upload-*` files older than 24h (a crash/SIGKILL between buffering
+and the post-upload `remove_file` would otherwise leak a full buffered object
+in the shared temp dir). Fresh in-flight buffers and unrelated files are never
+touched.
 | delete | `DeleteObject` (batch delete later) |
 
 Delete is **idempotent-friendly** (PR2 A-M3/B-L6): deleting an already-absent
