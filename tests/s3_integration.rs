@@ -182,15 +182,19 @@ fn s3_integ_prefix_isolation() {
         })
         .expect("other store");
         put_bytes(&other, "secret.txt", b"s", None)?;
-        // our store must not see it
+        // Capture the listing, then clean up the sibling-prefix object BEFORE
+        // asserting (W55/B-L4): a failed assertion must not permanently litter
+        // the shared bucket - `with_store`'s sweeper covers only the primary
+        // prefix, so an assertion failure used to leave
+        // `vaultsync-other-prefix-<ts>/secret.txt` behind.
         let keys: Vec<String> = s.list("").unwrap().iter().map(|e| e.key.clone()).collect();
+        let _ = other.delete("secret.txt");
+        // our store must not see it
         assert!(
             !keys.iter().any(|k| k == "secret.txt"),
             "sibling-prefix object leaked into list: {keys:?}"
         );
         assert!(keys.iter().any(|k| k == "mine.txt"));
-        // clean up the other store's object
-        let _ = other.delete("secret.txt");
         Ok(())
     });
 }
