@@ -772,17 +772,67 @@ pub fn key_to_local_path(root: &Path, key: &str) -> Result<PathBuf, Error> {
 /// so the allocator can skip a stale leftover or a pre-planted symlink and
 /// retry at the next candidate instead of following/truncating through it
 /// (R4-L2/W40, mirroring the W29 upload-side `alloc_first` pattern).
+///
+/// NAME_MAX invariant (r10-M1/W85): every candidate's final component is
+/// at most 255 bytes. A leaf longer than `TEMP_NAME_LEAF_BUDGET` bytes has
+/// its embedded name replaced by `{first <budget> bytes on a char
+/// boundary}-{fnv1a64(name):016x}` - readability from the head, uniqueness
+/// from the hash of the full name (two leaves sharing the head but differing
+/// later stay disjoint even with the same pid+counter). The budget reserves
+/// the fixed `.`+`-`+16-hex+`.`+`.vaultsync-tmp-`+`-` suffix (35 bytes) plus
+/// the theoretical maxima of the `pid` (u32, 10 digits) and `n` (u64, 20
+/// digits) so the invariant holds unconditionally, not just for typical
+/// pids/counters.
+const TEMP_NAME_LEAF_BUDGET: usize = 190;
+
+/// FNV-1a 64-bit (std-only, no external dep): the uniqueness hash for long
+/// leaf names in [`temp_sibling_candidates`]. Stable across runs and
+/// platforms - the hash must never feed back into allocator semantics beyond
+/// candidate-name uniqueness.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Truncate `s` to at most `budget` bytes on a UTF-8 char boundary (never
+/// split a multi-byte char). Returns `s` unchanged when it already fits.
+fn truncate_char_boundary(s: &str, budget: usize) -> &str {
+    if s.len() <= budget {
+        return s;
+    }
+    let mut end = budget;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn temp_sibling_candidates(final_path: &Path) -> Vec<PathBuf> {
     let name = final_path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "obj".to_string());
+    // r10-M1/W85: cap the embedded leaf name so a legal 255-byte (or
+    // multibyte) leaf cannot overflow NAME_MAX in the candidate names.
+    let name_part = if name.len() > TEMP_NAME_LEAF_BUDGET {
+        format!(
+            "{}-{:016x}",
+            truncate_char_boundary(&name, TEMP_NAME_LEAF_BUDGET),
+            fnv1a64(name.as_bytes())
+        )
+    } else {
+        name
+    };
     let dir = final_path.parent().unwrap_or_else(|| Path::new("."));
     let pid = std::process::id();
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let start = COUNTER.fetch_add(100, std::sync::atomic::Ordering::Relaxed);
     (0..100)
-        .map(|i| dir.join(format!(".{name}.vaultsync-tmp-{pid}-{}", start + i as u64)))
+        .map(|i| dir.join(format!(".{name_part}.vaultsync-tmp-{pid}-{}", start + i as u64)))
         .collect()
 }
 
@@ -1878,6 +1928,59 @@ mod tests {
         for c in &candidates {
             let _ = std::fs::remove_file(c);
         }
+    }
+
+    #[test]
+    fn temp_sibling_candidates_caps_long_leaf_names() {
+        // r10-M1 (W85): a leaf name longer than ~231 bytes makes every temp
+        // sibling candidate exceed NAME_MAX (255 bytes), so `create_new` fails
+        // with ENAMETOOLONG and `alloc_temp_sibling_from` returns the raw io
+        // error - a 255-byte leaf is legal on disk and as an S3 key, so
+        // vaultsync could upload a file it can never pull back. The candidates
+        // must cap the embedded leaf name and keep uniqueness via a hash of
+        // the full name. Fails today: candidates for a 255-byte leaf are
+        // ~280 bytes (NAME_MAX overflow).
+        let dir = TempDir::new("vaultsync-test");
+        // 255-byte ASCII leaf (legal on disk, NAME_MAX = 255)
+        let long: String = "a".repeat(255);
+        let candidates = temp_sibling_candidates(&dir.join(&long));
+        assert_eq!(candidates.len(), 100);
+        for c in &candidates {
+            let name_bytes = c.file_name().unwrap().to_string_lossy().len();
+            assert!(
+                name_bytes <= 255,
+                "candidate {} is {name_bytes} bytes (NAME_MAX 255)",
+                c.display()
+            );
+        }
+        // 300-byte multibyte leaf ("é" is 2 bytes in UTF-8): the truncation
+        // must stay on a char boundary - a broken UTF-8 candidate name would
+        // itself be a defect.
+        let wide: String = "é".repeat(150);
+        assert_eq!(wide.len(), 300);
+        let candidates = temp_sibling_candidates(&dir.join(&wide));
+        for c in &candidates {
+            let name = c.file_name().unwrap().to_str().unwrap();
+            assert!(
+                name.len() <= 255,
+                "candidate {name:?} too long: {} bytes",
+                name.len()
+            );
+        }
+        // uniqueness from the hash, not pid+counter: two leaves sharing the
+        // first 190 bytes but differing later truncate to the same prefix and
+        // must still produce disjoint candidate sets.
+        let shared: String = "a".repeat(190);
+        let leaf1 = format!("{shared}AAA");
+        let leaf2 = format!("{shared}BBB");
+        let set1: std::collections::HashSet<PathBuf> =
+            temp_sibling_candidates(&dir.join(&leaf1)).into_iter().collect();
+        let set2: std::collections::HashSet<PathBuf> =
+            temp_sibling_candidates(&dir.join(&leaf2)).into_iter().collect();
+        assert!(
+            set1.is_disjoint(&set2),
+            "candidate sets must be disjoint (hash uniqueness)"
+        );
     }
 
     #[test]

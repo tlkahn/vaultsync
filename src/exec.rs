@@ -502,6 +502,33 @@ mod tests {
     }
 
     #[test]
+    fn pull_downloads_255_byte_leaf_name() {
+        // r10-M1 (W85) behavior lock: a 255-byte leaf name is legal on disk
+        // (NAME_MAX) and as an S3 key (S3 allows 1024-byte keys), but the
+        // temp-sibling candidates embedded the full leaf name
+        // (`.{name}.vaultsync-tmp-{pid}-{n}`), so every candidate exceeded
+        // NAME_MAX and `create_new` failed with ENAMETOOLONG - vaultsync
+        // could upload a file it could never pull back. Fails today with
+        // "File name too long (os error 63)".
+        let dir = TempDir::new("vaultsync-exec");
+        let key: String = "a".repeat(255);
+        let store = MemoryStore::new();
+        put_str(&store, &key, "hello", Some(1_700_000_000_000));
+        let local = LocalFs::new(dir.path());
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+        assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
+        assert_eq!(rep.executed, 1, "{:?}", rep);
+        let p = dir.join(&key);
+        assert_eq!(std::fs::read(&p).unwrap(), b"hello");
+        let got = mtime_ms(&p);
+        assert!(
+            got.abs_diff(1_700_000_000_000) < 2000,
+            "remote mtime not applied: {got}"
+        );
+    }
+
+    #[test]
     fn exec_download_writes_file_and_mtime() {
         let dir = TempDir::new("vaultsync-exec");
         let store = MemoryStore::new();
