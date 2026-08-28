@@ -630,7 +630,12 @@ impl LocalFs {
         let mut warnings: Vec<String> = Vec::new();
         // Ancestor dirs of each key, deepest-first (the file's parent first,
         // walking up to but excluding the root), dedup'd across chains.
+        // r2-M2/W91: membership via a HashSet seen-set instead of the old
+        // linear `dirs.iter().any()` (O(n^2) at 50k deleted files with deep
+        // nesting); the ordered Vec is preserved so insertion order is
+        // unchanged.
         let mut dirs: Vec<PathBuf> = Vec::new();
+        let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         for key in keys {
             // Keys come from the plan (already validated), but re-route
             // through the single join site defensively; an invalid key simply
@@ -643,7 +648,7 @@ impl LocalFs {
                 if p == self.root {
                     break; // never remove the vault root
                 }
-                if !dirs.iter().any(|d| d == p) {
+                if seen.insert(p.to_path_buf()) {
                     dirs.push(p.to_path_buf());
                 }
                 probe = p.parent();
@@ -2401,6 +2406,43 @@ mod tests {
             std::fs::read(outside.join("notes/a.md")).unwrap(),
             b"OUTSIDE-SECRET"
         );
+    }
+
+    #[test]
+    fn remove_empty_ancestor_dirs_dedups_shared_ancestors_bottom_up() {
+        // r2-M2 (W91) characterization lock: two deleted keys sharing a deep
+        // ancestor chain must have each shared ancestor removed exactly once,
+        // bottom-up, with the root untouched and pre-existing non-empty dirs
+        // surviving. Passes before and after (the fix is semantics-preserving);
+        // the lock exists so the HashSet rewrite cannot silently change
+        // ordering/dedup behavior - a broken depth-descending order leaves `a`
+        // behind (it is non-empty while `a/b` still exists), and a broken
+        // dedup re-probes already-removed dirs.
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::create_dir_all(dir.join("a/b/c")).unwrap();
+        std::fs::write(dir.join("a/b/c/one.md"), "x").unwrap();
+        std::fs::write(dir.join("a/b/c/two.md"), "y").unwrap();
+        std::fs::remove_file(dir.join("a/b/c/one.md")).unwrap();
+        std::fs::remove_file(dir.join("a/b/c/two.md")).unwrap();
+        // pre-existing non-empty dir must survive
+        std::fs::create_dir_all(dir.join("keep/sub")).unwrap();
+        std::fs::write(dir.join("keep/sub/file.md"), "x").unwrap();
+        let fs = LocalFs::new(dir.path());
+        let (removed, _warnings) = fs
+            .remove_empty_ancestor_dirs(&[
+                "a/b/c/one.md".to_string(),
+                "a/b/c/two.md".to_string(),
+            ])
+            .unwrap();
+        assert!(!dir.join("a/b/c").exists(), "deepest dir removed");
+        assert!(!dir.join("a/b").exists(), "middle dir removed");
+        assert!(!dir.join("a").exists(), "top dir removed");
+        assert!(dir.exists(), "root must remain");
+        assert!(
+            dir.join("keep/sub/file.md").exists(),
+            "pre-existing non-empty dir must survive"
+        );
+        assert_eq!(removed, 3, "each shared ancestor removed exactly once");
     }
 
     #[cfg(unix)]
