@@ -76,7 +76,12 @@ impl S3Store {
         Ok(S3Store {
             client,
             bucket: settings.bucket.clone(),
-            prefix: settings.prefix.clone(),
+            // R5-M1: the trailing-`/` invariant is enforced at the
+            // constructor, not trusted from callers - `full_key` raw-concats
+            // the prefix, so an unnormalized `"notes"` would map `a.md` to
+            // `notesa.md`. Config resolution already normalizes, but the
+            // public constructor contract must not depend on that.
+            prefix: crate::config::normalize_prefix(&settings.prefix),
             rt,
         })
     }
@@ -602,6 +607,29 @@ mod tests {
         let mode = std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "upload temp perms must be 0600, got {mode:o}");
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn s3store_new_normalizes_prefix() {
+        // R5-M1: the constructor enforces the trailing-`/` invariant itself,
+        // not trusting callers. `full_key` raw-concats the prefix, so an
+        // unnormalized `"notes"` would silently map `a.md` -> `notesa.md`.
+        for (input, expected) in [
+            ("notes", "notes/"),
+            ("notes/", "notes/"),
+            ("a/b", "a/b/"),
+            ("", ""),
+        ] {
+            let settings = StoreSettings {
+                bucket: "bucket".to_string(),
+                region: None,
+                endpoint: None,
+                prefix: input.to_string(),
+                path_style: false,
+            };
+            let store = S3Store::new(&settings).unwrap();
+            assert_eq!(store.prefix, expected, "input {input:?}");
+        }
     }
 
     #[test]
