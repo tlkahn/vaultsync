@@ -42,6 +42,11 @@ pub trait ObjectStore {
     /// Fetch metadata for a single object.
     fn head(&self, key: &str) -> Result<Entity, Error>;
     /// Stream object bytes into `w`, returning its metadata.
+    ///
+    /// Contract (W30/N6/L2): the returned entity's `size` must be the true
+    /// number of bytes written to `w`. Backends must not report a placeholder
+    /// (e.g. 0) when the body length is not known up front; the executor's
+    /// size check relies on this.
     fn get_to(&self, key: &str, w: &mut dyn Write) -> Result<Entity, Error>;
     /// Store exactly `size` bytes read from `r`. File keys only: a trailing
     /// `/` (folder marker) is rejected with [`Error::InvalidKey`].

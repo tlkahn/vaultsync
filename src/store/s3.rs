@@ -134,6 +134,14 @@ fn strip_prefix<'a>(prefix: &str, full: &'a str) -> Option<&'a str> {
     }
 }
 
+/// The entity `size` to report for a streamed body (W30/N6/L2): when
+/// `Content-Length` is present it is authoritative and equals `written` after
+/// the truncation check; when absent, the true streamed byte count is used so
+/// the reported size is never a bogus 0.
+fn effective_get_size(content_len: Option<i64>, written: u64) -> u64 {
+    content_len.map(|c| c.max(0) as u64).unwrap_or(written)
+}
+
 /// Full S3 key for a vault-relative key.
 fn full_key(prefix: &str, key: &str) -> String {
     if prefix.is_empty() {
@@ -373,7 +381,6 @@ impl ObjectStore for S3Store {
             let meta_val = meta.and_then(|m| m.get(MTIME_KEY).map(String::as_str));
             let last = resp.last_modified().and_then(dt_millis);
             let content_len = resp.content_length();
-            let size = content_len.unwrap_or(0) as u64;
             let mtime = decode_mtime(meta_val, last);
             let etag = resp.e_tag().map(|s| s.to_string());
             // A-H1/B-L3: count bytes actually written while streaming. A
@@ -390,11 +397,18 @@ impl ObjectStore for S3Store {
                 w.write_all(&chunk).map_err(Error::Io)?;
                 written += chunk.len() as u64;
             }
-            if content_len.is_some() && written != size {
-                return Err(Error::Other(format!(
-                    "get: truncated body for {rel} (expected {size}, got {written})"
-                )));
+            if let Some(cl) = content_len {
+                let cl = cl.max(0) as u64;
+                if written != cl {
+                    return Err(Error::Other(format!(
+                        "get: truncated body for {rel} (expected {cl}, got {written})"
+                    )));
+                }
             }
+            // W30/N6/L2: report the true byte count. When Content-Length is
+            // present it is authoritative (and equals written post-check); when
+            // absent, the streamed count is used - never a bogus 0.
+            let size = effective_get_size(content_len, written);
             Ok::<Entity, Error>(Entity {
                 key: rel,
                 size,
@@ -433,6 +447,11 @@ impl ObjectStore for S3Store {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
+        // L1-hygiene: drop the write handle before `from_path` re-opens the
+        // temp for the upload (std-only handles already allow a concurrent
+        // open on Windows, so this is intent documentation, not a fix - see
+        // Refutation R-b).
+        drop(f);
 
         let upload = (|| -> Result<(), Error> {
             let body_res = self.rt.block_on(async {
@@ -484,6 +503,21 @@ impl ObjectStore for S3Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_get_size_reports_streamed_bytes() {
+        // W30/N6/L2: an absent Content-Length must yield the true streamed
+        // count (never a bogus 0); a present CL is authoritative and, after
+        // the caller's truncation check, equals `written`.
+        assert_eq!(effective_get_size(Some(5), 5), 5);
+        assert_eq!(effective_get_size(Some(0), 0), 0);
+        assert_eq!(effective_get_size(None, 123), 123);
+        // A present CL that disagrees is handled by the caller's truncation
+        // error before this is used; an absent CL with a short body is not
+        // measurable and the streamed count is the truth.
+        assert_eq!(effective_get_size(Some(5), 4), 5);
+        assert_eq!(effective_get_size(None, 0), 0);
+    }
 
     #[test]
     fn s3_key_mapping_applies_prefix() {
