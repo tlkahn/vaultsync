@@ -148,7 +148,8 @@ fn s3_integ_prefix_isolation() {
         // write something under a sibling prefix directly via a second store
         // sharing the bucket but a different prefix.
         let bucket = std::env::var("VAULTSYNC_TEST_S3_BUCKET").unwrap();
-        let region = std::env::var("VAULTSYNC_TEST_S3_REGION").unwrap_or_else(|_| "us-west-1".into());
+        let region =
+            std::env::var("VAULTSYNC_TEST_S3_REGION").unwrap_or_else(|_| "us-west-1".into());
         let other = S3Store::new(&StoreSettings {
             bucket,
             region: Some(region),
@@ -218,7 +219,12 @@ fn s3_integ_path_style_toggle() -> Result<(), String> {
     for (flavor, s) in &stores {
         if let Err(e) = (|| -> Result<(), String> {
             put_bytes(s, "f.txt", b"ps", None)?;
-            let n = s.list("").unwrap().iter().filter(|e| !e.is_folder()).count();
+            let n = s
+                .list("")
+                .unwrap()
+                .iter()
+                .filter(|e| !e.is_folder())
+                .count();
             if n != 1 {
                 return Err(format!("path-style {flavor}: expected 1 file, got {n}"));
             }
@@ -330,8 +336,14 @@ fn s3_integ_e2e_push_pull() {
         std::fs::create_dir_all(src.join("notes")).unwrap();
         let files: Vec<(&str, Vec<u8>)> = vec![
             ("note.md", b"hello world\n".to_vec()),
-            ("notes/img.png", vec![0x89, 0x50, 0x4e, 0x47, 0x00, 0x0a, 0xff, 0xfe]),
-            ("notes/\u{4e2d}\u{6587}.md", "\u{63a8}\u{8350}\u{ff01}\n".to_string().into_bytes()),
+            (
+                "notes/img.png",
+                vec![0x89, 0x50, 0x4e, 0x47, 0x00, 0x0a, 0xff, 0xfe],
+            ),
+            (
+                "notes/\u{4e2d}\u{6587}.md",
+                "\u{63a8}\u{8350}\u{ff01}\n".to_string().into_bytes(),
+            ),
         ];
         let fixed = 1_600_000_000_123u64;
         for (rel, bytes) in &files {
@@ -353,7 +365,8 @@ fn s3_integ_e2e_push_pull() {
         let ldst = LocalFs::new(&dst);
         let plan2 = vaultsync::build_plan(&ldst, s, Mode::Pull, &PlanOpts::default())
             .map_err(|e| format!("{e}"))?;
-        let rep2 = vaultsync::exec::execute_plan(&ldst, s, &plan2, Mode::Pull, &PlanOpts::default());
+        let rep2 =
+            vaultsync::exec::execute_plan(&ldst, s, &plan2, Mode::Pull, &PlanOpts::default());
         assert!(rep2.failed.is_empty(), "pull failures: {:?}", rep2.failed);
 
         // byte- and mtime-compare each expected file

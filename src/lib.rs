@@ -431,7 +431,11 @@ mod tests {
             listed: vec![crate::entity::file("note.md", 5, Some(1000))],
         };
         let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default()).unwrap();
-        let note = p.actions.iter().find(|a| a.key == "Note.md").expect("Note.md");
+        let note = p
+            .actions
+            .iter()
+            .find(|a| a.key == "Note.md")
+            .expect("Note.md");
         let note_lower = p
             .actions
             .iter()
@@ -443,7 +447,6 @@ mod tests {
         assert_eq!(note_lower.reason, "case_collision");
         assert_eq!(p.stats.conflict, 2);
     }
-
 
     #[test]
     fn build_plan_case_collision_file_vs_folder() {
@@ -461,7 +464,11 @@ mod tests {
         };
         let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default()).unwrap();
         let notes = p.actions.iter().find(|a| a.key == "Notes").expect("Notes");
-        let notes_folder = p.actions.iter().find(|a| a.key == "notes/").expect("notes/");
+        let notes_folder = p
+            .actions
+            .iter()
+            .find(|a| a.key == "notes/")
+            .expect("notes/");
         assert_eq!(notes.kind, ActionKind::Conflict);
         assert_eq!(notes.reason, "case_collision");
         assert_eq!(notes_folder.kind, ActionKind::Conflict);
@@ -473,7 +480,10 @@ mod tests {
         // The probe key is a valid vault-relative key under a dot-prefix.
         let k = probe_key();
         assert!(k.starts_with(".vaultsync-check-"));
-        assert!(crate::entity::ensure_valid_key(&k).is_ok(), "invalid probe key {k:?}");
+        assert!(
+            crate::entity::ensure_valid_key(&k).is_ok(),
+            "invalid probe key {k:?}"
+        );
     }
 
     #[test]
@@ -485,7 +495,10 @@ mod tests {
         assert_ne!(a, b, "probe keys must be unique");
         for k in [&a, &b] {
             assert!(k.starts_with(".vaultsync-check-"), "key {k:?}");
-            assert!(crate::entity::ensure_valid_key(k).is_ok(), "invalid probe key {k:?}");
+            assert!(
+                crate::entity::ensure_valid_key(k).is_ok(),
+                "invalid probe key {k:?}"
+            );
         }
     }
 
@@ -496,7 +509,6 @@ mod tests {
         // probe object removed after the check
         assert!(store.list("").unwrap().is_empty());
     }
-
 
     #[test]
     fn format_plan_human_hides_skips_by_default() {
@@ -513,17 +525,24 @@ mod tests {
             .unwrap()
             .modified()
             .unwrap();
-        let ms = mt.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let ms = mt
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
         {
             let mut c = std::io::Cursor::new(b"same".to_vec());
             store.put_from("a.md", &mut c, 4, Some(ms)).unwrap();
         }
         let p = status_with_store(&dir, &store, &PlanOpts::default()).unwrap();
         let default = format_plan_human(&p);
-        assert!(!default.lines().any(|l| l.starts_with("S  ")), "skips leaked: {default}");
+        assert!(
+            !default.lines().any(|l| l.starts_with("S  ")),
+            "skips leaked: {default}"
+        );
         let verbose = format_plan_human_verbose(&p, 1);
-        assert!(verbose.lines().any(|l| l.starts_with("S  ")), "skips hidden with -v: {verbose}");
+        assert!(
+            verbose.lines().any(|l| l.starts_with("S  ")),
+            "skips hidden with -v: {verbose}"
+        );
     }
-
-
 }

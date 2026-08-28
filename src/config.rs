@@ -104,9 +104,8 @@ pub fn load_config(explicit: Option<&Path>, search: &[PathBuf]) -> Result<FileCo
     if let Some(p) = explicit {
         let text = std::fs::read_to_string(p)
             .map_err(|e| Error::Other(format!("cannot read config {}: {e}", p.display())))?;
-        return parse_config_str(&text).map_err(|e| {
-            Error::Other(format!("invalid config {}: {e}", p.display()))
-        });
+        return parse_config_str(&text)
+            .map_err(|e| Error::Other(format!("invalid config {}: {e}", p.display())));
     }
     for p in search {
         if p.is_file() {
@@ -140,11 +139,7 @@ pub struct EnvSnapshot {
 }
 
 /// Merge config + CLI + env into a [`Settings`]. Pure: no IO, no network.
-pub fn resolve_settings(
-    cfg: &FileConfig,
-    cli: &Cli,
-    env: &EnvSnapshot,
-) -> Result<Settings, Error> {
+pub fn resolve_settings(cfg: &FileConfig, cli: &Cli, env: &EnvSnapshot) -> Result<Settings, Error> {
     let vault_root = match cli.vault {
         Some(v) => v.to_path_buf(),
         None => cfg.vault_root.clone().unwrap_or_else(|| PathBuf::from(".")),
@@ -250,7 +245,10 @@ concurrency = 4
 mtime_tolerance_ms = 1000
 "#;
         let cfg = parse_config_str(text).unwrap();
-        assert_eq!(cfg.vault_root.as_deref(), Some(Path::new("/Users/me/Notes")));
+        assert_eq!(
+            cfg.vault_root.as_deref(),
+            Some(Path::new("/Users/me/Notes"))
+        );
         let s = cfg.store.unwrap();
         assert_eq!(s.store_type.as_deref(), Some("s3"));
         assert_eq!(s.bucket.as_deref(), Some("my-vaults"));
@@ -291,7 +289,10 @@ mtime_tolerance_ms = 1000
     fn config_explicit_missing_file_errors() {
         let missing = Path::new("/nonexistent/vaultsync-config-zzz.toml");
         let err = load_config(Some(missing), &[]).unwrap_err();
-        assert!(format!("{err}").contains("cannot read config"), "err: {err}");
+        assert!(
+            format!("{err}").contains("cannot read config"),
+            "err: {err}"
+        );
     }
 
     #[test]
@@ -300,7 +301,11 @@ mtime_tolerance_ms = 1000
         let cwd = TempDir::new("vaultsync-cfg");
         let home = TempDir::new("vaultsync-cfg-home");
         std::fs::create_dir_all(home.join(".config/vaultsync")).unwrap();
-        std::fs::write(cwd.join(".vaultsync.toml"), "[store]\nbucket = \"cwd-bucket\"\n").unwrap();
+        std::fs::write(
+            cwd.join(".vaultsync.toml"),
+            "[store]\nbucket = \"cwd-bucket\"\n",
+        )
+        .unwrap();
         std::fs::write(
             home.join(".config/vaultsync/config.toml"),
             "[store]\nbucket = \"home-bucket\"\n",
@@ -325,7 +330,10 @@ mtime_tolerance_ms = 1000
         let text = "[store]\nregion = \"us-east-1\"\n";
         let cfg = parse_config_str(text).unwrap();
         let err = settings(&cfg).unwrap_err();
-        assert!(format!("{err}").to_lowercase().contains("bucket"), "err: {err}");
+        assert!(
+            format!("{err}").to_lowercase().contains("bucket"),
+            "err: {err}"
+        );
     }
 
     #[test]
@@ -339,8 +347,10 @@ mtime_tolerance_ms = 1000
 
     #[test]
     fn config_cli_vault_overrides_config() {
-        let mut cfg = FileConfig::default();
-        cfg.vault_root = Some(PathBuf::from("/cfg/vault"));
+        let cfg = FileConfig {
+            vault_root: Some(PathBuf::from("/cfg/vault")),
+            ..Default::default()
+        };
         let cli = Cli {
             vault: Some(Path::new("/cli/vault")),
         };

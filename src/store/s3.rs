@@ -28,9 +28,9 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+use aws_sdk_s3::Client;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::Client;
 
 use crate::config::StoreSettings;
 use crate::entity::Entity;
@@ -59,8 +59,8 @@ impl S3Store {
             .map_err(|e| Error::Other(format!("failed to start async runtime: {e}")))?;
         let client = rt.block_on(async {
             let sdk = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-            let mut b = aws_sdk_s3::config::Builder::from(&sdk)
-                .force_path_style(settings.path_style);
+            let mut b =
+                aws_sdk_s3::config::Builder::from(&sdk).force_path_style(settings.path_style);
             // W7/B-M2: only override the region when explicitly configured;
             // `None` leaves the AWS default chain (env, shared config,
             // profile) already loaded into `sdk` to decide - never a
@@ -81,7 +81,10 @@ impl S3Store {
         })
     }
 
-    fn list_prefix_objects(&self, caller_prefix: &str) -> Result<Vec<(String, u64, Option<u64>)>, Error> {
+    fn list_prefix_objects(
+        &self,
+        caller_prefix: &str,
+    ) -> Result<Vec<(String, u64, Option<u64>)>, Error> {
         let s3_prefix = format!("{}{}", self.prefix, caller_prefix);
         let client = self.client.clone();
         let bucket = self.bucket.clone();
@@ -98,10 +101,7 @@ impl S3Store {
                 if let Some(tok) = &continuation {
                     req = req.continuation_token(tok.clone());
                 }
-                let resp = req
-                    .send()
-                    .await
-                    .map_err(|e| map_sdk_err(&e, "list"))?;
+                let resp = req.send().await.map_err(|e| map_sdk_err(&e, "list"))?;
                 for obj in resp.contents().iter() {
                     let Some(full) = obj.key() else { continue };
                     let Some(rel) = strip_prefix(&store_prefix, full) else {
@@ -361,8 +361,7 @@ impl ObjectStore for S3Store {
                 .await
                 .map_err(|e| Error::Other(format!("get: {e}")))?
             {
-                w.write_all(&chunk)
-                    .map_err(|e| Error::Io(e))?;
+                w.write_all(&chunk).map_err(Error::Io)?;
                 written += chunk.len() as u64;
             }
             if content_len.is_some() && written != size {
@@ -404,9 +403,9 @@ impl ObjectStore for S3Store {
             f.sync_all()?;
             Ok(())
         })();
-        if write_res.is_err() {
+        if let Err(e) = write_res {
             let _ = std::fs::remove_file(&tmp);
-            return Err(write_res.unwrap_err());
+            return Err(e);
         }
 
         let upload = (|| -> Result<(), Error> {
@@ -419,17 +418,11 @@ impl ObjectStore for S3Store {
             let client = self.client.clone();
             let bucket = self.bucket.clone();
             self.rt.block_on(async move {
-                let mut req = client
-                    .put_object()
-                    .bucket(&bucket)
-                    .key(&fk)
-                    .body(body);
+                let mut req = client.put_object().bucket(&bucket).key(&fk).body(body);
                 if let Some(v) = encode_mtime(mtime_ms) {
                     req = req.metadata(MTIME_KEY, v);
                 }
-                req.send()
-                    .await
-                    .map_err(|e| map_sdk_err(&e, "put"))?;
+                req.send().await.map_err(|e| map_sdk_err(&e, "put"))?;
                 Ok::<(), Error>(())
             })
         })();
@@ -469,7 +462,10 @@ mod tests {
     #[test]
     fn s3_key_mapping_applies_prefix() {
         assert_eq!(full_key("myvault/", "notes/a.md"), "myvault/notes/a.md");
-        assert_eq!(strip_prefix("myvault/", "myvault/notes/a.md"), Some("notes/a.md"));
+        assert_eq!(
+            strip_prefix("myvault/", "myvault/notes/a.md"),
+            Some("notes/a.md")
+        );
         assert_eq!(strip_prefix("myvault/", "other/notes/a.md"), None);
         assert_eq!(full_key("", "notes/a.md"), "notes/a.md");
     }
@@ -485,7 +481,10 @@ mod tests {
         assert_eq!(encode_mtime(Some(123)), Some("123".to_string()));
         assert_eq!(encode_mtime(None), None);
         // decode: metadata wins
-        assert_eq!(decode_mtime(Some("1700000000123"), Some(999)), Some(1700000000123));
+        assert_eq!(
+            decode_mtime(Some("1700000000123"), Some(999)),
+            Some(1700000000123)
+        );
         // no metadata -> LastModified
         assert_eq!(decode_mtime(None, Some(999)), Some(999));
         assert_eq!(decode_mtime(None, None), None);
@@ -545,31 +544,67 @@ mod tests {
     fn s3_error_mapping() {
         // Amended for W9/A-M5/B-M4 (PR2): 5xx and 429 map to Unavailable
         // (previously Other); 404/401/403/timeout mappings unchanged.
-        assert!(matches!(classify_error(false, Some(404), "x"), Error::NotFound(_)));
-        assert!(matches!(classify_error(false, Some(403), "x"), Error::Unauthorized(_)));
-        assert!(matches!(classify_error(false, Some(401), "x"), Error::Unauthorized(_)));
-        assert!(matches!(classify_error(true, Some(500), "x"), Error::Timeout(_)));
-        assert!(matches!(classify_error(false, Some(500), "x"), Error::Unavailable(_)));
-        assert!(matches!(classify_error(false, Some(503), "x"), Error::Unavailable(_)));
-        assert!(matches!(classify_error(false, Some(429), "x"), Error::Unavailable(_)));
-        assert!(matches!(classify_error(false, Some(599), "x"), Error::Unavailable(_)));
-        assert!(matches!(classify_error(false, Some(499), "x"), Error::Other(_)));
+        assert!(matches!(
+            classify_error(false, Some(404), "x"),
+            Error::NotFound(_)
+        ));
+        assert!(matches!(
+            classify_error(false, Some(403), "x"),
+            Error::Unauthorized(_)
+        ));
+        assert!(matches!(
+            classify_error(false, Some(401), "x"),
+            Error::Unauthorized(_)
+        ));
+        assert!(matches!(
+            classify_error(true, Some(500), "x"),
+            Error::Timeout(_)
+        ));
+        assert!(matches!(
+            classify_error(false, Some(500), "x"),
+            Error::Unavailable(_)
+        ));
+        assert!(matches!(
+            classify_error(false, Some(503), "x"),
+            Error::Unavailable(_)
+        ));
+        assert!(matches!(
+            classify_error(false, Some(429), "x"),
+            Error::Unavailable(_)
+        ));
+        assert!(matches!(
+            classify_error(false, Some(599), "x"),
+            Error::Unavailable(_)
+        ));
+        assert!(matches!(
+            classify_error(false, Some(499), "x"),
+            Error::Other(_)
+        ));
         assert!(matches!(classify_error(false, None, "x"), Error::Other(_)));
     }
 
     #[test]
     fn s3_rejects_invalid_key_before_request() {
         for bad in ["../x", "/abs", "a/\nb.md"] {
-            assert!(matches!(validate_put_key(bad), Err(Error::InvalidKey(_))), "{bad}");
+            assert!(
+                matches!(validate_put_key(bad), Err(Error::InvalidKey(_))),
+                "{bad}"
+            );
             assert!(validate_object_key(bad).is_err(), "{bad}");
         }
     }
 
     #[test]
     fn s3_put_rejects_folder_key() {
-        assert!(matches!(validate_put_key("notes/"), Err(Error::InvalidKey(_))));
+        assert!(matches!(
+            validate_put_key("notes/"),
+            Err(Error::InvalidKey(_))
+        ));
         // object ops treat folder keys as NotFound (not objects)
-        assert!(matches!(validate_object_key("notes/"), Err(Error::NotFound(_))));
+        assert!(matches!(
+            validate_object_key("notes/"),
+            Err(Error::NotFound(_))
+        ));
     }
 
     #[test]

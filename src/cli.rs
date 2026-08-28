@@ -297,26 +297,30 @@ pub fn run_with_io(
             0
         }
         Command::Help => {
-            let _ = write!(out, "{}\n", Cli::command().render_help());
+            let _ = writeln!(out, "{}", Cli::command().render_help());
             0
         }
-        Command::Check { config: _c, verbose: _v } => {
-            match crate::check_store(store) {
-                Ok(()) => {
-                    let _ = writeln!(out, "check: ok");
-                    0
-                }
-                Err(crate::error::Error::Unauthorized(_)) => {
-                    let _ = writeln!(err, "check failed: credentials or permissions rejected");
-                    let _ = writeln!(err, "hint: check your credentials/bucket/region (expired keys, wrong region, bad bucket)");
-                    1
-                }
-                Err(e) => {
-                    let _ = writeln!(err, "check failed: {e}");
-                    1
-                }
+        Command::Check {
+            config: _c,
+            verbose: _v,
+        } => match crate::check_store(store) {
+            Ok(()) => {
+                let _ = writeln!(out, "check: ok");
+                0
             }
-        }
+            Err(crate::error::Error::Unauthorized(_)) => {
+                let _ = writeln!(err, "check failed: credentials or permissions rejected");
+                let _ = writeln!(
+                    err,
+                    "hint: check your credentials/bucket/region (expired keys, wrong region, bad bucket)"
+                );
+                1
+            }
+            Err(e) => {
+                let _ = writeln!(err, "check failed: {e}");
+                1
+            }
+        },
         Command::Status {
             vault,
             json,
@@ -363,9 +367,13 @@ pub fn run_with_io(
                 delete,
                 force_local,
                 force_remote,
-                ..Default::default()
             };
-            dispatch_plan(&vault, store, Mode::Push, &opts, dry_run, follow_symlinks, verbose, out, err)
+            let flags = PlanFlags {
+                dry_run,
+                follow_symlinks,
+                verbose,
+            };
+            dispatch_plan(&vault, store, Mode::Push, &opts, &flags, out, err)
         }
         Command::Pull {
             vault,
@@ -386,9 +394,13 @@ pub fn run_with_io(
                 delete,
                 force_local,
                 force_remote,
-                ..Default::default()
             };
-            dispatch_plan(&vault, store, Mode::Pull, &opts, dry_run, follow_symlinks, verbose, out, err)
+            let flags = PlanFlags {
+                dry_run,
+                follow_symlinks,
+                verbose,
+            };
+            dispatch_plan(&vault, store, Mode::Pull, &opts, &flags, out, err)
         }
     }
 }
@@ -409,12 +421,21 @@ fn print_walk_warnings(local: &crate::local::LocalFs, follow: bool, err: &mut dy
     }
 }
 
-/// Build a plan and dispatch push/pull execution. Exit codes (P1r-stub-exit,
-/// retired in Slice 6):
-/// - `0` all selected actions succeeded and no conflict rows;
-/// - `2` the plan contained any Conflict rows (non-conflict actions still
-///   execute);
-/// - `1` any transfer/fatal error.
+/// Push/pull value flags bundled so `dispatch_plan` stays under clippy's
+/// 7-argument limit (W18/B-L9) while keeping the dry-run/verbosity/symlink
+/// plumbing in one place.
+struct PlanFlags {
+    dry_run: bool,
+    follow_symlinks: bool,
+    verbose: u8,
+}
+
+/// Build a plan and dispatch push/pull execution.
+///
+/// Exit codes (P1r-stub-exit, retired in Slice 6): `0` all selected actions
+/// succeeded and no conflict rows; `2` the plan contained any Conflict rows
+/// (non-conflict actions still execute); `1` any transfer/fatal error.
+///
 /// With `--dry-run`: print the plan, mutate nothing, exit like status
 /// (2 if dirty/conflicts, else 0).
 fn dispatch_plan(
@@ -422,18 +443,20 @@ fn dispatch_plan(
     store: &dyn ObjectStore,
     mode: Mode,
     opts: &PlanOpts,
-    dry_run: bool,
-    follow_symlinks: bool,
-    verbose: u8,
+    flags: &PlanFlags,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
-    let local = crate::local::LocalFs::with_follow(vault, follow_symlinks);
+    let local = crate::local::LocalFs::with_follow(vault, flags.follow_symlinks);
     match crate::build_plan(&local, store, mode, opts) {
         Ok(plan) => {
-            print_walk_warnings(&local, follow_symlinks, err);
-            let _ = write!(out, "{}", crate::format_plan_human_verbose(&plan, verbose));
-            if dry_run {
+            print_walk_warnings(&local, flags.follow_symlinks, err);
+            let _ = write!(
+                out,
+                "{}",
+                crate::format_plan_human_verbose(&plan, flags.verbose)
+            );
+            if flags.dry_run {
                 if is_clean(&plan) { 0 } else { 2 }
             } else {
                 let report = crate::exec::execute_plan(&local, store, &plan, mode, opts);
@@ -485,25 +508,65 @@ fn cmd_config_path(cmd: &Command) -> Option<&Path> {
 /// `--vault` was left at its unset sentinel (see [`VAULT_UNSET`]).
 fn resolve_vault_from_config(cmd: Command, settings: &crate::config::Settings) -> Command {
     let want = settings.vault_root.clone();
-    if want == PathBuf::from(VAULT_UNSET) {
+    if want == Path::new(VAULT_UNSET) {
         return cmd;
     }
     match cmd {
-        Command::Status { vault, json, config, verbose, follow_symlinks }
-            if vault == PathBuf::from(VAULT_UNSET) =>
-        {
-            Command::Status { vault: want, json, config, verbose, follow_symlinks }
-        }
-        Command::Push { vault, delete, dry_run, force_local, force_remote, json, config, verbose, follow_symlinks }
-            if vault == PathBuf::from(VAULT_UNSET) =>
-        {
-            Command::Push { vault: want, delete, dry_run, force_local, force_remote, json, config, verbose, follow_symlinks }
-        }
-        Command::Pull { vault, delete, dry_run, force_local, force_remote, json, config, verbose, follow_symlinks }
-            if vault == PathBuf::from(VAULT_UNSET) =>
-        {
-            Command::Pull { vault: want, delete, dry_run, force_local, force_remote, json, config, verbose, follow_symlinks }
-        }
+        Command::Status {
+            vault,
+            json,
+            config,
+            verbose,
+            follow_symlinks,
+        } if vault == Path::new(VAULT_UNSET) => Command::Status {
+            vault: want,
+            json,
+            config,
+            verbose,
+            follow_symlinks,
+        },
+        Command::Push {
+            vault,
+            delete,
+            dry_run,
+            force_local,
+            force_remote,
+            json,
+            config,
+            verbose,
+            follow_symlinks,
+        } if vault == Path::new(VAULT_UNSET) => Command::Push {
+            vault: want,
+            delete,
+            dry_run,
+            force_local,
+            force_remote,
+            json,
+            config,
+            verbose,
+            follow_symlinks,
+        },
+        Command::Pull {
+            vault,
+            delete,
+            dry_run,
+            force_local,
+            force_remote,
+            json,
+            config,
+            verbose,
+            follow_symlinks,
+        } if vault == Path::new(VAULT_UNSET) => Command::Pull {
+            vault: want,
+            delete,
+            dry_run,
+            force_local,
+            force_remote,
+            json,
+            config,
+            verbose,
+            follow_symlinks,
+        },
         other => other,
     }
 }
@@ -511,7 +574,10 @@ fn resolve_vault_from_config(cmd: Command, settings: &crate::config::Settings) -
 /// True when a command mutates or probes a real store and therefore must not
 /// silently run (or delete) against the in-memory mock (A-M2/B-L5, W5).
 fn requires_real_store(cmd: &Command) -> bool {
-    matches!(cmd, Command::Push { .. } | Command::Pull { .. } | Command::Check { .. })
+    matches!(
+        cmd,
+        Command::Push { .. } | Command::Pull { .. } | Command::Check { .. }
+    )
 }
 
 /// Stable command name used in the no-store refusal message.
@@ -672,7 +738,10 @@ mod tests {
     fn parse_status_default_vault() {
         let mut args = a();
         args.push("status".into());
-        assert_eq!(parse_args(&args).unwrap(), Command::status(PathBuf::from(".")));
+        assert_eq!(
+            parse_args(&args).unwrap(),
+            Command::status(PathBuf::from("."))
+        );
     }
 
     #[test]
@@ -682,7 +751,10 @@ mod tests {
         args.push("--vault".into());
         args.push("/v".into());
         args.push("status".into());
-        assert_eq!(parse_args(&args).unwrap(), Command::status(PathBuf::from("/v")));
+        assert_eq!(
+            parse_args(&args).unwrap(),
+            Command::status(PathBuf::from("/v"))
+        );
     }
 
     #[test]
@@ -691,7 +763,10 @@ mod tests {
         let mut args = a();
         args.push("status".into());
         args.push("--vault=/v".into());
-        assert_eq!(parse_args(&args).unwrap(), Command::status(PathBuf::from("/v")));
+        assert_eq!(
+            parse_args(&args).unwrap(),
+            Command::status(PathBuf::from("/v"))
+        );
     }
 
     #[test]
@@ -700,7 +775,10 @@ mod tests {
         let mut args = a();
         args.push("status".into());
         args.push("--vault=-foo".into());
-        assert_eq!(parse_args(&args).unwrap(), Command::status(PathBuf::from("-foo")));
+        assert_eq!(
+            parse_args(&args).unwrap(),
+            Command::status(PathBuf::from("-foo"))
+        );
     }
 
     #[test]
@@ -777,7 +855,9 @@ mod tests {
         args.push("push".into());
         args.push("--follow-symlinks".into());
         match parse_args(&args).unwrap() {
-            Command::Push { follow_symlinks, .. } => assert!(follow_symlinks),
+            Command::Push {
+                follow_symlinks, ..
+            } => assert!(follow_symlinks),
             other => panic!("expected Push, got {other:?}"),
         }
         // also accepted before the subcommand (global)
@@ -785,7 +865,9 @@ mod tests {
         args.push("--follow-symlinks".into());
         args.push("status".into());
         match parse_args(&args).unwrap() {
-            Command::Status { follow_symlinks, .. } => assert!(follow_symlinks),
+            Command::Status {
+                follow_symlinks, ..
+            } => assert!(follow_symlinks),
             other => panic!("expected Status, got {other:?}"),
         }
     }
@@ -933,13 +1015,19 @@ mod tests {
         let err =
             os_args_to_strings(vec![std::ffi::OsString::from("vaultsync"), offending]).unwrap_err();
         assert!(err.contains("UTF-8"), "msg: {err}");
-        assert!(err.contains(&expected_debug), "offending bytes not shown: {err}");
+        assert!(
+            err.contains(&expected_debug),
+            "offending bytes not shown: {err}"
+        );
     }
 
     #[test]
     fn cli_args_valid_utf8_roundtrip() {
         let args = os_args_to_strings(vec!["vaultsync".into(), "status".into()]).unwrap();
-        assert_eq!(parse_args(&args).unwrap(), Command::status(PathBuf::from(".")));
+        assert_eq!(
+            parse_args(&args).unwrap(),
+            Command::status(PathBuf::from("."))
+        );
     }
 
     // --- dispatch ---
@@ -1112,8 +1200,14 @@ mod tests {
     fn requires_real_store_predicate() {
         // W5 (A-M2/B-L5): push/pull/check need a configured store; status and
         // help/version run against the mock.
-        assert!(requires_real_store(&Command::push(PathBuf::from("."), false)));
-        assert!(requires_real_store(&Command::pull(PathBuf::from("."), false)));
+        assert!(requires_real_store(&Command::push(
+            PathBuf::from("."),
+            false
+        )));
+        assert!(requires_real_store(&Command::pull(
+            PathBuf::from("."),
+            false
+        )));
         assert!(requires_real_store(&Command::check()));
         assert!(!requires_real_store(&Command::status(PathBuf::from("."))));
         assert!(!requires_real_store(&Command::Help));
@@ -1131,7 +1225,12 @@ mod tests {
         let settings = no_store_settings(dir.path());
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_with_settings(Command::pull(dir.path().into(), true), &settings, &mut out, &mut err);
+        let code = run_with_settings(
+            Command::pull(dir.path().into(), true),
+            &settings,
+            &mut out,
+            &mut err,
+        );
         let err = String::from_utf8(err).unwrap();
         assert_eq!(code, 1);
         assert!(
@@ -1157,7 +1256,10 @@ mod tests {
             err.to_lowercase().contains("store"),
             "expected store refusal: {err}"
         );
-        assert!(!String::from_utf8(out).unwrap().contains("check: ok"), "must not be a mock green check");
+        assert!(
+            !String::from_utf8(out).unwrap().contains("check: ok"),
+            "must not be a mock green check"
+        );
     }
 
     #[test]
@@ -1223,7 +1325,10 @@ mod tests {
         store.put_from("c.md", &mut cursor, 2, Some(ms)).unwrap();
         let (code, out, _) = run(Command::push(dir.path().into(), false), &store);
         assert_eq!(code, 2, "conflict -> exit 2");
-        assert!(out.lines().any(|l| l.starts_with("*  c.md")), "conflict row: {out}");
+        assert!(
+            out.lines().any(|l| l.starts_with("*  c.md")),
+            "conflict row: {out}"
+        );
         // the conflicting key is NOT transferred (remote unchanged)
         assert_eq!(store.head("c.md").unwrap().size, 2);
     }
@@ -1244,7 +1349,9 @@ mod tests {
     fn run_push_delete_removes_remote_exit_0() {
         let store = MemoryStore::new();
         let mut cursor = std::io::Cursor::new(b"x".to_vec());
-        store.put_from("gone.md", &mut cursor, 1, Some(100)).unwrap();
+        store
+            .put_from("gone.md", &mut cursor, 1, Some(100))
+            .unwrap();
         let dir = TempDir::new("vaultsync-cli-test");
         let (code, out, _) = run(Command::push(dir.path().into(), true), &store);
         assert_eq!(code, 0);

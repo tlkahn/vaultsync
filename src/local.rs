@@ -189,7 +189,10 @@ impl LocalFs {
     pub fn tmp_path_for(&self, key: &str) -> Result<PathBuf, Error> {
         let path = key_to_local_path(&self.root, key)?;
         let parent = path.parent().ok_or_else(|| {
-            Error::Other(format!("tmp_path_for has no parent dir: {}", path.display()))
+            Error::Other(format!(
+                "tmp_path_for has no parent dir: {}",
+                path.display()
+            ))
         })?;
         self.ensure_locality(parent)?;
         std::fs::create_dir_all(parent)?;
@@ -199,7 +202,12 @@ impl LocalFs {
 
     /// Commit a temp file written by a download to its final path, applying
     /// the remote mtime (atomic rename; temp removed on failure).
-    pub fn finalize_write(&self, key: &str, tmp: &Path, mtime_ms: Option<u64>) -> Result<(), Error> {
+    pub fn finalize_write(
+        &self,
+        key: &str,
+        tmp: &Path,
+        mtime_ms: Option<u64>,
+    ) -> Result<(), Error> {
         let path = key_to_local_path(&self.root, key)?;
         let result = (|| -> Result<(), Error> {
             let f = std::fs::File::open(tmp)?;
@@ -296,7 +304,10 @@ impl LocalFs {
     ) -> Result<(), Error> {
         let path = key_to_local_path(&self.root, key)?;
         let parent = path.parent().ok_or_else(|| {
-            Error::Other(format!("write_atomic has no parent dir: {}", path.display()))
+            Error::Other(format!(
+                "write_atomic has no parent dir: {}",
+                path.display()
+            ))
         })?;
         // Refuse to write outside the canonicalized vault root even when a
         // parent component has been swapped for an out-of-vault symlink.
@@ -437,7 +448,9 @@ fn set_file_mtime_ms(f: &std::fs::File, ms: u64) -> Result<(), Error> {
 
 /// Whether a directory currently has no entries.
 fn is_empty_dir(d: &Path) -> bool {
-    std::fs::read_dir(d).map(|mut rd| rd.next().is_none()).unwrap_or(false)
+    std::fs::read_dir(d)
+        .map(|mut rd| rd.next().is_none())
+        .unwrap_or(false)
 }
 
 /// Pre-order accumulate of all directories under `root` (root included).
@@ -539,10 +552,7 @@ fn handle_followed_symlink(
         Err(e) => return Err(e.into()),
         Ok(t) => t,
     };
-    let root_canon = match std::fs::canonicalize(root) {
-        Ok(r) => r,
-        Err(e) => return Err(e.into()),
-    };
+    let root_canon = std::fs::canonicalize(root)?;
     if !target.starts_with(&root_canon) {
         report.warnings.push(format!(
             "skipping {} (symlink escapes vault root)",
@@ -875,7 +885,17 @@ mod tests {
         let mut out = Vec::new();
         let mut report = WalkReport::default();
         let mut visited = std::collections::HashSet::new();
-        walk(&missing_sub, &dir, &mut out, &WalkOpts { follow_symlinks: false }, &mut report, &mut visited).unwrap();
+        walk(
+            &missing_sub,
+            &dir,
+            &mut out,
+            &WalkOpts {
+                follow_symlinks: false,
+            },
+            &mut report,
+            &mut visited,
+        )
+        .unwrap();
         assert!(out.is_empty());
     }
 
@@ -1035,7 +1055,10 @@ mod tests {
         std::fs::write(dir.join("a.md"), "12345").unwrap();
         let fs = LocalFs::new(dir.path());
         assert!(fs.open_verified("a.md", 5, None, 1000).is_ok());
-        assert!(fs.open_verified("a.md", 6, None, 1000).is_err(), "size mismatch not caught");
+        assert!(
+            fs.open_verified("a.md", 6, None, 1000).is_err(),
+            "size mismatch not caught"
+        );
     }
 
     #[test]
@@ -1050,7 +1073,8 @@ mod tests {
         {
             let fh = std::fs::File::open(&f).unwrap();
             let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis(base);
-            fh.set_times(std::fs::FileTimes::new().set_modified(t)).unwrap();
+            fh.set_times(std::fs::FileTimes::new().set_modified(t))
+                .unwrap();
         }
         let fs = LocalFs::new(dir.path());
         assert!(fs.open_verified("a.md", 5, Some(base + 3000), 5000).is_ok());
@@ -1107,8 +1131,14 @@ mod tests {
         let fs = LocalFs::new(dir.path());
         let mut r = std::io::Cursor::new(b"tiny".to_vec());
         let err = fs.write_atomic("a.md", &mut r, 100, None).unwrap_err();
-        assert!(format!("{err}").to_lowercase().contains("short"), "err: {err}");
-        assert!(!dir.join("a.md").exists(), "partial file visible at final path");
+        assert!(
+            format!("{err}").to_lowercase().contains("short"),
+            "err: {err}"
+        );
+        assert!(
+            !dir.join("a.md").exists(),
+            "partial file visible at final path"
+        );
     }
 
     #[cfg(unix)]
@@ -1245,7 +1275,10 @@ mod tests {
         let fs = LocalFs::with_follow(dir.path(), true);
         let (ents, _) = fs.list_report().unwrap();
         let keys: Vec<String> = ents.iter().map(|e| e.key.clone()).collect();
-        assert!(keys.iter().any(|k| k == "lnk/"), "followed dir listed: {keys:?}");
+        assert!(
+            keys.iter().any(|k| k == "lnk/"),
+            "followed dir listed: {keys:?}"
+        );
         assert!(
             keys.iter().any(|k| k == "lnk/f.md"),
             "followed child listed: {keys:?}"
@@ -1266,10 +1299,16 @@ mod tests {
         let fs = LocalFs::with_follow(dir.path(), true);
         let (ents, report) = fs.list_report().unwrap();
         let keys: Vec<String> = ents.iter().map(|e| e.key.clone()).collect();
-        assert!(!keys.iter().any(|k| k == "escape"), "escaping target emitted: {keys:?}");
+        assert!(
+            !keys.iter().any(|k| k == "escape"),
+            "escaping target emitted: {keys:?}"
+        );
         assert!(!keys.iter().any(|k| k.starts_with("escape/")));
         assert!(
-            report.warnings.iter().any(|w| w.contains("escape") && w.contains("vault root")),
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("escape") && w.contains("vault root")),
             "warning missing: {:?}",
             report.warnings
         );
@@ -1291,8 +1330,10 @@ mod tests {
         assert!(keys.iter().any(|k| k == "a/leaf.md"));
         assert!(keys.iter().any(|k| k == "a/back/"));
         // a/back/back must NOT reappear (cycle cut)
-        assert!(!keys.iter().any(|k| k == "a/back/back/"), "cycle not cut: {keys:?}");
+        assert!(
+            !keys.iter().any(|k| k == "a/back/back/"),
+            "cycle not cut: {keys:?}"
+        );
         assert!(keys.len() < 8, "unexpected expansion: {keys:?}");
     }
 }
-

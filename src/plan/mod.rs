@@ -217,7 +217,7 @@ fn path_collision_keys(keys: &[&str]) -> std::collections::BTreeSet<String> {
     let mut collided = std::collections::BTreeSet::new();
     for k in keys {
         if k.ends_with('/') {
-            let base = &k[..k.len() - 1];
+            let base = k.strip_suffix('/').unwrap();
             if keys.contains(&base) {
                 collided.insert(k.to_string());
                 collided.insert(base.to_string());
@@ -293,9 +293,7 @@ fn resolve(
             Mode::Pull => (Download, reason::REMOTE_NEWER),
         },
         Delta::Conflict => force_conflict(opts, mode, reason::CONFLICT_MTIME_SIZE),
-        Delta::ConflictUnknownMtime => {
-            force_conflict(opts, mode, reason::CONFLICT_UNKNOWN_MTIME)
-        }
+        Delta::ConflictUnknownMtime => force_conflict(opts, mode, reason::CONFLICT_UNKNOWN_MTIME),
     }
 }
 
@@ -378,7 +376,6 @@ pub fn case_collision_keys(
 fn fold_key(key: &str) -> String {
     key.strip_suffix('/').unwrap_or(key).to_lowercase()
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -955,7 +952,10 @@ mod tests {
             &opts(),
         );
         let acts: Vec<_> = p.actions.iter().map(|a| (a.key.as_str(), a.kind)).collect();
-        assert!(acts.iter().any(|(k, kind)| *k == "K" && *kind == ActionKind::Conflict));
+        assert!(
+            acts.iter()
+                .any(|(k, kind)| *k == "K" && *kind == ActionKind::Conflict)
+        );
     }
 
     #[test]
@@ -977,8 +977,14 @@ mod tests {
         // Status/Push/Pull all Conflict; forces do not resolve type collisions.
         for mode in [Mode::Status, Mode::Push, Mode::Pull] {
             for force in [
-                PlanOpts { force_local: true, ..Default::default() },
-                PlanOpts { force_remote: true, ..Default::default() },
+                PlanOpts {
+                    force_local: true,
+                    ..Default::default()
+                },
+                PlanOpts {
+                    force_remote: true,
+                    ..Default::default()
+                },
                 PlanOpts {
                     force_local: true,
                     force_remote: true,
@@ -1156,7 +1162,11 @@ mod tests {
         assert!(c.contains("notes/"), "c: {c:?}");
 
         let no = vec![folder("A"), file("a.md", 1, Some(1))];
-        assert!(case_collision_keys(&no, &[]).is_empty(), "folded distinct: {:?}", no);
+        assert!(
+            case_collision_keys(&no, &[]).is_empty(),
+            "folded distinct: {:?}",
+            no
+        );
     }
 
     #[test]
@@ -1168,4 +1178,3 @@ mod tests {
         assert!(c.is_empty(), "c: {c:?}");
     }
 }
-

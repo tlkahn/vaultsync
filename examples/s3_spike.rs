@@ -19,8 +19,8 @@
 //! Credentials come from the ambient AWS default chain (env, shared
 //! credentials file, profile). Probe objects are tiny and removed after.
 
-use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
+use aws_sdk_s3::primitives::ByteStream;
 
 const MTIME_KEY: &str = "vaultsync-mtime";
 
@@ -53,7 +53,14 @@ async fn probe_put_head_get_delete(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let key = format!("{prefix}spike-probe.txt");
     // 1. put
-    put_bytes(client, bucket, &key, b"hello spike", Some(1_700_000_000_123)).await?;
+    put_bytes(
+        client,
+        bucket,
+        &key,
+        b"hello spike",
+        Some(1_700_000_000_123),
+    )
+    .await?;
     println_ok("put", &format!("wrote {key}"));
     // head
     let head = client.head_object().bucket(bucket).key(&key).send().await?;
@@ -80,13 +87,13 @@ async fn probe_put_head_get_delete(
     assert_eq!(body.as_ref(), b"hello spike", "get body mismatch");
     println_ok("get", &format!("read {key} -> {:?}", body.as_ref()));
     // delete
-    client.delete_object().bucket(bucket).key(&key).send().await?;
-    let after = client
-        .head_object()
+    client
+        .delete_object()
         .bucket(bucket)
         .key(&key)
         .send()
-        .await;
+        .await?;
+    let after = client.head_object().bucket(bucket).key(&key).send().await;
     assert!(after.is_err(), "head after delete should fail");
     println_ok("delete", &format!("removed {key}"));
     Ok(())
@@ -105,7 +112,7 @@ async fn probe_prefix_isolation(
     let l1 = client
         .list_objects_v2()
         .bucket(bucket)
-        .prefix(&*p1)
+        .prefix(p1)
         .send()
         .await?;
     let keys1: Vec<String> = l1
@@ -114,7 +121,7 @@ async fn probe_prefix_isolation(
         .map(|o| o.key().map(|k| k.to_string()).unwrap_or_default())
         .collect();
     assert!(
-        keys1.iter().all(|k| k.starts_with(&p1)),
+        keys1.iter().all(|k| k.starts_with(p1)),
         "prefix isolation broken: {keys1:?}"
     );
     assert_eq!(keys1.len(), 1, "p1 count: {keys1:?}");
@@ -122,13 +129,13 @@ async fn probe_prefix_isolation(
     client
         .delete_object()
         .bucket(bucket)
-        .key(&format!("{p1}x.txt"))
+        .key(format!("{p1}x.txt"))
         .send()
         .await?;
     client
         .delete_object()
         .bucket(bucket)
-        .key(&format!("{p2}x.txt"))
+        .key(format!("{p2}x.txt"))
         .send()
         .await?;
     Ok(())
@@ -166,7 +173,11 @@ async fn probe_paginated_list(
     let mut count = 0usize;
     let mut marker: Option<String> = None;
     loop {
-        let mut req = client.list_objects_v2().bucket(bucket).prefix(prefix).max_keys(1000);
+        let mut req = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(prefix)
+            .max_keys(1000);
         if let Some(m) = marker.as_deref() {
             req = req.continuation_token(m);
         }
@@ -187,7 +198,7 @@ async fn probe_paginated_list(
         inflight.spawn(async move {
             c.delete_object()
                 .bucket(&b)
-                .key(&format!("{p}obj-{i:05}.dat"))
+                .key(format!("{p}obj-{i:05}.dat"))
                 .send()
                 .await
                 .map_err(|e| e.to_string())?;
@@ -206,10 +217,7 @@ async fn probe_paginated_list(
     Ok(())
 }
 
-async fn probe_path_style(
-    client: &Client,
-    bucket: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn probe_path_style(client: &Client, bucket: &str) -> Result<(), Box<dyn std::error::Error>> {
     // item 4: path-style toggle. The client was built with force_path_style;
     // a put/list under a unique prefix must succeed.
     let prefix = "vs-spike-pathstyle/";
@@ -217,7 +225,7 @@ async fn probe_path_style(
     let l = client
         .list_objects_v2()
         .bucket(bucket)
-        .prefix(&*prefix)
+        .prefix(prefix)
         .send()
         .await?;
     let n = l.contents().len();
@@ -226,7 +234,7 @@ async fn probe_path_style(
     client
         .delete_object()
         .bucket(bucket)
-        .key(&format!("{prefix}f.txt"))
+        .key(format!("{prefix}f.txt"))
         .send()
         .await?;
     Ok(())
@@ -234,17 +242,21 @@ async fn probe_path_style(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let bucket = std::env::var("VS_SPIKE_BUCKET")
-        .map_err(|_| "VS_SPIKE_BUCKET is required".to_string())?;
+    let bucket =
+        std::env::var("VS_SPIKE_BUCKET").map_err(|_| "VS_SPIKE_BUCKET is required".to_string())?;
     let region = std::env::var("VS_SPIKE_REGION").unwrap_or_else(|_| "us-west-1".to_string());
-    let prefix_override = std::env::var("VS_SPIKE_PREFIX").unwrap_or_else(|_| "myvault/".to_string());
+    let prefix_override =
+        std::env::var("VS_SPIKE_PREFIX").unwrap_or_else(|_| "myvault/".to_string());
     let endpoint = std::env::var("VS_SPIKE_ENDPOINT").ok();
     let path_style = std::env::var("VS_SPIKE_PATH_STYLE")
         .map(|v| v == "1")
         .unwrap_or(false);
 
     // item 6: default AWS credential chain + region via aws-config.
-    println!("== spike: region={region} endpoint={:?} path_style={path_style} ==", endpoint);
+    println!(
+        "== spike: region={region} endpoint={:?} path_style={path_style} ==",
+        endpoint
+    );
     let base = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let mut b = aws_sdk_s3::config::Builder::from(&base)
         .region(aws_sdk_s3::config::Region::new(region))

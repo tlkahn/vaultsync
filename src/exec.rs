@@ -14,11 +14,10 @@
 //!   a per-key error, the run continues, and exit is non-zero at dispatch;
 //! - per-key failures are isolated; the report collects `(key, error)`.
 
-
+use crate::error::Error;
 use crate::local::LocalFs;
 use crate::plan::{ActionKind, Mode, Plan};
 use crate::store::ObjectStore;
-use crate::error::Error;
 
 /// Outcome of an execution run.
 #[derive(Debug, Default, PartialEq)]
@@ -56,7 +55,11 @@ pub fn execute_plan(
     }
 
     // Pass 1: downloads (pull).
-    for a in plan.actions.iter().filter(|a| a.kind == ActionKind::Download) {
+    for a in plan
+        .actions
+        .iter()
+        .filter(|a| a.kind == ActionKind::Download)
+    {
         match exec_download(local, store, a, opts.mtime_tolerance_ms) {
             Ok(()) => rep.executed += 1,
             Err(e) => fail(&mut rep, &a.key, e),
@@ -76,7 +79,11 @@ pub fn execute_plan(
     // already-gone key achieves the goal state, so NotFound is normalized to a
     // success here (S3 delete is idempotent; LocalFs.delete_file still reports
     // NotFound for a missing key, and the executor absorbs it).
-    for a in plan.actions.iter().filter(|a| a.kind == ActionKind::DeleteRemote) {
+    for a in plan
+        .actions
+        .iter()
+        .filter(|a| a.kind == ActionKind::DeleteRemote)
+    {
         match store.delete(&a.key) {
             Ok(()) => rep.executed += 1,
             Err(Error::NotFound(_)) => rep.executed += 1,
@@ -84,7 +91,11 @@ pub fn execute_plan(
         }
     }
     let mut deleted_local = false;
-    for a in plan.actions.iter().filter(|a| a.kind == ActionKind::DeleteLocal) {
+    for a in plan
+        .actions
+        .iter()
+        .filter(|a| a.kind == ActionKind::DeleteLocal)
+    {
         match local.delete_file(&a.key) {
             Ok(()) => {
                 rep.executed += 1;
@@ -196,7 +207,7 @@ fn exec_upload(
 mod tests {
     use super::*;
     use crate::entity::Entity;
-    use crate::plan::{PlanOpts};
+    use crate::plan::PlanOpts;
     use crate::store::mock::MemoryStore;
     use crate::testutil::TempDir;
     use std::sync::Mutex;
@@ -400,7 +411,10 @@ mod tests {
         let put = log.iter().position(|l| l == "put_from:a.md");
         let del = log.iter().position(|l| l == "delete:gone.md");
         assert!(put.is_some() && del.is_some(), "log: {log:?}");
-        assert!(put.unwrap() < del.unwrap(), "delete ran before transfer: {log:?}");
+        assert!(
+            put.unwrap() < del.unwrap(),
+            "delete ran before transfer: {log:?}"
+        );
     }
 
     #[test]
@@ -435,7 +449,10 @@ mod tests {
         let store = MemoryStore::new();
         let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default()).unwrap();
         // File grows between plan (walks size 3) and open -> per-key failure.
-        let mut f = std::fs::OpenOptions::new().append(true).open(dir.join("a.md")).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("a.md"))
+            .unwrap();
         use std::io::Write as _;
         f.write_all(b"defghijklmnop").unwrap();
         drop(f);
@@ -446,7 +463,10 @@ mod tests {
             rep.failed
         );
         // a.md must not be uploaded at all.
-        assert!(matches!(store.head("a.md").unwrap_err(), Error::NotFound(_)));
+        assert!(matches!(
+            store.head("a.md").unwrap_err(),
+            Error::NotFound(_)
+        ));
         // the stable key still uploads (isolation).
         assert!(store.head("ok.md").is_ok());
         assert_eq!(rep.executed, 1, "only ok.md executed");
@@ -545,7 +565,11 @@ mod tests {
         let local = LocalFs::new(dir.path());
         let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
         let act = plan.actions.iter().find(|a| a.key == "a.md").unwrap();
-        assert_eq!(act.kind, ActionKind::Download, "expected remote_newer download");
+        assert_eq!(
+            act.kind,
+            ActionKind::Download,
+            "expected remote_newer download"
+        );
         assert!(act.local.is_some());
         // user edits the local file after planning (size changes)
         std::fs::write(&p, "user-edit-since-plan-123").unwrap();
@@ -647,15 +671,18 @@ mod tests {
             ..Default::default()
         };
         let plan = crate::build_plan(&local, &store, Mode::Pull, &opts).unwrap();
-        assert!(plan
-            .actions
-            .iter()
-            .any(|a| a.key == "n/gone.md" && a.kind == ActionKind::DeleteLocal));
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| a.key == "n/gone.md" && a.kind == ActionKind::DeleteLocal)
+        );
         // lock the subdir after planning so the empty-dir cleanup pass errors
-        std::fs::set_permissions(dir.join("n/locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(dir.join("n/locked"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
         let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &opts);
         // restore perms so TempDir drop can remove the tree
-        std::fs::set_permissions(dir.join("n/locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(dir.join("n/locked"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
         assert!(
             rep.warnings
                 .iter()
@@ -698,7 +725,10 @@ mod tests {
         let store = MemoryStore::new();
         let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default()).unwrap();
         // grow bad.md after planning
-        let mut f = std::fs::OpenOptions::new().append(true).open(dir.join("bad.md")).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("bad.md"))
+            .unwrap();
         use std::io::Write as _;
         f.write_all(b"aaaaaaaaaa").unwrap();
         drop(f);
@@ -738,7 +768,10 @@ mod tests {
         assert_eq!(rep.executed, 0);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new());
         // no upload of a.md, no download of b.md
-        assert!(matches!(store.head("a.md").unwrap_err(), Error::NotFound(_)));
+        assert!(matches!(
+            store.head("a.md").unwrap_err(),
+            Error::NotFound(_)
+        ));
         assert!(!dir.join("b.md").exists());
         assert!(store.head("b.md").is_ok());
         assert!(dir.join("a.md").exists());
