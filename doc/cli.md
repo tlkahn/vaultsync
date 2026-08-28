@@ -13,7 +13,6 @@ vaultsync [global flags] <command> [command flags]
 | `--config <path>` | config file (default: `./.vaultsync.toml` then `~/.config/vaultsync/config.toml`) |
 | `--vault <path>` | vault root override |
 | `--follow-symlinks` | follow symlinks below the vault root (off by default; out-of-vault targets are skipped with a warning) |
-| `--dry-run` | plan only; no mutations (alias of `status` behavior when passed to push/pull) |
 | `-v, --verbose` | repeatable debug noise on stderr |
 | `--json` | machine-readable stdout (**Phase 3**: parses, but dispatch rejects it as not implemented) |
 | `-y, --yes` | skip confirmation for destructive flags (**Phase 3**: rejected as unknown today) |
@@ -27,7 +26,7 @@ Show diff between local vault and remote prefix.
 
 ```text
 vaultsync status
-vaultsync status --json
+vaultsync status --json   # Phase 3: parses, but dispatch rejects it as not implemented
 ```
 
 Exit codes:
@@ -44,7 +43,7 @@ Download remote-newer and local-missing paths.
 vaultsync pull
 vaultsync pull --delete          # remove local extras
 vaultsync pull --force-remote    # conflicts prefer remote
-vaultsync pull --dry-run
+vaultsync pull --dry-run         # plan only, no mutations (push/pull only, not a global flag)
 ```
 
 ### `vaultsync push`
@@ -55,7 +54,7 @@ Upload local-newer and remote-missing paths.
 vaultsync push
 vaultsync push --delete          # remove remote extras
 vaultsync push --force-local
-vaultsync push --dry-run
+vaultsync push --dry-run         # plan only, no mutations (push/pull only, not a global flag)
 ```
 
 ### `vaultsync check`
@@ -182,16 +181,26 @@ shows followed-symlink rows as live inventory. Dir-symlink children transfer
 normally; a `pull` write through a symlink destination stays refused (fail
 closed).
 
+**Dir-symlink alias footgun:** a dir symlink whose target is inside the vault
+double-lists the target's content under both keys (push uploads the same
+bytes twice; pull writes both keys). The walk warns on every such alias
+(e.g. `following linkdir duplicates realdir/`); both copies are still listed
+and synced - dedup is deliberately not performed, because which copy would
+survive would depend on directory enumeration order.
+
 **Local deletes re-verify freshness.** A `pull --delete` re-stats a local file
 before removing it (size + mtime within `transfer.mtime_tolerance_ms`); a
 file that changed since the plan is left on disk with a per-key error,
 symmetric to the upload/download freshness guards. `DeleteRemote` (push
-`--delete`) has no head-before-delete re-check: the list-to-delete gap is an
-accepted cross-machine race on the store side. The guarded delete is a
-check-then-act stat followed by a by-path `remove_file` (std has no
-fd-based delete), so a leaf swapped in the window between the stat and the
-unlink is still removed - the same residual class as the download note;
-fd-based delete is a post-v1 item (A-L3).
+`--delete`) re-verifies the remote object with a head-before-delete check
+(size only): an object that changed size since the plan is left in place
+with a per-key error. Same-size replacement between list and delete remains
+a documented residual (the list-to-delete gap is an accepted cross-machine
+race on the store side). The guarded delete is a check-then-act stat
+followed by a by-path `remove_file` (std has no fd-based delete), so a leaf
+swapped in the window between the stat and the unlink is still removed - the
+same residual class as the download note; fd-based delete is a post-v1 item
+(A-L3).
 
 **Planner identity is codepoint-exact (no NFC fold).** APFS folds NFD/NFC (a
 note named in decomposed form appears under its composed name), while S3
@@ -252,7 +261,7 @@ vaultsync pull --delete
 vaultsync pull && vaultsync push
 
 # gate commit on clean remote mirror
-vaultsync status --json | jq -e '.stats.upload + .stats.download == 0'
+vaultsync status; test $? -eq 0
 ```
 
 (`--yes` is a Phase 3 flag and is rejected today, so the delete examples

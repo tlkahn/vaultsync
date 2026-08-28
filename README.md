@@ -74,6 +74,11 @@ action a plan - or delete files - against a non-existent store).
   `status` shows them as live inventory rows. Dir-symlink children transfer
   normally; a `pull` write through a symlink destination stays refused (fail
   closed).
+- **Dir-symlink alias footgun.** A dir symlink whose target is inside the
+  vault double-lists the target's content under both keys (push uploads the
+  same bytes twice; pull writes both keys). The walk warns on every such
+  alias; both copies are still listed and synced (dedup would make the
+  surviving key set depend on directory enumeration order).
 - **Pull overwrite resets permission bits.** A download writes a fresh temp
   file (`0666 & umask`) and renames it over the destination, so a
   previously-`0600` local note returns as `0644`. v1 has no permission model;

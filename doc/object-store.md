@@ -66,7 +66,7 @@ Practical options (pick in Phase 2 spike, not earlier):
 | list | `ListObjectsV2` paginated; synthesize folder prefixes from `CommonPrefixes` if delimiter `/` is used, or derive from keys |
 | head | `HeadObject` |
 | get_to | `GetObject` (stream body into the caller's writer) |
-| put_from | `PutObject` (multipart only if size > threshold; can defer multipart to v1.1) |
+| put_from | `PutObject` single-PUT via `ByteStream::from_path` (buffered to a disk temp, never a `size`-sized memory buffer); 5 GiB ceiling. Multipart is a post-v1 item. |
 | delete | `DeleteObject` (batch delete later) |
 
 Delete is **idempotent-friendly** (PR2 A-M3/B-L6): deleting an already-absent
@@ -82,7 +82,15 @@ Download to disk or re-upload (R4-L4/W42).
 Zero-byte marker objects at the exact store prefix (e.g. an S3-console
 "Make Folder" marker that strips to an empty vault-relative key) are ignored;
 objects whose keys end in `/` (some tools write content into `dir/` markers)
-are invisible to sync in v1 (their trailing `/` is not a vault file key).
+are invisible to sync in v1 (their trailing `/` is not a vault file key) - a
+non-zero-size `*/` key surfaces a warning instead of being silently dropped
+(W70).
+
+Partial listings fail closed (W61): a provider that reports a truncated page
+without a continuation token is refused loudly - a partial listing would be
+indistinguishable from a complete one, and `pull --delete` would classify
+genuinely-remote files missing from the partial page as local extras and
+delete them locally.
 
 ### Metadata
 
