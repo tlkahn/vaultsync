@@ -269,6 +269,30 @@ fn temp_upload_path() -> PathBuf {
     std::env::temp_dir().join(format!("vaultsync-upload-{}-{n}", std::process::id()))
 }
 
+/// Create the upload temp buffer file. Owner-only `0o600` perms (W14/A-L1/
+/// B-L1) and `create_new` (no reuse of an existing file, killing the
+/// predictable-name race). On non-unix it is plain `create_new`.
+fn create_temp_upload_file() -> Result<(PathBuf, std::fs::File), Error> {
+    let tmp = temp_upload_path();
+    #[cfg(unix)]
+    let f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(Error::Io)?
+    };
+    #[cfg(not(unix))]
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(Error::Io)?;
+    Ok((tmp, f))
+}
+
 impl ObjectStore for S3Store {
     fn list(&self, prefix: &str) -> Result<Vec<Entity>, Error> {
         let raw = self.list_prefix_objects(prefix)?;
@@ -368,10 +392,9 @@ impl ObjectStore for S3Store {
         let fk = full_key(&self.prefix, key);
 
         // Buffer the reader to a temp file on disk (never a size-sized Vec),
-        // then stream that file to S3.
-        let tmp = temp_upload_path();
+        // then stream that file to S3. Owner-only perms + create_new (W14).
+        let (tmp, mut f) = create_temp_upload_file()?;
         let write_res = (|| -> Result<(), Error> {
-            let mut f = std::fs::File::create(&tmp)?;
             let copied = std::io::copy(&mut r.take(size), &mut f)?;
             if copied != size {
                 return Err(Error::Other(format!(
@@ -490,6 +513,18 @@ mod tests {
         let ents = convert_listed(vec![("notes/a.md".to_string(), 1, None)]);
         assert_eq!(ents.len(), 2);
         assert!(ents.iter().any(|e| e.key == "notes/" && e.is_folder()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn put_from_temp_file_is_owner_only() {
+        // W14/A-L1/B-L1: the upload temp buffer is created 0600 (owner-only),
+        // not the default 0666 & umask.
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, _f) = create_temp_upload_file().unwrap();
+        let mode = std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "upload temp perms must be 0600, got {mode:o}");
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
