@@ -127,6 +127,7 @@ Record choices here as they are made.
 | 2026-08-28 | 4b unknown mtime | When both sides exist and either mtime is `None`: sizes equal -> Skip `equal_unknown_mtime` (visible row, zero overwrite risk); sizes differ -> Conflict `conflict_mtime_unknown` (forces apply per the mode-aware table). Retires the Phase 1 `None -> 0` rule. Pre-epoch `Some(0)` stays comparable, not aliased to `None`. Retired characterization tests flipped in the same commit. |
 | 2026-08-28 | 4c key identity | v1 key identity is case-sensitive, codepoint-exact, no NFC normalization (bytes preserved). `build_plan` preflights case-only collisions (same-side and cross-side) to Conflict `case_collision`; Collisions are never auto-paired as Equal, and (Slice 5) never executed. |
 | 2026-08-28 | 4d etag policy | Phase 2 does not compare etags and never hashes local files. Real-S3 etags are MD5 only for single-part uploads and provider-dependent (R2), so no cross-store etag equality is portable. `Entity::etag` stays an opaque remote token; `plan()` ignores etag fields. `--checksum` content comparison remains post-v1. The 4b policy is the sole guard for zero-evidence pairs. |
+| 2026-08-28 | R2.1 folder + `--delete` | Option (a): the executor runs transfers first, destination deletes last, then a bottom-up `remove_empty_dirs_bottom_up` post-pass cleans now-empty local dirs outside the plan (remote has no folder objects, so nothing to do there). Folder actions stay Skip; no folder delete rows. Characterization Skip tests remain. |
 
 ## Open decisions
 

@@ -6,6 +6,7 @@ pub mod cli;
 pub mod config;
 pub mod entity;
 pub mod error;
+pub mod exec;
 pub mod local;
 pub mod plan;
 pub mod store;

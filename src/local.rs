@@ -68,7 +68,24 @@ impl LocalFs {
     /// - size recheck: the opened descriptor's own size must equal
     ///   `expected_size` (a file that grew/shrunk between walk and open is a
     ///   per-key error, never a silently-truncated object).
-    pub fn open_verified(&self, key: &str, expected_size: u64) -> Result<std::fs::File, Error> {
+    /// Open a local file for reading (upload side), verifying it is still a
+    /// regular, non-symlink file of the expected size and (optionally) mtime
+    /// after walking (R3.3 / P1r7-symlink-swap TOCTOU guard).
+    ///
+    /// - type recheck: the path must not currently be a symlink (no-follow
+    ///   look via `symlink_metadata`) and the opened descriptor must be a
+    ///   regular file;
+    /// - size recheck: the opened descriptor's own size must equal
+    ///   `expected_size` (a file that grew/shrunk between walk and open is a
+    ///   per-key error, never a silently-truncated object);
+    /// - mtime recheck: if `expected_mtime_ms` is `Some`, the opened
+    ///   descriptor's mtime must be within the default tolerance of it.
+    pub fn open_verified(
+        &self,
+        key: &str,
+        expected_size: u64,
+        expected_mtime_ms: Option<u64>,
+    ) -> Result<std::fs::File, Error> {
         let path = key_to_local_path(&self.root, key)?;
         // No-follow type check: reject a symlink swapped in after the walk.
         let smd = match std::fs::symlink_metadata(&path) {
@@ -101,7 +118,53 @@ impl LocalFs {
                 fmd.len()
             )));
         }
+        if let Some(expect_ms) = expected_mtime_ms {
+            if let Ok(mt) = fmd.modified() {
+                if let Some(actual_ms) = system_time_to_ms(mt) {
+                    if actual_ms.abs_diff(expect_ms) > crate::config::DEFAULT_MTIME_TOLERANCE_MS {
+                        return Err(Error::Other(format!(
+                            "open_verified: mtime changed for {} (expected {expect_ms}, found {actual_ms})",
+                            key
+                        )));
+                    }
+                }
+            }
+        }
         Ok(f)
+    }
+
+    /// Validate a download target and create its parents, returning a unique
+    /// temp path whose later rename is the atomic commit. The path stays under
+    /// the canonical vault root (P1r7 download half).
+    pub fn tmp_path_for(&self, key: &str) -> Result<PathBuf, Error> {
+        let path = key_to_local_path(&self.root, key)?;
+        let parent = path.parent().ok_or_else(|| {
+            Error::Other(format!("tmp_path_for has no parent dir: {}", path.display()))
+        })?;
+        self.ensure_locality(parent)?;
+        std::fs::create_dir_all(parent)?;
+        self.ensure_locality(parent)?;
+        Ok(temp_sibling(&path))
+    }
+
+    /// Commit a temp file written by a download to its final path, applying
+    /// the remote mtime (atomic rename; temp removed on failure).
+    pub fn finalize_write(&self, key: &str, tmp: &Path, mtime_ms: Option<u64>) -> Result<(), Error> {
+        let path = key_to_local_path(&self.root, key)?;
+        let result = (|| -> Result<(), Error> {
+            let f = std::fs::File::open(tmp)?;
+            if let Some(ms) = mtime_ms {
+                set_file_mtime_ms(&f, ms)?;
+            }
+            f.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(tmp);
+            return result;
+        }
+        std::fs::rename(tmp, &path)?;
+        Ok(())
     }
 
     /// Atomically write `expected_size` bytes from `r` to `key`'s file and set
@@ -747,7 +810,7 @@ mod tests {
         let dir = TempDir::new("vaultsync-test");
         std::fs::write(dir.join("a.md"), "hello world").unwrap();
         let fs = LocalFs::new(dir.path());
-        let mut f = fs.open_verified("a.md", 11).unwrap();
+        let mut f = fs.open_verified("a.md", 11, None).unwrap();
         let mut buf = String::new();
         std::io::Read::read_to_string(&mut f, &mut buf).unwrap();
         assert_eq!(buf, "hello world");
@@ -764,7 +827,7 @@ mod tests {
         std::fs::write(outside.join("secret"), "s").unwrap();
         std::os::unix::fs::symlink(outside.join("secret"), dir.join("a.md")).unwrap();
         let fs = LocalFs::new(dir.path());
-        let err = fs.open_verified("a.md", 1).unwrap_err();
+        let err = fs.open_verified("a.md", 1, None).unwrap_err();
         assert!(
             format!("{err}").contains("symlink"),
             "expected symlink refusal, got: {err}"
@@ -777,8 +840,8 @@ mod tests {
         let dir = TempDir::new("vaultsync-test");
         std::fs::write(dir.join("a.md"), "12345").unwrap();
         let fs = LocalFs::new(dir.path());
-        assert!(fs.open_verified("a.md", 5).is_ok());
-        assert!(fs.open_verified("a.md", 6).is_err(), "size mismatch not caught");
+        assert!(fs.open_verified("a.md", 5, None).is_ok());
+        assert!(fs.open_verified("a.md", 6, None).is_err(), "size mismatch not caught");
     }
 
     #[test]
@@ -786,7 +849,7 @@ mod tests {
         let dir = TempDir::new("vaultsync-test");
         let fs = LocalFs::new(dir.path());
         assert!(matches!(
-            fs.open_verified("gone.md", 1).unwrap_err(),
+            fs.open_verified("gone.md", 1, None).unwrap_err(),
             Error::NotFound(_)
         ));
     }
