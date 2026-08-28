@@ -34,6 +34,18 @@ Exit criteria: push/pull a sample vault including nested folders and a binary at
 5. Lock file to prevent concurrent runs on same vault
 6. JSON schema stability for `--json`
 7. Integration test optional gate in CI
+8. Head-on-list (or HEAD-sample on size-equal candidates) so list-driven plans
+   see client mtimes instead of upload `LastModified` (PR2 A-M1 follow-up)
+9. `path_collision_keys` O(n^2) -> set-based membership (PR2 A-M6/B-L8);
+   benchmark before advertising large-vault use
+10. CI: pin the toolchain and verify MSRV 1.85 (A-L9); set
+    `VAULTSYNC_TEST_S3_BUCKET` in CI so the env-gated suite genuinely runs,
+    and consider `#[ignore]` + `--ignored` or a CI sentinel so a silent skip
+    cannot look green (B-L7 hardening)
+11. Consider anchoring a relative `vault_root` to the config file's directory
+    instead of the cwd (PR2 B-L10) - breaking-change review
+12. Cloudflare R2 endpoint matrix row (still pending; the path-style toggle
+    test exercises both flavors there, PR2 A-M8/W12)
 
 Exit criteria: daily-driver usable for single-user backup (`push --delete` from trusted machine).
 
@@ -131,6 +143,11 @@ Record choices here as they are made.
 | 2026-08-28 | exit-code lock (P1r-stub-exit) | `status` 0 clean / 2 dirty / 1 error. `push`/`pull` execute the plan: 0 if all selected actions succeeded and no Conflict rows; 2 if the plan contained any Conflict rows (non-conflict actions still execute); 1 on any transfer failure or fatal error. `--dry-run` prints the plan, mutates nothing, exits like status. Retires `run_push_stub_conflict_exit_0_placeholder` in the same commit. Help carries a permanent-`--delete`-no-confirmation warning until Phase 3. |
 | 2026-08-28 | check probe lock | `check` writes a tiny probe object (`<prefix>.vaultsync-check-<pid>`), reads it back, deletes it; success only on put+get+delete round-trip. No head-bucket-only fallback - probe failure is a failure. 404 -> not found, 401/403 -> actionable credentials hint, exit 1. Credentials come from the ambient AWS chain (Slice 8). |
 | 2026-08-28 | symlink policy (P1r4-symlink) | Default remains skip all symlinks below the root (symlinked root still followed, P1r6-root-symlink). `--follow-symlinks` (off by default, global flag): the walker follows symlinks, guards dir cycles with a canonical-path visited set, and still skips (with a warning) any target escaping the canonicalized vault root - never syncs out-of-vault content silently. Off-by-default skipped symlinks surface as a walk warning count on stderr (`skipped N symlink(s); use --follow-symlinks`), not plan Skip rows. 
+| 2026-08-28 | PR2-defer-head-on-list | Deferred (PR2 A-M1): a head-on-list (or HEAD-sample on size-equal candidates) so list-driven plans see client mtimes is a Phase 3 optimization; today the plan compares upload `LastModified` (documented in README). |
+| 2026-08-28 | PR2-defer-path-collision-perf | Deferred (PR2 A-M6/B-L8): `path_collision_keys` is O(n^2); a set-based rewrite is Phase 3 perf, benchmark before advertising large-vault use. |
+| 2026-08-28 | PR2-defer-ci | Deferred (PR2 A-L9/B-L7): CI is Phase 3 - pin the toolchain + verify MSRV 1.85, set `VAULTSYNC_TEST_S3_BUCKET` so the env-gated suite runs for real, and use `#[ignore]`/`--ignored` or a CI sentinel so a silent skip cannot look green. |
+| 2026-08-28 | PR2-defer-vault-root-baseline | Deferred (PR2 B-L10): anchoring a relative `vault_root` to the config file's directory is a breaking-change Phase 3 review; today it resolves against the cwd (documented in cli.md). |
+| 2026-08-28 | PR2-defer-r2-row | Deferred (PR2 W12/A-M8 matrix): the Cloudflare R2 endpoint row is still pending; the path-style toggle test now exercises both addressing flavors there. |
 
 ## Open decisions
 
