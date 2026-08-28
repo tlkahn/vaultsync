@@ -30,7 +30,10 @@ Exit criteria: push/pull a sample vault including nested folders and a binary at
 1. `--delete` safety (`--yes`, `--max-delete`, confirm prompt)
 2. Ignore patterns + Obsidian default profile
 3. Concurrency limits, retries with backoff on transient S3 errors
-4. Streaming for large objects if not already done
+4. Multipart upload above the 5 GiB single-PUT ceiling (get/put already
+   stream: `get_to` streams the body; `put_from` buffers to a disk temp and
+   streams it - never a size-sized memory buffer; the ceiling is rejected
+   client-side before buffering, W80)
 5. Lock file to prevent concurrent runs on same vault
 6. JSON schema stability for `--json`
 7. Integration test optional gate in CI
@@ -146,6 +149,14 @@ Record choices here as they are made.
 | 2026-08-28 | PR2-defer-ci | Deferred (PR2 A-L9/B-L7): CI is Phase 3 - pin the toolchain + verify MSRV 1.85, set `VAULTSYNC_TEST_S3_BUCKET` so the env-gated suite runs for real, and use `#[ignore]`/`--ignored` or a CI sentinel so a silent skip cannot look green. |
 | 2026-08-28 | PR2-defer-vault-root-baseline | Deferred (PR2 B-L10): anchoring a relative `vault_root` to the config file's directory is a breaking-change Phase 3 review; today it resolves against the cwd (documented in cli.md). |
 | 2026-08-28 | PR2-defer-r2-row | Deferred (PR2 W12/A-M8 matrix): the Cloudflare R2 endpoint row is still pending; the path-style toggle test now exercises both addressing flavors there. |
+| 2026-08-28 | PR2-W76 guarded-delete-seam | `delete_file_guarded` routes its unlink through the shared `unlink_local_file` seam (pre-unlink locality re-check + `NotFound` mapping); a `#[cfg(test)]` pre-unlink hook in the seam lets tests inject the stat-to-unlink race through production APIs (r8b M1 / r8a-5, the merge-bar item). |
+| 2026-08-28 | PR2-W77 scoped-empty-dir-pass | The `pull --delete` empty-dir post-pass is scoped to the ancestor chains of the files deleted this run (both the Ok and the W32 NotFound goal-state arms), deepest-first, never the root, dedup'd across chains; pre-existing plan-unrelated empty dirs are kept. Replaces the vault-wide pass (r9 M1, the merge-bar item). |
+| 2026-08-28 | PR2-W78 tmp-path-self-cleanup | `tmp_path_for`'s post-creation tail (create_dir_all, second ensure_locality, alloc_temp_sibling) runs under a cleanup-on-error helper, so no failure can leak created dirs (r9 L2). `remove_created_dirs` is shared with exec's W66 download cleanup. |
+| 2026-08-28 | PR2-W79 reserved-keys-warn | Reserved-namespace remote keys dropped by `build_plan` are counted and surfaced on stderr (first 5 names + "and N more"), via a pure `partition_reserved_remote_keys` helper (r9 L1). |
+| 2026-08-28 | PR2-W80 single-put-ceiling | `S3Store::put_from` rejects a size above the 5 GiB single-PUT ceiling client-side, before buffering or upload (r8b L3). |
+| 2026-08-28 | PR2-W81 root-canon-cache | The vault root is canonicalized once per `LocalFs` (OnceLock) and threaded through `ensure_locality`, the scoped dir cleanup, and the walk; a mid-run root-symlink swap yields one consistent boundary decision per instance (r8a-1 / r9-N2). |
+| 2026-08-28 | PR2-W82 report-mutex | `RefCell<WalkReport>` -> `Mutex<WalkReport>` so `LocalFs` is Send/Sync ahead of Phase 3 concurrency (r8a-2). |
+| 2026-08-28 | PR2-W83 single-vault-merge-site | The `Cli.vault` merge arm is removed from `resolve_settings` (test-only in production); `resolve_vault_from_config` is the single `--vault`/config merge site; precedence tests retargeted (r9 N1). |
 
 ## Open decisions
 

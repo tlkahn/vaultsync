@@ -161,8 +161,9 @@ A relative `vault_root` (e.g. `vault_root = "."` or `notes`) resolves
 against the process working directory, not the config file's directory;
 anchor it absolutely if you rely on the file's location.
 
-Uploads are single-PUT, so a single object is limited to 5 GiB; larger files
-need multipart (a post-v1 item).
+Uploads are single-PUT, so a single object is limited to 5 GiB; a larger
+size is rejected client-side before buffering (W80), and multipart remains
+a post-v1 item.
 
 `--follow-symlinks` + `--delete` is a footgun, but the delete half is inert
 in v1: a followed *file* symlink key plans `Skip(followed_symlink)` in every
@@ -200,7 +201,9 @@ race on the store side). The guarded delete is a check-then-act stat
 followed by a by-path `remove_file` (std has no fd-based delete), so a leaf
 swapped in the window between the stat and the unlink is still removed - the
 same residual class as the download note; fd-based delete is a post-v1 item
-(A-L3).
+(A-L3). After the deletes, the empty-dir post-pass is scoped to the ancestor
+chains of the files deleted this run (deepest-first, never the vault root):
+pre-existing, plan-unrelated empty dirs are kept (W77).
 
 **Planner identity is codepoint-exact (no NFC fold).** APFS folds NFD/NFC (a
 note named in decomposed form appears under its composed name), while S3

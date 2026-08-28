@@ -74,10 +74,13 @@ key may return `Ok` (S3 is idempotent) or `NotFound` (mock / local). Both are
 the achieved goal state; the executor normalizes `NotFound` to success.
 
 Keys under the reserved namespace `.vaultsync-check-*` (used by `check`'s
-connectivity probe) must not be created by user content. A crash-leftover
-probe (e.g. a SIGKILL between probe put and delete) is additionally filtered
-out of both walks and plans, so a stray `.vaultsync-check-*` object can never
-Download to disk or re-upload (R4-L4/W42).
+connectivity probe) and `.*.vaultsync-tmp-*` (the download/upload temp-sibling
+pattern, W63) must not be created by user content. Both prefixes are filtered
+out of walks and plans (final-segment policy, W63/A-L3), so a crash leftover -
+a probe stranded between put and delete, or a temp sibling that reached the
+store out-of-band - can never Download to disk or re-upload (R4-L4/W42). A run
+that encounters such a leftover counts it and surfaces it on stderr instead of
+dropping it silently (W79).
 
 Zero-byte marker objects at the exact store prefix (e.g. an S3-console
 "Make Folder" marker that strips to an empty vault-relative key) are ignored;
