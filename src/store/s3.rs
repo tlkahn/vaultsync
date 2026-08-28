@@ -466,7 +466,7 @@ impl ObjectStore for S3Store {
         // Refutation R-b).
         drop(f);
 
-        let upload = (|| -> Result<(), Error> {
+        let upload = (|| -> Result<Option<String>, Error> {
             let body_res = self.rt.block_on(async {
                 ByteStream::from_path(&tmp)
                     .await
@@ -480,18 +480,21 @@ impl ObjectStore for S3Store {
                 if let Some(v) = encode_mtime(mtime_ms) {
                     req = req.metadata(MTIME_KEY, v);
                 }
-                req.send().await.map_err(|e| map_sdk_err(&e, "put"))?;
-                Ok::<(), Error>(())
+                let resp = req.send().await.map_err(|e| map_sdk_err(&e, "put"))?;
+                // R5-L2/W44: return the S3 ETag from the put response so the
+                // entity returned by `put_from` matches what `head`/`get_to`
+                // report (they already populate etag; put_from did not).
+                Ok::<Option<String>, Error>(resp.e_tag().map(String::from))
             })
         })();
         let _ = std::fs::remove_file(&tmp);
-        upload?;
+        let etag = upload?;
 
         Ok(Entity {
             key: key.to_string(),
             size,
             mtime_ms,
-            etag: None,
+            etag,
         })
     }
 

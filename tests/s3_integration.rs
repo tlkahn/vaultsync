@@ -31,12 +31,16 @@ fn unique_num() -> u64 {
     ts.wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
-fn put_bytes(store: &S3Store, key: &str, bytes: &[u8], mtime: Option<u64>) -> Result<(), String> {
+fn put_bytes(
+    store: &S3Store,
+    key: &str,
+    bytes: &[u8],
+    mtime: Option<u64>,
+) -> Result<vaultsync::entity::Entity, String> {
     let mut c = std::io::Cursor::new(bytes.to_vec());
     store
         .put_from(key, &mut c, bytes.len() as u64, mtime)
-        .map_err(|e| format!("{e}"))?;
-    Ok(())
+        .map_err(|e| format!("{e}"))
 }
 
 /// Run a test against a unique-prefix store, cleaning up afterwards. Skips
@@ -98,11 +102,18 @@ where
 #[test]
 fn s3_integ_put_get_head_delete_roundtrip() {
     with_store("roundtrip", |s| {
-        put_bytes(s, "a.txt", b"hello", Some(1_700_000_000_123))?;
+        let put_ent = put_bytes(s, "a.txt", b"hello", Some(1_700_000_000_123))?;
+        assert!(
+            put_ent.etag.is_some(),
+            "put_from must return the S3 ETag (R5-L2/W44)"
+        );
         let h = s.head("a.txt").map_err(|e| format!("{e}"))?;
         assert_eq!(h.size, 5, "head size");
         assert_eq!(h.mtime_ms, Some(1_700_000_000_123), "metadata mtime");
         assert!(h.etag.is_some(), "etag present");
+        // the entity returned by put_from must agree with head on the etag
+        // (R5-L2: put_from previously always returned etag: None).
+        assert_eq!(put_ent.etag, h.etag, "put_from vs head etag");
 
         let mut buf = Vec::new();
         let got = s.get_to("a.txt", &mut buf).map_err(|e| format!("{e}"))?;
