@@ -209,6 +209,52 @@ fn fail(rep: &mut ExecReport, key: &str, e: Error) {
     });
 }
 
+/// Validate a pull destination for `a` (W13/B-L4 + W22/N2/L3): fails fast
+/// when the destination changed since the plan (size/mtime drift ->
+/// `Changed`), became a symlink or non-regular file (guard error), or
+/// appeared for a remote-only key. Shared by the pre-body fast-fail
+/// (W68/A-L4) and the post-body check that owns the plan-to-rename window
+/// (N3) - identical messages, no semantics change.
+///
+/// N3: this is a check-then-act stat (std has no `renameat2(NOREPLACE)`/
+/// fd-exchange), so a writer that lands between the stat and the rename is
+/// still silently overwritten - documented limitation; the upload half
+/// (R3.3) re-checks the OPENED descriptor on the same fd, which this
+/// download path cannot (it renames a separate temp file).
+fn check_destination(
+    local: &LocalFs,
+    a: &crate::plan::Action,
+    tolerance_ms: u64,
+) -> Result<(), Error> {
+    if let Some(planned) = &a.local {
+        let freshness =
+            local.destination_freshness(&a.key, planned.size, planned.mtime_ms, tolerance_ms)?;
+        if freshness == crate::local::Freshness::Changed {
+            return Err(Error::Other(format!(
+                "destination changed since plan for {}; not overwriting",
+                a.key
+            )));
+        }
+    } else if !local.destination_absent(&a.key)? {
+        // R4-L5/W43: distinguish a destination that was *skipped by the
+        // walk* (a pre-existing symlink - the key is remote-only because the
+        // walk skipped it, not because it appeared) from one that truly
+        // appeared since the plan. Both fail closed; only the message differs.
+        let is_symlink = local.is_symlink_destination(&a.key)?;
+        if is_symlink {
+            return Err(Error::Other(format!(
+                "destination {} exists but was skipped by the walk (symlink); not overwriting",
+                a.key
+            )));
+        }
+        return Err(Error::Other(format!(
+            "destination appeared since plan for {}; not overwriting",
+            a.key
+        )));
+    }
+    Ok(())
+}
+
 /// Download one key into an atomic temp + rename, applying the remote mtime
 /// from the `get_to` metadata (which carries the client `vaultsync-mtime`, not
 /// the list's LastModified).
@@ -218,6 +264,11 @@ fn exec_download(
     a: &crate::plan::Action,
     tolerance_ms: u64,
 ) -> Result<(), Error> {
+    // W68/A-L4: pre-download destination checks - fail fast before the
+    // (potentially multi-hundred-MB) body streams. The post-body check below
+    // stays: it owns the plan-to-rename race window (N3). Pure earlier-fail
+    // optimization with identical messages.
+    check_destination(local, a, tolerance_ms)?;
     let (tmp, mut f, created_dirs) = local.tmp_path_for(&a.key)?;
     // W66/A-L2: every post-creation failure removes the temp sibling AND the
     // parent dirs `tmp_path_for` created (best-effort, only while empty - a
@@ -246,57 +297,11 @@ fn exec_download(
             // on-disk size re-stat above is kept (it is the correctness check).
             remote.mtime_ms
         };
-        // W22/N2/L3: a pull key with no planned local entity (remote only)
-        // still guards the destination. A file/dir/symlink that appeared since
-        // the plan is never clobbered by the rename - the key fails, the
-        // appeared content survives.
-        if a.local.is_none() && !local.destination_absent(&a.key)? {
-            // R4-L5/W43: distinguish a destination that was *skipped by
-            // the walk* (a pre-existing symlink - the key is remote-only
-            // because the walk skipped it, not because it appeared) from
-            // one that truly appeared since the plan. Both fail closed;
-            // only the message differs.
-            let is_symlink = local.is_symlink_destination(&a.key)?;
-            if is_symlink {
-                return Err(Error::Other(format!(
-                    "destination {} exists but was skipped by the walk (symlink); not overwriting",
-                    a.key
-                )));
-            }
-            return Err(Error::Other(format!(
-                "destination appeared since plan for {}; not overwriting",
-                a.key
-            )));
-        }
-
-        // W13/B-L4: pull destination-freshness guard (symmetric to upload
-        // R3.3). A destination that changed since the plan is NOT overwritten
-        // - the user's newer edits survive; a vanished destination is
-        // recreated.
-        //
-        // N3: this is a check-then-act stat (std has no `renameat2(NOREPLACE)`/
-        // fd-exchange), so a writer that lands between the stat and the rename
-        // is still silently overwritten - documented limitation; the upload
-        // half (R3.3) re-checks the OPENED descriptor on the same fd, which
-        // this download path cannot (it renames a separate temp file).
-        if let Some(planned) = &a.local {
-            // W21/N1: every error path after the temp was written must remove
-            // it, including a refusal from `destination_freshness` itself (e.g.
-            // the destination became a symlink) - the outer cleanup covers
-            // this and the `Changed` arm below uniformly.
-            let freshness = local.destination_freshness(
-                &a.key,
-                planned.size,
-                planned.mtime_ms,
-                tolerance_ms,
-            )?;
-            if freshness == crate::local::Freshness::Changed {
-                return Err(Error::Other(format!(
-                    "destination changed since plan for {}; not overwriting",
-                    a.key
-                )));
-            }
-        }
+        // W22/N2/L3 + W13/B-L4: post-body destination guard (same logic as
+        // the pre-body fast-fail, W68/A-L4). Re-run after the body download
+        // because it owns the plan-to-rename window (N3): a writer that lands
+        // between the pre-check and the rename must still be refused.
+        check_destination(local, a, tolerance_ms)?;
         local.finalize_write(&a.key, &tmp, remote_mtime)
     })();
     match result {
@@ -392,6 +397,12 @@ mod tests {
             let mut c = std::io::Cursor::new(body.as_bytes().to_vec());
             self.inner
                 .put_from(key, &mut c, body.len() as u64, None)
+                .unwrap();
+        }
+        fn seed_mtime(&self, key: &str, body: &str, mtime: u64) {
+            let mut c = std::io::Cursor::new(body.as_bytes().to_vec());
+            self.inner
+                .put_from(key, &mut c, body.len() as u64, Some(mtime))
                 .unwrap();
         }
     }
@@ -1001,6 +1012,82 @@ mod tests {
         assert!(
             dir.join("keep").exists(),
             "pre-existing empty dir must survive"
+        );
+    }
+
+    #[test]
+    fn exec_download_precheck_skips_body_when_dest_changed() {
+        // W68/A-L4: pull destination guards run after the full body
+        // downloads. Pre-check the destination BEFORE tmp_path_for/get_to so
+        // a refused key never pays the (potentially multi-hundred-MB)
+        // download; the post-download check stays and owns the plan-to-
+        // rename window (N3). Fails today: the body streams first.
+        let dir = TempDir::new("vaultsync-exec");
+        let p = dir.join("a.md");
+        std::fs::write(&p, "old-local").unwrap();
+        set_mtime_ms(&p, 1_700_000_000_000);
+        let store = RecordingStore::new();
+        store.seed_mtime("a.md", "remote-new-body", 1_700_000_005_000);
+        let local = LocalFs::new(dir.path());
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let act = plan.actions.iter().find(|a| a.key == "a.md").unwrap();
+        assert_eq!(act.kind, ActionKind::Download);
+        // user edits the destination after planning (size changes)
+        std::fs::write(&p, "user-edit-since-plan-123").unwrap();
+        let rep =
+            crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+        assert!(
+            rep.failed.iter().any(|fl| fl.key == "a.md"),
+            "a.md not failed: {:?}",
+            rep.failed
+        );
+        assert!(
+            rep.failed
+                .iter()
+                .any(|fl| fl.message.contains("changed since plan")),
+            "no changed-since-plan message: {:?}",
+            rep.failed
+        );
+        assert!(
+            !store.log().iter().any(|l| l == "get_to:a.md"),
+            "body streamed despite changed destination: {:?}",
+            store.log()
+        );
+        // the user's newer content survives
+        assert_eq!(std::fs::read(&p).unwrap(), b"user-edit-since-plan-123");
+    }
+
+    #[test]
+    fn exec_download_precheck_skips_body_when_dest_appeared() {
+        // W68/A-L4: a remote-only key whose destination appeared since the
+        // plan must fail BEFORE the body downloads (same message as the
+        // post-check, which still owns the plan-to-rename window). Fails
+        // today: the body streams first.
+        let dir = TempDir::new("vaultsync-exec");
+        let store = RecordingStore::new();
+        store.seed_mtime("b.md", "remote-bytes", 1_700_000_000_123);
+        let local = LocalFs::new(dir.path());
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let act = plan.actions.iter().find(|a| a.key == "b.md").unwrap();
+        assert_eq!(act.kind, ActionKind::Download);
+        assert!(act.local.is_none(), "remote-only pull");
+        // a regular file appears at the destination after planning
+        std::fs::write(dir.join("b.md"), "editor-saved-since-plan").unwrap();
+        let rep =
+            crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+        assert!(
+            rep.failed.iter().any(|fl| fl.key == "b.md"),
+            "b.md not failed: {:?}",
+            rep.failed
+        );
+        assert!(
+            !store.log().iter().any(|l| l == "get_to:b.md"),
+            "body streamed despite appeared destination: {:?}",
+            store.log()
+        );
+        assert_eq!(
+            std::fs::read(dir.join("b.md")).unwrap(),
+            b"editor-saved-since-plan"
         );
     }
 
