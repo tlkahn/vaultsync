@@ -10,3 +10,7 @@ categories = ["command-line-utilities", "filesystem"]
 publish = false
 
 [dependencies]
+aws-config = { version = "1.11.0", registry = "rsproxy-sparse" }
+aws-sdk-s3 = { version = "1.144.0", registry = "rsproxy-sparse" }
+clap = { version = "4.6.6", registry = "rsproxy-sparse", features = ["derive"] }
+tokio = { version = "1.53.1", registry = "rsproxy-sparse", features = ["rt-multi-thread", "macros"] }

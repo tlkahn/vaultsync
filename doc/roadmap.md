@@ -116,6 +116,13 @@ Record choices here as they are made.
 | 2026-08-27 | P1r7-special-node-key | Walker validates keys only for emittable nodes (`is_dir`/`is_file`); special files (FIFO/socket/device) are skipped unconditionally, name never inspected. Files/dirs with invalid names still fail loud (P1r4-key-ctl). Locked by `local_list_skips_special_file_with_backslash_name`. |
 | 2026-08-27 | P1r7-delete-repeat | Repeated `--delete` is a parse error (fail loud), matching repeated `--vault` (P1r4-vault-value). Locked by `parse_repeated_delete_flag_errors`. |
 | 2026-08-27 | P1r7-parse-usage | Every `parse_args` error message ends with the USAGE block (uniform rule). Locked by `parse_errors_always_include_usage`. |
+| 2026-08-28 | D1 S3 client stack | Official `aws-sdk-s3` + `aws-config` + `tokio` accepted after the Slice 0 spike cleared the AWS matrix: all 6 probes passed (list/head/get/put/delete, metadata mtime, prefix, path-style, custom-endpoint path, default cred chain). Weight: ~12.9 MiB stripped over the 435 KiB Phase 1 binary, 1m28s clean release build, 654-tree nodes. R2 row still unverified (no endpoint this session; lands in the integration suite). Notes: `doc/spikes/phase-2-s3.md`. `rust-s3` remains docs-only. |
+| 2026-08-28 | D2 async runtime | tokio; async lives only inside `store::s3` (`S3Store` owns a private runtime and `block_on`s per call). Planner/executor/CLI stay sync and runtime-free. No `async` outside `store::s3` without a new log entry. |
+| 2026-08-28 | P2-scope | Phase 2 = Roadmap 5 items plus the full deferred Phase 2 checklist; each item lands or is explicitly re-deferred with a log entry. |
+| 2026-08-28 | P2-matrix | Manual test matrix = AWS S3 + Cloudflare R2 (S3-compatible row). |
+| 2026-08-28 | P2-integ | Env-gated automated integration tests (`tests/`, off by default) plus a manual matrix checklist doc. |
+| 2026-08-28 | P2-toml | Config parsing via `toml` + `serde` (derive). |
+| 2026-08-28 | P2-cli | Migrate CLI parse to `clap` (global flags, `--flag=value`, `--` terminator). |
 
 ## Open decisions
 
