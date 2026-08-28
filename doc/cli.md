@@ -12,11 +12,12 @@ vaultsync [global flags] <command> [command flags]
 | ---- | ------- |
 | `--config <path>` | config file (default: `./.vaultsync.toml` then `~/.config/vaultsync/config.toml`) |
 | `--vault <path>` | vault root override |
-| `--json` | machine-readable stdout |
+| `--follow-symlinks` | follow symlinks below the vault root (off by default; out-of-vault targets are skipped with a warning) |
 | `--dry-run` | plan only; no mutations (alias of `status` behavior when passed to push/pull) |
 | `-v, --verbose` | repeatable debug noise on stderr |
-| `-y, --yes` | skip confirmation for destructive flags |
-| `--concurrency <n>` | transfer workers |
+| `--json` | machine-readable stdout (**Phase 3**: parses, but dispatch rejects it as not implemented) |
+| `-y, --yes` | skip confirmation for destructive flags (**Phase 3**: rejected as unknown today) |
+| `--concurrency <n>` | transfer workers (**Phase 3**: rejected as unknown today) |
 
 ## Commands
 
@@ -42,7 +43,6 @@ Download remote-newer and local-missing paths.
 ```text
 vaultsync pull
 vaultsync pull --delete          # remove local extras
-vaultsync pull --delete --yes
 vaultsync pull --force-remote    # conflicts prefer remote
 vaultsync pull --dry-run
 ```
@@ -165,14 +165,14 @@ anchor it absolutely if you rely on the file's location.
 Uploads are single-PUT, so a single object is limited to 5 GiB; larger files
 need multipart (a post-v1 item).
 
-`--follow-symlinks` + `--delete` is a footgun: with the flag on, a followed
-symlink and its target are two names for the same inode, and deleting the
-link key unlinks the *link* itself (`remove_file` semantics). The target
-inode keeps its own name, so if the target is a separately-listed key it
-survives under that name - there is no write-through and the link's unlink
-never deletes the target's other names. Default mode never plans through
-symlinks (they are skipped and counted), so this only applies when you
-explicitly opt in.
+`--follow-symlinks` + `--delete` is a footgun, but the delete half is inert
+in v1: a followed *file* symlink key plans `Skip(followed_symlink)` in every
+mutating mode - including `pull --delete` - so the link is never removed
+(`--follow-symlinks` is inventory-only; see below). `delete_file_guarded`
+additionally refuses a symlink leaf that swapped in *after* planning (fail
+closed): the guarded delete is no-follow, so a link planted between plan and
+execute is never unlinked. Default mode never plans through symlinks (they
+are skipped and counted), so this only applies when you explicitly opt in.
 
 `--follow-symlinks` is **inventory-only in v1**: the walker follows symlinks
 and lists them, but push/pull plan any followed *file* symlink as
@@ -187,7 +187,17 @@ before removing it (size + mtime within `transfer.mtime_tolerance_ms`); a
 file that changed since the plan is left on disk with a per-key error,
 symmetric to the upload/download freshness guards. `DeleteRemote` (push
 `--delete`) has no head-before-delete re-check: the list-to-delete gap is an
-accepted cross-machine race on the store side.
+accepted cross-machine race on the store side. The guarded delete is a
+check-then-act stat followed by a by-path `remove_file` (std has no
+fd-based delete), so a leaf swapped in the window between the stat and the
+unlink is still removed - the same residual class as the download note;
+fd-based delete is a post-v1 item (A-L3).
+
+**Planner identity is codepoint-exact (no NFC fold).** APFS folds NFD/NFC (a
+note named in decomposed form appears under its composed name), while S3
+does not, so a vault round-tripped through another machine can show a false
+`local_only` + `remote_only` pair for the "same" note name. v1 does not
+normalize (A-L4).
 
 **One invalid remote key aborts the plan loudly.** A store listing that yields
 an invalid key (escaping, control-character) fails the whole plan; the error
@@ -232,10 +242,10 @@ Stable field names; versioned later with a `schema` field if needed.
 
 ```text
 # cron backup: local is truth
-vaultsync push --delete --yes
+vaultsync push --delete
 
 # new laptop: remote is truth once
-vaultsync pull --delete --yes
+vaultsync pull --delete
 
 # careful bidirectional without deletes
 vaultsync pull && vaultsync push
@@ -243,6 +253,9 @@ vaultsync pull && vaultsync push
 # gate commit on clean remote mirror
 vaultsync status --json | jq -e '.stats.upload + .stats.download == 0'
 ```
+
+(`--yes` is a Phase 3 flag and is rejected today, so the delete examples
+above omit it; the confirmation rail is a Phase 3 roadmap item.)
 
 ## Non-commands (v1)
 

@@ -65,7 +65,9 @@ action a plan - or delete files - against a non-existent store).
 - **`[ignore].patterns` and `[transfer].concurrency` are Phase 3.** They are
   parsed but not yet applied: `push`/`pull`/`check` refuse loudly on a
   non-empty `[ignore].patterns` (`status` warns), and an explicitly-set
-  `[transfer].concurrency` warns on every run until the pool exists.
+  `[transfer].concurrency` that **differs from the default** warns on every
+  run until the pool exists (an explicit copy of the default, `4`, is
+  silent - it is behaviorally indistinguishable from omitting the key).
 - **`--follow-symlinks` is inventory-only in v1.** The walker follows
   symlinks and lists them, but push/pull plan any followed *file* symlink as
   `Skip(followed_symlink)` (transfers refuse to open a symlink); only
@@ -76,6 +78,11 @@ action a plan - or delete files - against a non-existent store).
   file (`0666 & umask`) and renames it over the destination, so a
   previously-`0600` local note returns as `0644`. v1 has no permission model;
   only content and mtime are preserved.
+- **Planner identity is codepoint-exact (no NFC fold).** APFS folds NFD/NFC
+  (a note named in decomposed form appears under its composed name), while S3
+  does not, so a vault round-tripped through another machine can show a false
+  `local_only` + `remote_only` pair for the "same" note name. v1 does not
+  normalize (A-L4).
 - **The integration suite skips without `VAULTSYNC_TEST_S3_BUCKET`.** The S3
   tests compile always but skip at runtime with a `[skip]` note when the env
   var is unset, keeping `cargo test` green offline. Set it (plus optional
