@@ -53,7 +53,10 @@ impl S3Store {
     /// Build from resolved store settings. Credentials come from the ambient
     /// AWS default chain (env, shared config, profile) - never from the TOML.
     pub fn new(settings: &StoreSettings) -> Result<S3Store, Error> {
-        let rt = tokio::runtime::Builder::new_multi_thread()
+        // W48: a current-thread runtime matches the one-`block_on`-at-a-time
+        // sync architecture (each call `block_on`s once); a multi-thread
+        // runtime would add worker threads with no parallelization benefit.
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| Error::Other(format!("failed to start async runtime: {e}")))?;

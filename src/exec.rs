@@ -182,7 +182,9 @@ fn exec_download(
                     a.key
                 )));
             }
-            f.sync_all()?;
+            // W48: no `sync_all` here - `finalize_write` opens the temp and
+            // syncs it before the atomic rename, covering durability. The
+            // on-disk size re-stat above is kept (it is the correctness check).
             remote.mtime_ms
         };
         Ok(remote_mtime)
