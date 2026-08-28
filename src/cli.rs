@@ -59,6 +59,7 @@ pub enum Command {
     Check {
         config: Option<PathBuf>,
         verbose: u8,
+        json: bool,
     },
     Version,
     Help,
@@ -108,6 +109,7 @@ impl Command {
         Command::Check {
             config: None,
             verbose: 0,
+            json: false,
         }
     }
 }
@@ -221,7 +223,11 @@ impl Cli {
                 verbose,
                 follow_symlinks: self.follow_symlinks,
             },
-            Some(Commands::Check) => Command::Check { config, verbose },
+            Some(Commands::Check) => Command::Check {
+                config,
+                verbose,
+                json: self.json,
+            },
             Some(Commands::Version) => Command::Version,
             Some(Commands::Help) => Command::Help,
         }
@@ -303,24 +309,33 @@ pub fn run_with_io(
         Command::Check {
             config: _c,
             verbose: _v,
-        } => match crate::check_store(store) {
-            Ok(()) => {
-                let _ = writeln!(out, "check: ok");
-                0
+            json,
+        } => {
+            // W53/B-L1: `check --json` is rejected at dispatch like
+            // status/push/pull - it must not silently drop the flag and run
+            // human check (schema stability is Phase 3).
+            if json {
+                return reject_json(err);
             }
-            Err(crate::error::Error::Unauthorized(_)) => {
-                let _ = writeln!(err, "check failed: credentials or permissions rejected");
-                let _ = writeln!(
-                    err,
-                    "hint: check your credentials/bucket/region (expired keys, wrong region, bad bucket)"
-                );
-                1
+            match crate::check_store(store) {
+                Ok(()) => {
+                    let _ = writeln!(out, "check: ok");
+                    0
+                }
+                Err(crate::error::Error::Unauthorized(_)) => {
+                    let _ = writeln!(err, "check failed: credentials or permissions rejected");
+                    let _ = writeln!(
+                        err,
+                        "hint: check your credentials/bucket/region (expired keys, wrong region, bad bucket)"
+                    );
+                    1
+                }
+                Err(e) => {
+                    let _ = writeln!(err, "check failed: {e}");
+                    1
+                }
             }
-            Err(e) => {
-                let _ = writeln!(err, "check failed: {e}");
-                1
-            }
-        },
+        }
         Command::Status {
             vault,
             json,
@@ -1219,6 +1234,41 @@ mod tests {
         assert_eq!(code, 0);
         assert!(out.contains("check: ok"));
         assert!(!out.contains("(mock)"), "(mock) marker removed: {out}");
+    }
+
+    #[test]
+    fn parse_check_json_flag_carried() {
+        // W53/B-L1: `check --json` must carry the flag into the Command so
+        // dispatch can reject it like status/push/pull - today it is silently
+        // dropped and check runs human output with exit 0.
+        let mut args = a();
+        args.push("check".into());
+        args.push("--json".into());
+        match parse_args(&args).unwrap() {
+            Command::Check { json, .. } => assert!(json),
+            other => panic!("expected Check, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_check_json_rejected_not_implemented() {
+        // W53/B-L1: `check --json` must be rejected at dispatch (exit 1,
+        // stderr names --json), mirroring status/push/pull - the one
+        // subcommand that silently dropped the flag is closed.
+        let (code, out, err) = run(
+            Command::Check {
+                config: None,
+                verbose: 0,
+                json: true,
+            },
+            &MemoryStore::new(),
+        );
+        assert_eq!(code, 1);
+        assert!(err.contains("--json"), "err: {err}");
+        assert!(
+            !out.contains("check: ok"),
+            "must not run human check: {out}"
+        );
     }
 
     /// A store whose probe put is denied -> actionable failure path.
