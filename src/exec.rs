@@ -96,11 +96,13 @@ fn fail(rep: &mut ExecReport, key: &str, e: Error) {
     });
 }
 
-/// Download one key into an atomic temp + rename, applying the remote mtime.
+/// Download one key into an atomic temp + rename, applying the remote mtime
+/// from the `get_to` metadata (which carries the client `vaultsync-mtime`, not
+/// the list's LastModified).
 fn exec_download(local: &LocalFs, store: &dyn ObjectStore, a: &crate::plan::Action) -> Result<(), Error> {
     let tmp = local.tmp_path_for(&a.key)?;
-    let result = (|| -> Result<(), Error> {
-        {
+    let result = (|| -> Result<Option<u64>, Error> {
+        let remote_mtime = {
             let mut f = std::fs::File::create(&tmp)?;
             let remote = store.get_to(&a.key, &mut f)?;
             f.sync_all()?;
@@ -114,14 +116,21 @@ fn exec_download(local: &LocalFs, store: &dyn ObjectStore, a: &crate::plan::Acti
                     )));
                 }
             }
-            Ok(())
-        }
+            remote.mtime_ms
+        };
+        Ok(remote_mtime)
     })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return result;
+    let (remote_mtime, err) = match result {
+        Ok(m) => (m, None),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            (None, Some(e))
+        }
+    };
+    if let Some(e) = err {
+        return Err(e);
     }
-    local.finalize_write(&a.key, &tmp, a.remote.as_ref().and_then(|r| r.mtime_ms))
+    local.finalize_write(&a.key, &tmp, remote_mtime)
 }
 
 /// Upload one key, re-verifying size + mtime at open (R3.3).

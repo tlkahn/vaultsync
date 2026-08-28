@@ -9,6 +9,12 @@ pub enum Error {
     NotFound(String),
     /// A key failed vault-relative validation rules.
     InvalidKey(String),
+    /// The provider rejected the credentials / denied access (403/401).
+    Unauthorized(String),
+    /// The request timed out (transient).
+    Timeout(String),
+    /// The provider is unavailable / throttling (5xx, service down).
+    Unavailable(String),
     /// An underlying filesystem / IO error.
     Io(std::io::Error),
     /// Anything else, with a human-readable message.
@@ -20,6 +26,9 @@ impl fmt::Display for Error {
         match self {
             Error::NotFound(key) => write!(f, "not found: {key}"),
             Error::InvalidKey(key) => write!(f, "invalid key: {key}"),
+            Error::Unauthorized(msg) => write!(f, "credentials or permissions rejected: {msg}"),
+            Error::Timeout(msg) => write!(f, "request timed out: {msg}"),
+            Error::Unavailable(msg) => write!(f, "store unavailable: {msg}"),
             Error::Io(e) => write!(f, "io error: {e}"),
             Error::Other(msg) => write!(f, "{msg}"),
         }

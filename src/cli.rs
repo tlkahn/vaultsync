@@ -501,8 +501,19 @@ pub fn run_from_env() -> i32 {
     };
     let cmd = resolve_vault_from_config(cmd, &settings);
 
-    let store = MemoryStore::new();
-    run_with_io(cmd, &store, &mut out, &mut err)
+    // Build the store: a real `[store]` bucket -> S3Store; otherwise the mock.
+    let store: Box<dyn ObjectStore> = if settings.store.bucket.is_empty() {
+        Box::new(MemoryStore::new())
+    } else {
+        match crate::store::s3::S3Store::new(&settings.store) {
+            Ok(s) => Box::new(s),
+            Err(e) => {
+                let _ = writeln!(err, "error: {e}");
+                return 1;
+            }
+        }
+    };
+    run_with_io(cmd, store.as_ref(), &mut out, &mut err)
 }
 
 #[cfg(test)]

@@ -10,6 +10,7 @@ use crate::entity::Entity;
 use crate::error::Error;
 
 pub mod mock;
+pub mod s3;
 
 /// An object store holding a set of vault-relative keys.
 ///

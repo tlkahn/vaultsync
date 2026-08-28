@@ -1,0 +1,223 @@
+//! Env-gated S3 integration suite (Slice 7/8/10).
+//!
+//! Compiled always, but every test **skips** at runtime (printing a note)
+//! unless `VAULTSYNC_TEST_S3_BUCKET` is set. Optional:
+//! `VAULTSYNC_TEST_S3_ENDPOINT`, `VAULTSYNC_TEST_S3_REGION`,
+//! `VAULTSYNC_TEST_S3_PREFIX`, `VAULTSYNC_TEST_S3_PATH_STYLE=1`.
+//!
+//! Credentials come from the ambient AWS default chain (env, shared
+//! credentials file, profile); the tests never read secret values themselves.
+//!
+//! Each test runs under a unique `vaultsync-itest-<ts>-<name>/` prefix and
+//! cleans up its objects afterwards (Drop/finally-style via `with_store`).
+
+use std::io::Read;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use vaultsync::config::StoreSettings;
+use vaultsync::error::Error;
+use vaultsync::store::ObjectStore;
+use vaultsync::store::s3::S3Store;
+
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn unique_num() -> u64 {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    ts.wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+fn put_bytes(store: &S3Store, key: &str, bytes: &[u8], mtime: Option<u64>) -> Result<(), String> {
+    let mut c = std::io::Cursor::new(bytes.to_vec());
+    store
+        .put_from(key, &mut c, bytes.len() as u64, mtime)
+        .map_err(|e| format!("{e}"))?;
+    Ok(())
+}
+
+/// Run a test against a unique-prefix store, cleaning up afterwards. Skips
+/// (with a printed note) when `VAULTSYNC_TEST_S3_BUCKET` is unset.
+fn with_store<F>(name: &str, f: F)
+where
+    F: FnOnce(&S3Store) -> Result<(), String>,
+{
+    let bucket = match std::env::var("VAULTSYNC_TEST_S3_BUCKET") {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!(
+                "[skip] {}: VAULTSYNC_TEST_S3_BUCKET not set (set to run real S3 tests)",
+                name
+            );
+            return;
+        }
+    };
+    let region = std::env::var("VAULTSYNC_TEST_S3_REGION").unwrap_or_else(|_| "us-west-1".into());
+    let endpoint = std::env::var("VAULTSYNC_TEST_S3_ENDPOINT").ok();
+    let path_style = std::env::var("VAULTSYNC_TEST_S3_PATH_STYLE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let base = std::env::var("VAULTSYNC_TEST_S3_PREFIX").unwrap_or_default();
+    let prefix = format!("{base}vaultsync-itest-{}-{name}/", unique_num());
+
+    let settings = StoreSettings {
+        bucket: bucket.clone(),
+        region,
+        endpoint,
+        prefix,
+        path_style,
+    };
+    let store = S3Store::new(&settings).map_err(|e| format!("S3Store::new: {e}"));
+    let store = match store {
+        Ok(s) => s,
+        Err(e) => {
+            panic!("{name}: failed to build store against {bucket}: {e}");
+        }
+    };
+
+    let result = f(&store);
+
+    // Cleanup: list + delete everything (files only; folders are views).
+    if let Ok(ents) = store.list("") {
+        for e in ents {
+            if !e.is_folder() {
+                let _ = store.delete(&e.key);
+            }
+        }
+    }
+
+    if let Err(e) = result {
+        panic!("{name} failed: {e}");
+    }
+    eprintln!("[ok] {}", name);
+}
+
+#[test]
+fn s3_integ_put_get_head_delete_roundtrip() {
+    with_store("roundtrip", |s| {
+        put_bytes(s, "a.txt", b"hello", Some(1_700_000_000_123))?;
+        let h = s.head("a.txt").map_err(|e| format!("{e}"))?;
+        assert_eq!(h.size, 5, "head size");
+        assert_eq!(h.mtime_ms, Some(1_700_000_000_123), "metadata mtime");
+        assert!(h.etag.is_some(), "etag present");
+
+        let mut buf = Vec::new();
+        let got = s.get_to("a.txt", &mut buf).map_err(|e| format!("{e}"))?;
+        assert_eq!(buf, b"hello", "get bytes");
+        assert_eq!(got.mtime_ms, Some(1_700_000_000_123), "get mtime");
+
+        s.delete("a.txt").map_err(|e| format!("{e}"))?;
+        assert!(
+            matches!(s.head("a.txt"), Err(Error::NotFound(_))),
+            "head after delete should be NotFound"
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn s3_integ_list_paginates() {
+    // Seed >1000 keys (S3 pages at 1000) concurrently, confirm list returns all.
+    let n = 1050usize;
+    with_store("paginate", |s| {
+        std::thread::scope(|scope| {
+            for t in 0..16 {
+                scope.spawn(move || {
+                    for i in (t..n).step_by(16) {
+                        put_bytes(s, &format!("p/obj-{i:05}.dat"), b"x", Some(i as u64)).unwrap();
+                    }
+                });
+            }
+        });
+        let ents = s.list("").map_err(|e| format!("{e}"))?;
+        // files + synthesized folder views
+        let files: Vec<_> = ents.iter().filter(|e| !e.is_folder()).collect();
+        assert_eq!(files.len(), n, "all paged objects returned");
+        Ok(())
+    });
+}
+
+#[test]
+fn s3_integ_prefix_isolation() {
+    // Objects under another (non-store) prefix are invisible to this store.
+    with_store("isolation", |s| {
+        put_bytes(s, "mine.txt", b"m", None)?;
+        // write something under a sibling prefix directly via a second store
+        // sharing the bucket but a different prefix.
+        let bucket = std::env::var("VAULTSYNC_TEST_S3_BUCKET").unwrap();
+        let region = std::env::var("VAULTSYNC_TEST_S3_REGION").unwrap_or_else(|_| "us-west-1".into());
+        let other = S3Store::new(&StoreSettings {
+            bucket,
+            region,
+            endpoint: None,
+            prefix: format!("vaultsync-other-prefix-{}", unique_num()),
+            path_style: false,
+        })
+        .expect("other store");
+        put_bytes(&other, "secret.txt", b"s", None)?;
+        // our store must not see it
+        let keys: Vec<String> = s.list("").unwrap().iter().map(|e| e.key.clone()).collect();
+        assert!(
+            !keys.iter().any(|k| k == "secret.txt"),
+            "sibling-prefix object leaked into list: {keys:?}"
+        );
+        assert!(keys.iter().any(|k| k == "mine.txt"));
+        // clean up the other store's object
+        let _ = other.delete("secret.txt");
+        Ok(())
+    });
+}
+
+#[test]
+fn s3_integ_path_style_toggle() {
+    // Exercise the path-style setting (works regardless of which addressing
+    // the endpoint defaults to; the assertion is that put/list succeed).
+    with_store("pathstyle", |s| {
+        put_bytes(s, "f.txt", b"ps", None)?;
+        let n = s.list("").unwrap().iter().filter(|e| !e.is_folder()).count();
+        assert_eq!(n, 1, "path-style put/list");
+        Ok(())
+    });
+}
+
+#[test]
+fn s3_integ_streaming_put_large() {
+    // An 8 MiB body streamed from a counting reader: proves the backend pulls
+    // the reader incrementally (no `size`-sized in-memory buffer, P1r-put-size).
+    struct Probe {
+        remaining: u64,
+        max_chunk: usize,
+    }
+    impl Read for Probe {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.max_chunk = self.max_chunk.max(buf.len());
+            if self.remaining == 0 {
+                return Ok(0);
+            }
+            let n = (64 * 1024).min(buf.len()).min(self.remaining as usize);
+            buf[..n].fill(0xAB);
+            self.remaining -= n as u64;
+            Ok(n)
+        }
+    }
+    let size = 8 * 1024 * 1024u64;
+    with_store("streamput", |s| {
+        let mut probe = Probe {
+            remaining: size,
+            max_chunk: 0,
+        };
+        s.put_from("big.bin", &mut probe, size, Some(1_700_000_000_999))
+            .map_err(|e| format!("{e}"))?;
+        assert_eq!(probe.remaining, 0, "exactly size bytes consumed");
+        assert!(
+            probe.max_chunk <= 128 * 1024,
+            "reader asked to fill {} bytes (should stream)",
+            probe.max_chunk
+        );
+        let h = s.head("big.bin").map_err(|e| format!("{e}"))?;
+        assert_eq!(h.size, size, "stored size");
+        assert_eq!(h.mtime_ms, Some(1_700_000_000_999));
+        Ok(())
+    });
+}
