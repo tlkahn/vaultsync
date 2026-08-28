@@ -39,12 +39,22 @@ pub fn build_plan(
     let remote_entities: Vec<_> = remote_entities
         .into_iter()
         .filter(|e| !e.key.is_empty())
-        // R4-L4/W42: the reserved connectivity-probe namespace. A crashed
-        // `check` (SIGKILL between probe put and delete) can leave a
-        // `.vaultsync-check-*` object remotely; it must never plan a Download
-        // (which would materialize a stray dotfile). Users must not create
-        // such keys (object-store.md reserved namespace).
-        .filter(|e| !e.key.starts_with(".vaultsync-check-"))
+        // R4-L4/W42 + W54/A-L2: the reserved connectivity-probe namespace.
+        // A crashed `check` (SIGKILL between probe put and delete) can leave
+        // a `.vaultsync-check-*` object remotely; it must never plan a
+        // Download (which would materialize a stray dotfile). The filter
+        // matches the local walker's final-segment policy (a
+        // `.vaultsync-check-*` *name* in any directory, both sides) via
+        // `is_check_probe_name`, so a nested `notes/.vaultsync-check-*`
+        // leftover is dropped here exactly as the walker would skip it.
+        // Users must not create such keys (object-store.md reserved
+        // namespace).
+        .filter(|e| {
+            !e.key
+                .rsplit('/')
+                .next()
+                .is_some_and(crate::local::is_check_probe_name)
+        })
         .collect();
     for e in &remote_entities {
         crate::entity::ensure_valid_key(&e.key)?;
@@ -311,6 +321,34 @@ mod tests {
                 .iter()
                 .any(|a| a.key.starts_with(".vaultsync-check-")),
             "probe leftover planned: {:?}",
+            p.actions
+        );
+    }
+
+    #[test]
+    fn build_plan_drops_nested_remote_check_probe_key() {
+        // W54/A-L2: the remote `.vaultsync-check-*` filter must match the
+        // local walker's final-segment policy - a nested
+        // `notes/.vaultsync-check-*` key (valid per `ensure_valid_key`) must
+        // never plan a Download. The old full-key `starts_with` filter missed
+        // nested keys: the local walker skips by *file name* in any
+        // directory (is_reserved_vaultsync_name), so a nested probe leftover
+        // was skipped locally but planned as a download remotely.
+        let dir = TempDir::new("vaultsync-lib-test");
+        let local = LocalFs::new(dir.path());
+        let store = StubStore {
+            listed: vec![crate::entity::file(
+                "notes/.vaultsync-check-1-2-3",
+                25,
+                Some(100),
+            )],
+        };
+        let p = build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        assert!(
+            !p.actions
+                .iter()
+                .any(|a| a.key == "notes/.vaultsync-check-1-2-3"),
+            "nested probe leftover planned: {:?}",
             p.actions
         );
     }

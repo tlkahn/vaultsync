@@ -636,6 +636,14 @@ fn alloc_temp_sibling_from(candidates: &[PathBuf]) -> Result<(PathBuf, std::fs::
     )))
 }
 
+/// Whether a single path segment / file name is the reserved connectivity-
+/// probe name `.vaultsync-check-*` (W19/W24 + R4-L4/W42, W54/A-L2). Shared
+/// by the local walker (final segment of a local path) and the remote ingest
+/// filter (final segment of a remote key) so the two policies cannot drift.
+pub(crate) fn is_check_probe_name(name: &str) -> bool {
+    name.starts_with(".vaultsync-check-")
+}
+
 /// Whether a file name is a reserved vaultsync temp/probe name. The walker
 /// treats these as never-syncable and skips/counts them. Covers:
 ///
@@ -648,7 +656,7 @@ fn alloc_temp_sibling_from(candidates: &[PathBuf]) -> Result<(PathBuf, std::fs::
 fn is_reserved_vaultsync_name(name: Option<&std::ffi::OsStr>) -> bool {
     let Some(name) = name else { return false };
     let s = name.to_string_lossy();
-    (s.starts_with('.') && s.contains(".vaultsync-tmp-")) || s.starts_with(".vaultsync-check-")
+    (s.starts_with('.') && s.contains(".vaultsync-tmp-")) || is_check_probe_name(&s)
 }
 
 /// Set a file's mtime in ms since epoch (std `File::set_times`, stable).
