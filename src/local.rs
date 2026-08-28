@@ -866,7 +866,7 @@ fn handle_followed_symlink(
         Ok(m) => m,
     };
     if tmd.is_dir() {
-        if !visited.insert(target) {
+        if !visited.insert(target.clone()) {
             // R5-L8/W46: a second link to an already-followed target (or a
             // true cycle) is skipped, but now warns and counts instead of
             // being silently omitted.
@@ -877,6 +877,22 @@ fn handle_followed_symlink(
             report.skipped_symlinks += 1;
             return Ok(()); // cycle guard / duplicate-target guard
         }
+        // W67/A-L5: an in-vault dir-symlink target is always independently
+        // walked (out-of-vault targets are skipped earlier), so the alias
+        // always double-lists the target's content under both keys - push a
+        // deterministic warning. Dedup is DECLINED (R-b): which copy would
+        // survive depends on `read_dir` enumeration order, so both copies
+        // stay listed and synced; a sync tool must not have a
+        // nondeterministic inventory.
+        let target_rel = target
+            .strip_prefix(&root_canon)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| target.display().to_string());
+        report.warnings.push(format!(
+            "following {} duplicates {}/ (dir symlink target is inside the vault); both copies are listed and synced",
+            path_to_key(rel)?,
+            target_rel
+        ));
         let key = format!("{}/", path_to_key(rel)?);
         if let Some(e) = folder_entity(path, &key)? {
             out.push(e);
@@ -2036,6 +2052,35 @@ mod tests {
             report.warnings
         );
         assert_eq!(report.skipped_symlinks, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_follow_symlinks_warns_on_in_vault_dir_alias() {
+        // W67/A-L5: a dir symlink whose canonical target is inside the vault
+        // (which is every followed dir symlink - out-of-vault targets are
+        // skipped earlier, and an in-vault target is always independently
+        // walked) double-lists the target's content under both keys. The walk
+        // must warn deterministically; both copies are still listed and synced
+        // (dedup is declined: the surviving key set would depend on read_dir
+        // order). Fails today (no warning).
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::create_dir_all(dir.join("realdir")).unwrap();
+        std::fs::write(dir.join("realdir/child.md"), "c").unwrap();
+        std::os::unix::fs::symlink("realdir", dir.join("linkdir")).unwrap();
+        let fs = LocalFs::with_follow(dir.path(), true);
+        let (ents, report) = fs.list_report().unwrap();
+        let keys: Vec<String> = ents.iter().map(|e| e.key.clone()).collect();
+        // no behavior change: both copies are still listed
+        assert!(keys.iter().any(|k| k == "realdir/child.md"));
+        assert!(keys.iter().any(|k| k == "linkdir/child.md"));
+        assert!(
+            report.warnings.iter().any(|w| w.contains("linkdir")
+                && w.contains("duplicates")
+                && w.contains("realdir/")),
+            "no in-vault alias warning: {:?}",
+            report.warnings
+        );
     }
 
     #[cfg(unix)]
