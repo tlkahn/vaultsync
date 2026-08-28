@@ -60,5 +60,10 @@ pub trait ObjectStore {
         mtime_ms: Option<u64>,
     ) -> Result<Entity, Error>;
     /// Remove an object.
+    ///
+    /// Delete is idempotent-friendly (W10/A-M3/B-L6): deleting an already-
+    /// absent key MAY return `Ok` (S3 is idempotent) **or** [`Error::NotFound`]
+    /// (the mock and `LocalFs::delete_file` do). Callers must treat both as
+    /// reaching the goal state; the executor normalizes `NotFound` to success.
     fn delete(&self, key: &str) -> Result<(), Error>;
 }

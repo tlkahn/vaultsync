@@ -68,10 +68,15 @@ pub fn execute_plan(
         }
     }
 
-    // Pass 3: destination-side deletes, after successful transfers.
+    // Pass 3: destination-side deletes, after successful transfers. W10
+    // (A-M3/B-L6): delete is idempotent-friendly across backends - deleting an
+    // already-gone key achieves the goal state, so NotFound is normalized to a
+    // success here (S3 delete is idempotent; LocalFs.delete_file still reports
+    // NotFound for a missing key, and the executor absorbs it).
     for a in plan.actions.iter().filter(|a| a.kind == ActionKind::DeleteRemote) {
         match store.delete(&a.key) {
             Ok(()) => rep.executed += 1,
+            Err(Error::NotFound(_)) => rep.executed += 1,
             Err(e) => fail(&mut rep, &a.key, e),
         }
     }
@@ -82,6 +87,7 @@ pub fn execute_plan(
                 rep.executed += 1;
                 deleted_local = true;
             }
+            Err(Error::NotFound(_)) => rep.executed += 1,
             Err(e) => fail(&mut rep, &a.key, e),
         }
     }
@@ -514,6 +520,27 @@ mod tests {
             rep.failed
         );
         assert!(!dir.join("a.md").exists());
+    }
+
+    #[test]
+    fn exec_delete_of_already_gone_key_is_success() {
+        // W10/A-M3/B-L6: deleting an already-absent remote key achieves the
+        // goal state; the executor counts it as success (idempotent-friendly,
+        // matching S3's idempotent delete) rather than a failure.
+        let dir = TempDir::new("vaultsync-exec");
+        let store = MemoryStore::new();
+        put_str(&store, "gone.md", "x", Some(100));
+        let local = LocalFs::new(dir.path());
+        let opts = PlanOpts {
+            delete: true,
+            ..Default::default()
+        };
+        let plan = crate::build_plan(&local, &store, Mode::Push, &opts).unwrap();
+        // remote vanishes before execution -> the planned delete sees NotFound
+        store.delete("gone.md").unwrap();
+        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Push, &opts);
+        assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep.failed);
+        assert_eq!(rep.executed, 1, "{:?}", rep);
     }
 
     #[test]
