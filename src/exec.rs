@@ -191,8 +191,8 @@ fn exec_download(
     // A destination that changed since the plan is NOT overwritten - the
     // user's newer edits survive; a vanished destination is recreated.
     if let Some(planned) = &a.local {
-        let freshness = local
-            .destination_freshness(&a.key, planned.size, planned.mtime_ms, tolerance_ms);
+        let freshness =
+            local.destination_freshness(&a.key, planned.size, planned.mtime_ms, tolerance_ms);
         // W21/N1: every error path after the temp was written must remove it,
         // including a refusal from `destination_freshness` itself (e.g. the
         // destination became a symlink) - mirroring the `Changed` arm below.

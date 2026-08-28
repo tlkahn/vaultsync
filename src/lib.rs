@@ -613,12 +613,7 @@ mod tests {
     }
 
     fn assert_no_check_probe(store: &MemoryStore) {
-        let keys: Vec<String> = store
-            .list("")
-            .unwrap()
-            .into_iter()
-            .map(|e| e.key)
-            .collect();
+        let keys: Vec<String> = store.list("").unwrap().into_iter().map(|e| e.key).collect();
         assert!(
             !keys.iter().any(|k| k.starts_with(".vaultsync-check-")),
             "probe leaked after failed check: {keys:?}"

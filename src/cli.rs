@@ -1220,7 +1220,10 @@ mod tests {
         }
     }
 
-    fn settings_with_ignore(vault: &std::path::Path, patterns: Vec<&str>) -> crate::config::Settings {
+    fn settings_with_ignore(
+        vault: &std::path::Path,
+        patterns: Vec<&str>,
+    ) -> crate::config::Settings {
         let mut s = no_store_settings(vault);
         s.ignore_patterns = patterns.iter().map(|s| s.to_string()).collect();
         s
