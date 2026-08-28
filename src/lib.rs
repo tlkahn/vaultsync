@@ -13,6 +13,7 @@ pub mod store;
 
 use std::path::Path;
 
+use crate::entity::Entity;
 use crate::error::Error;
 use crate::local::LocalFs;
 use crate::plan::{ActionKind, Mode, Plan, PlanOpts};
@@ -39,21 +40,33 @@ pub fn build_plan(
     let remote_entities: Vec<_> = remote_entities
         .into_iter()
         .filter(|e| !e.key.is_empty())
-        // R4-L4/W42 + W54/A-L2 + W63/A-L3: the reserved vaultsync namespace,
-        // final-segment policy shared with the local walker so the two sides
-        // cannot drift. A crashed `check` (SIGKILL between probe put and
-        // delete) can leave a `.vaultsync-check-*` object remotely, and a
-        // tmp-sibling key (`.name.vaultsync-tmp-*`) can reach the store
-        // out-of-band; neither must ever plan a Download (which would
-        // materialize a reserved dotfile locally). Users must not create
-        // such keys (object-store.md reserved namespace).
-        .filter(|e| {
-            !e.key
-                .rsplit('/')
-                .next()
-                .is_some_and(crate::local::is_reserved_vaultsync_key_name)
-        })
         .collect();
+    // W79/r9 L1: the reserved-namespace filter (W63/A-L3, R4-L4/W42 + W54/
+    // A-L2) is factored into a pure, unit-testable partition so the dropped
+    // keys can be counted and surfaced on stderr instead of vanishing
+    // silently. A crashed `check` (SIGKILL between probe put and delete) can
+    // leave a `.vaultsync-check-*` object remotely, and a tmp-sibling key
+    // (`.name.vaultsync-tmp-*`) can reach the store out-of-band; neither must
+    // ever plan a Download (which would materialize a reserved dotfile
+    // locally). Users must not create such keys (object-store.md reserved
+    // namespace), and now every run that encounters a leftover says so.
+    let (remote_entities, reserved_dropped) = partition_reserved_remote_keys(remote_entities);
+    if !reserved_dropped.is_empty() {
+        // W70-style one-line warning ("surface, don't hide"); names bounded
+        // so a pathological namespace can't flood stderr.
+        let names: Vec<String> = reserved_dropped.iter().map(|e| e.key.clone()).collect();
+        let shown = names.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+        let more = names.len().saturating_sub(5);
+        let suffix = if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "warning: ignoring {} remote object(s) under the reserved vaultsync namespace: {shown}{suffix}",
+            names.len()
+        );
+    }
     for e in &remote_entities {
         crate::entity::ensure_valid_key(&e.key)?;
     }
@@ -101,6 +114,31 @@ pub fn build_plan(
         p.stats = compute_stats(&p.actions);
     }
     Ok(p)
+}
+
+/// Split remote entities into `(kept, dropped)` by the reserved vaultsync
+/// namespace filter (W63/A-L3 + W79/r9 L1): a tmp-sibling key
+/// (`.name.vaultsync-tmp-*`) or a `.vaultsync-check-*` probe leftover on the
+/// remote is never planned. Pure and unit-testable offline; the `eprintln!`
+/// side effect over the `dropped` list lives in `build_plan` (not
+/// capture-tested, same precedent as W70). Both output lists preserve the
+/// input order.
+fn partition_reserved_remote_keys(entities: Vec<Entity>) -> (Vec<Entity>, Vec<Entity>) {
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for e in entities {
+        let reserved = e
+            .key
+            .rsplit('/')
+            .next()
+            .is_some_and(crate::local::is_reserved_vaultsync_key_name);
+        if reserved {
+            dropped.push(e);
+        } else {
+            kept.push(e);
+        }
+    }
+    (kept, dropped)
 }
 
 fn compute_stats(actions: &[plan::Action]) -> plan::PlanStats {
@@ -303,6 +341,59 @@ mod tests {
         fn delete(&self, key: &str) -> Result<(), Error> {
             Err(Error::NotFound(key.to_string()))
         }
+    }
+
+    #[test]
+    fn partition_reserved_remote_keys_splits_and_preserves_order() {
+        // W79/r9 L1: the pure partition splits tmp-sibling, check-probe, and
+        // nested reserved keys from normal keys, preserving order in both
+        // output lists (compile-RED on the helper). The `eprintln!` warning
+        // side effect itself is not capture-tested (same precedent as W70).
+        let all = vec![
+            crate::entity::file("a.md", 1, Some(1)),
+            crate::entity::file(".a.md.vaultsync-tmp-1-2", 2, Some(2)),
+            crate::entity::file("notes/.vaultsync-check-1-2-3", 3, Some(3)),
+            crate::entity::file("b.md", 4, Some(4)),
+            crate::entity::file("notes/.b.md.vaultsync-tmp-5-6", 5, Some(5)),
+        ];
+        let (kept, dropped) = partition_reserved_remote_keys(all);
+        let kept_keys: Vec<&str> = kept.iter().map(|e| e.key.as_str()).collect();
+        let dropped_keys: Vec<&str> = dropped.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(kept_keys, vec!["a.md", "b.md"], "kept order wrong");
+        assert_eq!(
+            dropped_keys,
+            vec![
+                ".a.md.vaultsync-tmp-1-2",
+                "notes/.vaultsync-check-1-2-3",
+                "notes/.b.md.vaultsync-tmp-5-6"
+            ],
+            "dropped order wrong"
+        );
+    }
+
+    #[test]
+    fn build_plan_drops_reserved_remote_keys_unchanged() {
+        // W79/r9 L1 behavior lock: with the counting + stderr warning added,
+        // reserved remote keys still produce NO plan rows (the W63 invariant
+        // pinned while the visibility is added).
+        let dir = TempDir::new("vaultsync-lib-test");
+        let local = LocalFs::new(dir.path());
+        let store = StubStore {
+            listed: vec![
+                crate::entity::file(".a.md.vaultsync-tmp-1-2", 25, Some(100)),
+                crate::entity::file("notes/.vaultsync-check-1-2-3", 25, Some(100)),
+                crate::entity::file("ok.md", 25, Some(100)),
+            ],
+        };
+        let p = build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        assert!(
+            !p.actions.iter().any(|a| {
+                a.key == ".a.md.vaultsync-tmp-1-2" || a.key == "notes/.vaultsync-check-1-2-3"
+            }),
+            "reserved keys planned: {:?}",
+            p.actions
+        );
+        assert!(p.actions.iter().any(|a| a.key == "ok.md"));
     }
 
     #[test]
