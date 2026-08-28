@@ -284,8 +284,21 @@ pub fn run_with_io(
             0
         }
         Command::Check { config: _c, verbose: _v } => {
-            let _ = writeln!(out, "check: ok");
-            0
+            match crate::check_store(store) {
+                Ok(()) => {
+                    let _ = writeln!(out, "check: ok");
+                    0
+                }
+                Err(crate::error::Error::Unauthorized(_)) => {
+                    let _ = writeln!(err, "check failed: credentials or permissions rejected");
+                    let _ = writeln!(err, "hint: check your credentials/bucket/region (expired keys, wrong region, bad bucket)");
+                    1
+                }
+                Err(e) => {
+                    let _ = writeln!(err, "check failed: {e}");
+                    1
+                }
+            }
         }
         Command::Status {
             vault,
@@ -918,6 +931,51 @@ mod tests {
         assert_eq!(code, 0);
         assert!(out.contains("check: ok"));
         assert!(!out.contains("(mock)"), "(mock) marker removed: {out}");
+    }
+
+    /// A store whose probe put is denied -> actionable failure path.
+    struct CheckFailStore {
+        inner: MemoryStore,
+    }
+    impl ObjectStore for CheckFailStore {
+        fn list(&self, prefix: &str) -> Result<Vec<crate::entity::Entity>, crate::error::Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.head(key)
+        }
+        fn get_to(
+            &self,
+            key: &str,
+            w: &mut dyn std::io::Write,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            _k: &str,
+            _r: &mut dyn std::io::Read,
+            _s: u64,
+            _m: Option<u64>,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            Err(crate::error::Error::Unauthorized("denied".to_string()))
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    #[test]
+    fn run_check_failure_actionable_message() {
+        let store = CheckFailStore {
+            inner: MemoryStore::new(),
+        };
+        let (code, _, err) = run(Command::check(), &store);
+        assert_eq!(code, 1);
+        assert!(
+            err.to_lowercase().contains("credential") || err.to_lowercase().contains("permission"),
+            "actionable hint missing: {err}"
+        );
     }
 
     #[test]

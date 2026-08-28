@@ -78,6 +78,28 @@ pub fn status_with_store(
     build_plan(&local, store, Mode::Status, opts)
 }
 
+/// Connectivity probe: write a tiny probe object, read it back, delete it.
+/// Succeeds only if put + get + delete all round-trip (lock: probe failure is
+/// a failure in Slice 8 - no head-bucket-only fallback).
+pub fn check_store(store: &dyn ObjectStore) -> Result<(), Error> {
+    let key = probe_key();
+    let body: &[u8] = b"vaultsync-connectivity-probe";
+    let mut writer = std::io::Cursor::new(body.to_vec());
+    let _ = store.put_from(&key, &mut writer, body.len() as u64, None)?;
+    let mut buf = Vec::new();
+    let ent = store.get_to(&key, &mut buf)?;
+    if buf != body || ent.size != body.len() as u64 {
+        return Err(Error::Other("check: read-back mismatch".to_string()));
+    }
+    store.delete(&key)?;
+    Ok(())
+}
+
+/// The vault-relative probe key used by `check`.
+pub fn probe_key() -> String {
+    format!(".vaultsync-check-{}", std::process::id())
+}
+
 /// Format a plan as human-readable text (Phase 1 subset of [cli.md]).
 pub fn format_plan_human(plan: &Plan) -> String {
     let s = &plan.stats;
@@ -402,6 +424,23 @@ mod tests {
         assert_eq!(note_lower.kind, ActionKind::Conflict);
         assert_eq!(note_lower.reason, "case_collision");
         assert_eq!(p.stats.conflict, 2);
+    }
+
+
+    #[test]
+    fn check_probe_key_under_prefix() {
+        // The probe key is a valid vault-relative key under a dot-prefix.
+        let k = probe_key();
+        assert!(k.starts_with(".vaultsync-check-"));
+        assert!(crate::entity::ensure_valid_key(&k).is_ok(), "invalid probe key {k:?}");
+    }
+
+    #[test]
+    fn check_store_succeeds_on_mock() {
+        let store = MemoryStore::new();
+        crate::check_store(&store).unwrap();
+        // probe object removed after the check
+        assert!(store.list("").unwrap().is_empty());
     }
 
 

@@ -241,7 +241,8 @@ fn is_timeout_err<E, R>(e: &SdkError<E, R>) -> bool {
 /// Thin shell over [`classify_error`] for a real SDK error.
 fn map_sdk_err<E: std::fmt::Debug>(e: &SdkError<E>, what: &str) -> Error {
     let status = e.raw_response().map(|r| r.status().as_u16());
-    let msg = format!("{what}: {e:?}");
+    // Display (not Debug) keeps the message concise and actionable.
+    let msg = format!("{what}: {e}");
     classify_error(is_timeout_err(e), status, &msg)
 }
 

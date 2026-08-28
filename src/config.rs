@@ -365,6 +365,21 @@ mtime_tolerance_ms = 1000
     }
 
     #[test]
+    fn resolve_settings_env_overrides_config_region() {
+        // Slice 8 lock: env `AWS_REGION` overrides an explicit config region.
+        let text = "[store]\nbucket = \"b\"\nregion = \"us-east-1\"\n";
+        let cfg = parse_config_str(text).unwrap();
+        let cwd = Cli::default();
+        let no_env = resolve_settings(&cfg, &cwd, &EnvSnapshot::default()).unwrap();
+        assert_eq!(no_env.store.region, "us-east-1");
+        let env = EnvSnapshot {
+            aws_region: Some("eu-west-3".to_string()),
+        };
+        let with_env = resolve_settings(&cfg, &cwd, &env).unwrap();
+        assert_eq!(with_env.store.region, "eu-west-3", "env overrides config region");
+    }
+
+    #[test]
     fn config_invalid_toml_reports_line() {
         // toml parse errors carry line info; they surface through the error.
         let text = "[store\nbucket = \"b\"\n";
