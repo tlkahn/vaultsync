@@ -123,13 +123,39 @@ impl S3Store {
                         last,
                     ));
                 }
-                match resp.next_continuation_token() {
-                    Some(t) if !t.is_empty() => continuation = Some(t.to_string()),
-                    _ => break,
+                match next_continuation(resp.is_truncated(), resp.next_continuation_token())? {
+                    Some(t) => continuation = Some(t),
+                    None => break,
                 }
             }
             Ok(out)
         })
+    }
+}
+
+/// Fail-closed pagination decision (W61/A-M1): a provider that reports a
+/// truncated page must hand back a continuation token. A truncated page with
+/// an absent or empty token is a mis-paging S3-compatible provider (R2/MinIO
+/// are named matrix targets) - a partial listing would be indistinguishable
+/// from a complete one, and `pull --delete` would classify genuinely-remote
+/// files missing from the partial page as local extras and delete them
+/// locally. Refuse loudly rather than plan against a false remote view. A
+/// non-truncated page (or a provider that stays silent about truncation, the
+/// AWS-absent case) ends the loop unchanged.
+fn next_continuation(
+    is_truncated: Option<bool>,
+    token: Option<&str>,
+) -> Result<Option<String>, Error> {
+    if is_truncated == Some(true) {
+        match token {
+            Some(t) if !t.is_empty() => Ok(Some(t.to_string())),
+            _ => Err(Error::Other(
+                "provider reports a truncated page with no continuation token; refusing a partial listing"
+                    .to_string(),
+            )),
+        }
+    } else {
+        Ok(None)
     }
 }
 
@@ -674,6 +700,41 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(&c0);
         let _ = std::fs::remove_file(&c1);
+    }
+
+    #[test]
+    fn next_continuation_fails_closed_on_truncated_without_token() {
+        // W61/A-M1: a truncated page must carry a continuation token. A
+        // provider that reports truncation with an absent or empty token
+        // (mis-paging R2/MinIO matrix target) would yield a partial listing
+        // indistinguishable from a complete one - fail loudly, never break
+        // silently and plan against a false remote view.
+        assert!(matches!(
+            next_continuation(Some(true), None),
+            Err(Error::Other(_))
+        ));
+        assert!(matches!(
+            next_continuation(Some(true), Some("")),
+            Err(Error::Other(_))
+        ));
+    }
+
+    #[test]
+    fn next_continuation_continues_with_token() {
+        // W61: a truncated page with a real token continues the loop.
+        assert_eq!(
+            next_continuation(Some(true), Some("tok")).unwrap(),
+            Some("tok".to_string())
+        );
+    }
+
+    #[test]
+    fn next_continuation_ends_on_complete_page() {
+        // W61: non-truncated pages (and providers that stay silent about
+        // truncation, the AWS-absent case) end the loop unchanged.
+        assert_eq!(next_continuation(Some(false), None).unwrap(), None);
+        assert_eq!(next_continuation(Some(false), Some("tok")).unwrap(), None);
+        assert_eq!(next_continuation(None, None).unwrap(), None);
     }
 
     #[test]
