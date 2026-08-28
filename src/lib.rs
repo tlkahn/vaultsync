@@ -146,8 +146,15 @@ fn partition_reserved_remote_keys(entities: Vec<Entity>) -> (Vec<Entity>, Vec<En
     let mut kept = Vec::new();
     let mut dropped = Vec::new();
     for e in entities {
+        // W109/L4: a folder-form key's reserved segment sits behind the
+        // trailing `/` (`rsplit('/').next()` on `.vaultsync-check-1/` yields
+        // the empty string); strip one trailing `/` first, same shape as
+        // `fold_key`, so the filter's stated final-segment policy also holds
+        // for folder-shaped keys.
         let reserved = e
             .key
+            .strip_suffix('/')
+            .unwrap_or(&e.key)
             .rsplit('/')
             .next()
             .is_some_and(crate::local::is_reserved_vaultsync_key_name);
@@ -364,6 +371,31 @@ mod tests {
         fn delete(&self, key: &str) -> Result<(), Error> {
             Err(Error::NotFound(key.to_string()))
         }
+    }
+
+    #[test]
+    fn partition_reserved_drops_trailing_slash_reserved_folder() {
+        // W109/L4: the reserved-namespace filter is a final-segment policy, so
+        // a folder-form key whose reserved segment is hidden behind the
+        // trailing `/` must still be dropped. `rsplit('/').next()` on
+        // `.vaultsync-check-1/` yields the empty string after the slash, so
+        // the reserved segment was never seen and the folder stayed in the
+        // plan (as a Skip row plus its synthesized parents). Fails today:
+        // both reserved folders are kept.
+        let all = vec![
+            crate::entity::folder(".vaultsync-check-1"),
+            crate::entity::folder("a/.name.vaultsync-tmp-1-2"),
+            crate::entity::folder("notes"),
+        ];
+        let (kept, dropped) = partition_reserved_remote_keys(all);
+        let kept_keys: Vec<&str> = kept.iter().map(|e| e.key.as_str()).collect();
+        let dropped_keys: Vec<&str> = dropped.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(kept_keys, vec!["notes/"], "kept wrong: {kept_keys:?}");
+        assert_eq!(
+            dropped_keys,
+            vec![".vaultsync-check-1/", "a/.name.vaultsync-tmp-1-2/"],
+            "dropped wrong: {dropped_keys:?}"
+        );
     }
 
     #[test]
