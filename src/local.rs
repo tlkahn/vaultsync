@@ -27,6 +27,9 @@ pub struct LocalFs {
     root: PathBuf,
     follow_symlinks: bool,
     report: std::cell::RefCell<WalkReport>,
+    /// Canonicalized vault root, computed once per instance on first use and
+    /// cached (W81/r8a-1 + r9-N2). See [`LocalFs::root_canonical`].
+    root_canon: std::sync::OnceLock<PathBuf>,
 }
 
 /// Pull destination state relative to the plan (W13/B-L4).
@@ -71,6 +74,7 @@ impl LocalFs {
             root: root.into(),
             follow_symlinks: false,
             report: std::cell::RefCell::new(WalkReport::default()),
+            root_canon: std::sync::OnceLock::new(),
         }
     }
 
@@ -81,7 +85,26 @@ impl LocalFs {
             root: root.into(),
             follow_symlinks,
             report: std::cell::RefCell::new(WalkReport::default()),
+            root_canon: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Canonicalized vault root, computed once per [`LocalFs`] and cached
+    /// (W81/r8a-1 + r9-N2). Previously every `ensure_locality` call
+    /// re-canonicalized the root (9 call sites, tens of thousands of
+    /// redundant syscalls at 10k-file scale) and `handle_followed_symlink`
+    /// did so per symlink. Caching also makes a mid-run root-symlink swap
+    /// yield one consistent boundary decision per instance instead of
+    /// potentially disagreeing canonicalizations (the reviewer's correctness
+    /// half). Errors propagate exactly as a per-call canonicalize did; the
+    /// success is cached, a failure is retried next call
+    /// (`get_or_try_init` is unstable, hence this shape).
+    fn root_canonical(&self) -> Result<&Path, Error> {
+        if let Some(c) = self.root_canon.get() {
+            return Ok(c);
+        }
+        let canon = std::fs::canonicalize(&self.root)?;
+        Ok(self.root_canon.get_or_init(|| canon).as_path())
     }
 
     /// The report from the most recent walk (symlink skips/warnings).
@@ -112,9 +135,16 @@ impl LocalFs {
         let opts = WalkOpts {
             follow_symlinks: self.follow_symlinks,
         };
+        // W81/r8a-1: the canonicalized root is computed once per LocalFs and
+        // threaded through the walk, instead of being re-canonicalized per
+        // followed symlink - a 10k-file tree no longer pays tens of thousands
+        // of redundant syscalls, and a mid-run root symlink swap yields one
+        // consistent boundary decision.
+        let root_canon = self.root_canonical()?;
         walk(
             &self.root,
             &self.root,
+            root_canon,
             &mut out,
             &opts,
             &mut report,
@@ -558,7 +588,7 @@ impl LocalFs {
     /// are surfaced instead of silently swallowed. Only touches dirs that are
     /// currently empty; file deletes are planned separately by the executor.
     pub fn remove_empty_ancestor_dirs(&self, keys: &[String]) -> Result<(u32, Vec<String>), Error> {
-        let root_canon = std::fs::canonicalize(&self.root)?;
+        let root_canon = self.root_canonical()?;
         let mut removed = 0u32;
         let mut warnings: Vec<String> = Vec::new();
         // Ancestor dirs of each key, deepest-first (the file's parent first,
@@ -599,7 +629,7 @@ impl LocalFs {
             if canon == root_canon {
                 continue; // never remove the root (belt and braces)
             }
-            if !canon.starts_with(&root_canon) {
+            if !canon.starts_with(root_canon) {
                 continue;
             }
             // W57: the emptiness probe is honest - a directory whose read_dir
@@ -630,12 +660,12 @@ impl LocalFs {
     /// under the canonicalized vault root. A parent swapped for an out-of-vault
     /// symlink canonicalizes outside and is refused before any mkdir/write.
     fn ensure_locality(&self, dir: &Path) -> Result<(), Error> {
-        let root_canon = std::fs::canonicalize(&self.root)?;
+        let root_canon = self.root_canonical()?;
         let mut probe: &Path = dir;
         loop {
             if probe.exists() {
                 let canon = std::fs::canonicalize(probe)?;
-                if !canon.starts_with(&root_canon) {
+                if !canon.starts_with(root_canon) {
                     return Err(Error::Other(format!(
                         "refusing to operate outside the vault root: {}",
                         probe.display()
@@ -884,6 +914,7 @@ fn is_empty_dir(d: &Path) -> std::io::Result<bool> {
 fn walk(
     dir: &Path,
     root: &Path,
+    root_canon: &Path,
     out: &mut Vec<Entity>,
     opts: &WalkOpts,
     report: &mut WalkReport,
@@ -914,7 +945,7 @@ fn walk(
                 report.skipped_symlinks += 1;
                 continue;
             }
-            handle_followed_symlink(&entry.path(), root, out, report, visited)?;
+            handle_followed_symlink(&entry.path(), root, root_canon, out, report, visited)?;
             continue;
         }
         let path = entry.path();
@@ -931,7 +962,7 @@ fn walk(
             if let Some(e) = folder_entity(&path, &key)? {
                 out.push(e);
             }
-            walk(&path, root, out, opts, report, visited)?;
+            walk(&path, root, root_canon, out, opts, report, visited)?;
         } else if ft.is_file() {
             // W23/M1: a reserved vaultsync temp sibling (crash leftover) is
             // never emitted as a key.
@@ -954,6 +985,7 @@ fn walk(
 fn handle_followed_symlink(
     path: &Path,
     root: &Path,
+    root_canon: &Path,
     out: &mut Vec<Entity>,
     report: &mut WalkReport,
     visited: &mut std::collections::HashSet<PathBuf>,
@@ -966,8 +998,7 @@ fn handle_followed_symlink(
         Err(e) => return Err(e.into()),
         Ok(t) => t,
     };
-    let root_canon = std::fs::canonicalize(root)?;
-    if !target.starts_with(&root_canon) {
+    if !target.starts_with(root_canon) {
         report.warnings.push(format!(
             "skipping {} (symlink escapes vault root)",
             path_to_key(rel)?
@@ -1000,7 +1031,7 @@ fn handle_followed_symlink(
         // stay listed and synced; a sync tool must not have a
         // nondeterministic inventory.
         let target_rel = target
-            .strip_prefix(&root_canon)
+            .strip_prefix(root_canon)
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| target.display().to_string());
         report.warnings.push(format!(
@@ -1017,6 +1048,7 @@ fn handle_followed_symlink(
         walk(
             path,
             root,
+            root_canon,
             out,
             &WalkOpts {
                 follow_symlinks: true,
@@ -1337,6 +1369,7 @@ mod tests {
         let mut visited = std::collections::HashSet::new();
         walk(
             &missing_sub,
+            &dir,
             &dir,
             &mut out,
             &WalkOpts {
@@ -1907,6 +1940,41 @@ mod tests {
             fs.delete_file("a.md").unwrap_err(),
             Error::NotFound(_)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_ops_reuse_cached_root_canonicalization() {
+        // W81 (r8a-1/r9-N2) characterization: the canonicalized vault root is
+        // computed once per LocalFs and cached. A root-level symlink
+        // retargeted mid-run does NOT silently move the security boundary:
+        // the instance keeps deciding against its first canonicalization
+        // (refuses the new target), while a fresh instance adopts the new
+        // root - one consistent decision per instance. RED before W81: a
+        // per-call canonicalize followed the retarget and accepted the second
+        // decision.
+        let dir = TempDir::new("vaultsync-test");
+        let real1 = dir.join("real1");
+        let real2 = dir.join("real2");
+        std::fs::create_dir_all(real1.join("notes")).unwrap();
+        std::fs::create_dir_all(real2.join("notes")).unwrap();
+        std::os::unix::fs::symlink(&real1, dir.join("vault")).unwrap();
+        let fs = LocalFs::new(dir.join("vault"));
+        // first use: canonicalize the root (cached) and accept an in-root path
+        fs.ensure_locality(&dir.join("vault/notes")).unwrap();
+        // retarget the root symlink to a DIFFERENT dir mid-run
+        std::fs::remove_file(dir.join("vault")).unwrap();
+        std::os::unix::fs::symlink(&real2, dir.join("vault")).unwrap();
+        // the same instance keeps its first boundary: the new target is
+        // outside it and must be refused
+        let err = fs.ensure_locality(&dir.join("vault/notes")).unwrap_err();
+        assert!(
+            format!("{err}").contains("outside"),
+            "cached boundary moved: {err}"
+        );
+        // a fresh instance adopts the new root (per-instance consistency)
+        let fresh = LocalFs::new(dir.join("vault"));
+        fresh.ensure_locality(&dir.join("vault/notes")).unwrap();
     }
 
     #[cfg(unix)]
