@@ -13,7 +13,6 @@ use crate::error::Error;
 
 pub const DEFAULT_MTIME_TOLERANCE_MS: u64 = 1000;
 pub const DEFAULT_CONCURRENCY: u32 = 4;
-pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// On-disk config mirroring [cli.md]. All sections optional; defaults applied
 /// at resolution time.
@@ -78,7 +77,9 @@ pub struct Settings {
 pub struct StoreSettings {
     /// Empty only when no `[store]` section was present (mock/offline phase).
     pub bucket: String,
-    pub region: String,
+    /// Region override; `None` means "let the AWS default chain decide" (env,
+    /// shared config, profile) - never a hardcoded guess (W7/B-M2).
+    pub region: Option<String>,
     pub endpoint: Option<String>,
     /// Vault-relative prefix with a normalized trailing `/` (`""` when none).
     pub prefix: String,
@@ -168,15 +169,11 @@ pub fn resolve_settings(
 }
 
 fn resolve_store(store: Option<&StoreConfig>, env: &EnvSnapshot) -> Result<StoreSettings, Error> {
-    let region_default = env
-        .aws_region
-        .clone()
-        .unwrap_or_else(|| DEFAULT_REGION.to_string());
     match store {
         // No `[store]` section -> offline/mock defaults, never an error.
         None => Ok(StoreSettings {
             bucket: String::new(),
-            region: region_default,
+            region: None,
             endpoint: None,
             prefix: String::new(),
             path_style: false,
@@ -195,13 +192,11 @@ fn resolve_store(store: Option<&StoreConfig>, env: &EnvSnapshot) -> Result<Store
             if bucket.is_empty() {
                 return Err(Error::Other("store.bucket must not be empty".to_string()));
             }
-            // Env `AWS_REGION` overrides an explicit config region (locked by
-            // resolve_settings_env_overrides_config_region).
-            let region = env
-                .aws_region
-                .clone()
-                .or_else(|| s.region.clone())
-                .unwrap_or_else(|| DEFAULT_REGION.to_string());
+            // Env `AWS_REGION` overrides an explicit config region; with
+            // neither set the result is `None` so the AWS default chain
+            // (env/shared config/profile) decides (W7/B-M2; env-over-config
+            // precedence locked by resolve_settings_env_overrides_config_region).
+            let region = env.aws_region.clone().or_else(|| s.region.clone());
             Ok(StoreSettings {
                 bucket,
                 region,
@@ -275,7 +270,7 @@ mtime_tolerance_ms = 1000
         let cfg = parse_config_str(text).unwrap();
         let s = settings(&cfg).unwrap();
         assert_eq!(s.store.bucket, "b");
-        assert_eq!(s.store.region, "eu-west-1");
+        assert_eq!(s.store.region.as_deref(), Some("eu-west-1"));
         assert_eq!(s.store.prefix, "");
         assert!(!s.store.path_style);
         assert_eq!(s.mtime_tolerance_ms, 1000, "tolerance default");
@@ -371,12 +366,26 @@ mtime_tolerance_ms = 1000
         let cfg = parse_config_str(text).unwrap();
         let cwd = Cli::default();
         let no_env = resolve_settings(&cfg, &cwd, &EnvSnapshot::default()).unwrap();
-        assert_eq!(no_env.store.region, "us-east-1");
+        assert_eq!(no_env.store.region.as_deref(), Some("us-east-1"));
         let env = EnvSnapshot {
             aws_region: Some("eu-west-3".to_string()),
         };
         let with_env = resolve_settings(&cfg, &cwd, &env).unwrap();
-        assert_eq!(with_env.store.region, "eu-west-3", "env overrides config region");
+        assert_eq!(
+            with_env.store.region.as_deref(),
+            Some("eu-west-3"),
+            "env overrides config region"
+        );
+    }
+
+    #[test]
+    fn region_unconfigured_is_none() {
+        // W7/B-M2: no [store].region and no AWS_REGION env -> region is None
+        // so the AWS default chain (env/shared config/profile) decides.
+        let text = "[store]\nbucket = \"b\"\n";
+        let cfg = parse_config_str(text).unwrap();
+        let s = settings(&cfg).unwrap();
+        assert_eq!(s.store.region, None);
     }
 
     #[test]

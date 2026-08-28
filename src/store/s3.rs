@@ -60,8 +60,14 @@ impl S3Store {
         let client = rt.block_on(async {
             let sdk = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
             let mut b = aws_sdk_s3::config::Builder::from(&sdk)
-                .region(aws_sdk_s3::config::Region::new(settings.region.clone()))
                 .force_path_style(settings.path_style);
+            // W7/B-M2: only override the region when explicitly configured;
+            // `None` leaves the AWS default chain (env, shared config,
+            // profile) already loaded into `sdk` to decide - never a
+            // hardcoded guess.
+            if let Some(r) = &settings.region {
+                b = b.region(aws_sdk_s3::config::Region::new(r.clone()));
+            }
             if let Some(ep) = &settings.endpoint {
                 b = b.endpoint_url(ep);
             }

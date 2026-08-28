@@ -1095,7 +1095,7 @@ mod tests {
             vault_root: vault.to_path_buf(),
             store: crate::config::StoreSettings {
                 bucket: String::new(),
-                region: String::new(),
+                region: None,
                 endpoint: None,
                 prefix: String::new(),
                 path_style: false,

@@ -65,7 +65,7 @@ where
 
     let settings = StoreSettings {
         bucket: bucket.clone(),
-        region,
+        region: Some(region),
         endpoint,
         prefix,
         path_style,
@@ -151,7 +151,7 @@ fn s3_integ_prefix_isolation() {
         let region = std::env::var("VAULTSYNC_TEST_S3_REGION").unwrap_or_else(|_| "us-west-1".into());
         let other = S3Store::new(&StoreSettings {
             bucket,
-            region,
+            region: Some(region),
             endpoint: None,
             prefix: format!("vaultsync-other-prefix-{}", unique_num()),
             path_style: false,
