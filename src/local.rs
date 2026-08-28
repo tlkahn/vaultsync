@@ -216,7 +216,12 @@ impl LocalFs {
             let _ = std::fs::remove_file(tmp);
             return Err(e);
         }
-        std::fs::rename(tmp, &path)?;
+        // W15/A-L2: a rename error must also clean the temp sibling (the
+        // mtime/sync path above already does on its own failures).
+        if let Err(e) = std::fs::rename(tmp, &path) {
+            let _ = std::fs::remove_file(tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -1094,6 +1099,29 @@ mod tests {
             !outside.join("a.md").exists(),
             "renamed through the swapped parent into outside"
         );
+    }
+
+    #[test]
+    fn finalize_write_removes_tmp_on_rename_failure() {
+        // W15/A-L2: if the atomic rename fails the temp sibling must be
+        // removed. Drive the rename to fail by making the final path an
+        // existing directory (rename file->dir -> EISDIR on Unix); the parent
+        // stays a real, writable dir so the cleanup itself can succeed (the
+        // read-only-parent variant would also block remove_file).
+        let dir = TempDir::new("vaultsync-test");
+        let fs = LocalFs::new(dir.path());
+        let tmp = fs.tmp_path_for("sub/a.md").unwrap();
+        std::fs::write(&tmp, "payload").unwrap();
+        std::fs::create_dir_all(dir.join("sub/a.md")).unwrap();
+        let err = fs.finalize_write("sub/a.md", &tmp, None).unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "expected io error, got: {err}");
+        assert!(
+            !tmp.exists(),
+            "temp sibling leaked on rename failure: {:?}",
+            tmp
+        );
+        // the directory (final path) is untouched
+        assert!(dir.join("sub/a.md").is_dir());
     }
 
     #[test]
