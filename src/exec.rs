@@ -1084,8 +1084,8 @@ mod tests {
         assert!(
             rep.warnings
                 .iter()
-                .any(|w| w.contains("empty-dir") || w.contains("cleanup")),
-            "no cleanup warning: {:?}",
+                .any(|w| w.contains("locked") && w.contains("inspect")),
+            "no cleanup warning naming the unreadable dir: {:?}",
             rep.warnings
         );
         // non-fatal: the delete itself succeeded, no failed keys

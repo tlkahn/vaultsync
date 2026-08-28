@@ -497,7 +497,8 @@ impl LocalFs {
     /// Remove now-empty directories bottom-up (R2.1 option a): children-first,
     /// stop at any non-empty dir, never remove the vault root. Returns how
     /// many directories were removed plus per-dir warning strings for dirs
-    /// that could not be removed (R4/R5 nit, W47) - unspecified failures are
+    /// that could not be removed (R4/R5 nit, W47) or whose emptiness could
+    /// not be probed (an unreadable dir, W57) - unspecified failures are
     /// surfaced instead of silently swallowed. Only touches dirs that are
     /// currently empty; file deletes are planned separately by the executor.
     pub fn remove_empty_dirs_bottom_up(&self) -> Result<(u32, Vec<String>), Error> {
@@ -516,16 +517,28 @@ impl LocalFs {
             if canon == root_canon {
                 continue; // never remove the root
             }
-            if canon.starts_with(&root_canon) && is_empty_dir(d) {
-                match std::fs::remove_dir(d) {
-                    Ok(()) => removed += 1,
-                    // Vanished mid-pass: the goal state (dir absent) is
-                    // achieved; do not report.
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        warnings.push(format!("could not remove empty dir {}: {e}", d.display()))
-                    }
+            if !canon.starts_with(&root_canon) {
+                continue;
+            }
+            // W57: the emptiness probe is honest - a directory whose read_dir
+            // fails (e.g. chmod 0o000) is surfaced as a cleanup warning
+            // naming the dir, never silently treated as non-empty.
+            let empty = match is_empty_dir(d) {
+                Ok(b) => b,
+                Err(e) => {
+                    warnings.push(format!("could not inspect empty dir {}: {e}", d.display()));
+                    continue;
                 }
+            };
+            if !empty {
+                continue;
+            }
+            match std::fs::remove_dir(d) {
+                Ok(()) => removed += 1,
+                // Vanished mid-pass: the goal state (dir absent) is
+                // achieved; do not report.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warnings.push(format!("could not remove empty dir {}: {e}", d.display())),
             }
         }
         Ok((removed, warnings))
@@ -667,11 +680,12 @@ fn set_file_mtime_ms(f: &std::fs::File, ms: u64) -> Result<(), Error> {
     Ok(())
 }
 
-/// Whether a directory currently has no entries.
-fn is_empty_dir(d: &Path) -> bool {
-    std::fs::read_dir(d)
-        .map(|mut rd| rd.next().is_none())
-        .unwrap_or(false)
+/// Whether a directory currently has no entries. `Err` when the emptiness
+/// cannot be determined (e.g. an unreadable directory) - the caller surfaces
+/// it as a warning instead of silently assuming non-empty (W57).
+fn is_empty_dir(d: &Path) -> std::io::Result<bool> {
+    let mut rd = std::fs::read_dir(d)?;
+    Ok(rd.next().is_none())
 }
 
 /// Pre-order accumulate of all directories under `root` (root included).
@@ -687,7 +701,11 @@ fn collect_dirs(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> {
         let p = entry.path();
         if ft.is_dir() {
             out.push(p.clone());
-            collect_dirs(&p, out)?;
+            // W57: an unreadable subdir must not abort the whole cleanup
+            // pass - it was already pushed, and the emptiness probe in
+            // `remove_empty_dirs_bottom_up` surfaces a per-dir warning for
+            // it instead.
+            let _ = collect_dirs(&p, out);
         }
     }
     out.push(root.to_path_buf());
@@ -1718,6 +1736,31 @@ mod tests {
         assert!(
             warnings.iter().any(|w| w.contains("b")),
             "no per-dir warning naming b: {warnings:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_empty_dirs_warns_on_unreadable_dir() {
+        // W57 (B nit): a directory whose emptiness cannot be probed (read_dir
+        // fails, e.g. chmod 0o000) is surfaced as a cleanup warning naming
+        // the dir - never silently treated as non-empty and skipped. The
+        // removed count is 0 (nothing succeeded). Fails today: the read_dir
+        // failure aborts the whole pass, so no warning is produced.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::create_dir_all(dir.join("n/zero")).unwrap();
+        let fs = LocalFs::new(dir.path());
+        std::fs::set_permissions(dir.join("n/zero"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let (removed, warnings) = fs.remove_empty_dirs_bottom_up().unwrap();
+        // restore perms so TempDir drop can remove the tree
+        std::fs::set_permissions(dir.join("n/zero"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert_eq!(removed, 0, "no dir removed under an unreadable dir");
+        assert!(
+            warnings.iter().any(|w| w.contains("zero")),
+            "no warning naming the unreadable dir: {warnings:?}"
         );
     }
 
