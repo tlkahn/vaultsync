@@ -62,7 +62,10 @@ impl S3Store {
         // W88/r10-L2: best-effort reap of stale upload temp buffers left by a
         // crashed run in the shared temp dir. Conservative 24h age; every
         // error is swallowed (hygiene, not an operation the user can act on).
-        reap_stale_upload_temps(&std::env::temp_dir(), UPLOAD_TEMP_MAX_AGE_SECS);
+        // W97/H2: gated to run at most once per process - construction must
+        // be cheap and idempotent, and test binaries constructing many
+        // stores must not re-scan the OS temp dir on every call.
+        reap_stale_upload_temps_once();
         // W48: a current-thread runtime matches the one-`block_on`-at-a-time
         // sync architecture (each call `block_on`s once); a multi-thread
         // runtime would add worker threads with no parallelization benefit.
@@ -377,6 +380,23 @@ const UPLOAD_TEMP_MAX_AGE_SECS: u64 = 24 * 3600;
 /// hygiene: a crash/SIGKILL between buffering and `remove_file` leaks a full
 /// buffered object in the shared temp dir, and no cross-run cleanup existed
 /// (contrast the vault-side temp siblings, which the walker counts and the
+/// Process-wide reap guard (W97/H2). `S3Store::new` must be cheap and
+/// idempotent: construction is a common operation (one per run, but many in
+/// test binaries), while the OS-temp-dir sweep is cross-process hygiene that
+/// only ever needs to happen once per process. The W88 semantics are
+/// unchanged - same best-effort reap, same swallow-all-errors behavior - only
+/// the cadence is gated.
+static REAP_ONCE: std::sync::Once = std::sync::Once::new();
+
+/// Run the W88 stale-upload-temp reap at most once per process. Repeat calls
+/// are no-ops; the actual reaping behavior lives in `reap_stale_upload_temps`
+/// (directly tested by the W88 tests).
+fn reap_stale_upload_temps_once() {
+    REAP_ONCE.call_once(|| {
+        reap_stale_upload_temps(&std::env::temp_dir(), UPLOAD_TEMP_MAX_AGE_SECS);
+    });
+}
+
 /// CLI surfaces - W23/W41). Only regular files whose name matches
 /// `vaultsync-upload-*` AND whose mtime is older than `max_age_secs` are
 /// removed; fresh buffers (a concurrent process's in-flight upload) and
@@ -690,6 +710,19 @@ mod tests {
         assert!(fresh.exists(), "fresh in-flight buffer must survive");
         assert!(other.exists(), "unrelated file must survive");
         assert!(dir.exists(), "the reap dir itself must survive");
+    }
+
+    #[test]
+    fn reap_once_is_idempotent_no_panic() {
+        // H2 (W97): S3Store::new must not sweep the shared OS temp dir on
+        // every construction - the reap is process-wide hygiene, not a
+        // per-constructor cost. The `reap_stale_upload_temps_once` wrapper
+        // must exist and be safe to call any number of times (repeat calls
+        // are no-ops); the actual reaping behavior is covered by the W88
+        // tests against the pure inner function. RED: the wrapper does not
+        // exist (compile failure).
+        reap_stale_upload_temps_once();
+        reap_stale_upload_temps_once();
     }
 
     #[test]
