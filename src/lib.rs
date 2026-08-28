@@ -796,6 +796,42 @@ mod tests {
         assert_eq!(notes_folder.reason, "case_collision");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn build_plan_case_collision_conflict_survives_follow_override() {
+        // W72 (locks the REFUTED round-7 B nit): a key that is BOTH a case
+        // collision AND a followed file symlink keeps its `case_collision`
+        // Conflict in mutating modes. The case-collision preflight runs
+        // first (row -> Conflict), and the W38/W51 followed-symlink override
+        // matches only Upload|Download|DeleteLocal - a Conflict row is not in
+        // its match arms. Cross-side construction (local followed symlink
+        // `link.md` vs remote `LINK.md`) keeps the test platform-safe: on a
+        // case-insensitive filesystem two same-side case variants cannot
+        // coexist.
+        let dir = TempDir::new("vaultsync-lib-test");
+        std::fs::write(dir.join("target.md"), "real-target").unwrap();
+        std::os::unix::fs::symlink("target.md", dir.join("link.md")).unwrap();
+        let local = LocalFs::with_follow(dir.path(), true);
+        let store = StubStore {
+            listed: vec![crate::entity::file("LINK.md", 11, Some(100))],
+        };
+        let p = build_plan(&local, &store, Mode::Push, &PlanOpts::default()).unwrap();
+        let link = p
+            .actions
+            .iter()
+            .find(|a| a.key == "link.md")
+            .expect("link.md row");
+        assert_eq!(
+            link.kind,
+            ActionKind::Conflict,
+            "case_collision Conflict overridden: {link:?}"
+        );
+        assert_eq!(
+            link.reason, "case_collision",
+            "case_collision reason dropped: {link:?}"
+        );
+    }
+
     #[test]
     fn build_plan_ignores_tmp_leftover() {
         // W23/M1: a planted vaultsync temp sibling produces no Upload row and
