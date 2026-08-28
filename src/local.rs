@@ -154,10 +154,31 @@ impl LocalFs {
                 path.display()
             )));
         }
+        // W26/M4: re-verify parent locality before opening (mirrors the
+        // download/write sides). A parent dir swapped for an out-of-vault
+        // symlink since the walk canonicalizes outside the root and must be
+        // refused - the outside file must never be uploaded under a vault key.
+        let parent = path.parent().ok_or_else(|| {
+            Error::Other(format!("open_verified has no parent dir: {}", path.display()))
+        })?;
+        self.ensure_locality(parent)?;
         let f = std::fs::File::open(&path)?;
         // Stats the OPENED descriptor (not a second path stat): a re-stat of
         // the path could describe a different file that replaced it.
         let fmd = f.metadata()?;
+        // W26/L5-leaf: on unix, close the leaf TOCTOU window with std only - a
+        // leaf swapped between the symlink_metadata above and open would have a
+        // different (dev, ino); refuse rather than read a planted file.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if fmd.dev() != smd.dev() || fmd.ino() != smd.ino() {
+                return Err(Error::Other(format!(
+                    "open_verified: leaf identity changed for {} (refusing to open a swapped file)",
+                    key
+                )));
+            }
+        }
         if !fmd.is_file() {
             return Err(Error::Other(format!(
                 "open_verified: not a regular file: {}",
@@ -1084,6 +1105,39 @@ mod tests {
         assert!(
             format!("{err}").contains("symlink"),
             "expected symlink refusal, got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_verified_refuses_out_of_vault_parent_swap() {
+        // W26/M4: if a parent dir is swapped for an out-of-vault symlink
+        // between walk and open, `open_verified` must refuse (locality) and
+        // never open the outside file under a vault key. `notes/` -> symlink to
+        // an outside dir that also contains a.md.
+        let dir = TempDir::new("vaultsync-test");
+        let outside = TempDir::new("vaultsync-outside");
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join("notes/a.md"), "in-vault").unwrap();
+        std::fs::create_dir_all(outside.join("notes")).unwrap();
+        std::fs::write(outside.join("notes/a.md"), "OUTSIDE-SECRET").unwrap();
+        let fs = LocalFs::new(dir.path());
+        // capture size/mtime as the plan would
+        let md = std::fs::metadata(dir.join("notes/a.md")).unwrap();
+        // swap the parent for a symlink to the outside dir
+        std::fs::remove_dir_all(dir.join("notes")).unwrap();
+        std::os::unix::fs::symlink(outside.join("notes"), dir.join("notes")).unwrap();
+        let err = fs
+            .open_verified("notes/a.md", md.len(), None, 1000)
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("outside"),
+            "expected locality refusal: {err}"
+        );
+        // the outside file must be untouched (never opened/read as a vault key)
+        assert_eq!(
+            std::fs::read(outside.join("notes/a.md")).unwrap(),
+            b"OUTSIDE-SECRET"
         );
     }
 
