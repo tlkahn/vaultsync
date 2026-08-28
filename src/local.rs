@@ -409,13 +409,7 @@ impl LocalFs {
             Error::Other(format!("delete_file has no parent dir: {}", path.display()))
         })?;
         self.ensure_locality(parent)?;
-        match std::fs::remove_file(&path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(Error::NotFound(key.to_string()))
-            }
-            Err(e) => Err(e.into()),
-            Ok(()) => Ok(()),
-        }
+        self.unlink_local_file(parent, &path, key)
     }
 
     /// Delete a single file only if it still matches the plan (R4-L1/W39,
@@ -429,11 +423,13 @@ impl LocalFs {
     /// when the planted outside inode matches the planned size/mtime
     /// (freshness authenticates the inode, not the path resolution).
     ///
-    /// N3-residual (W59): the guarded delete is a check-then-act stat
+    /// N3-residual (W60): the guarded delete is a check-then-act stat
     /// followed by a by-path `remove_file` (std has no fd-based delete), so
     /// a leaf swapped in the window between the stat and the unlink is still
     /// removed - the same residual class as the download note; fd-based
-    /// delete is a post-v1 item.
+    /// delete is a post-v1 item. The *parent* swap half is closed by the
+    /// pre-unlink locality re-check in [`LocalFs::unlink_local_file`] (W60,
+    /// B-M1), which mirrors `commit_temp`.
     pub fn delete_file_guarded(
         &self,
         key: &str,
@@ -492,6 +488,26 @@ impl LocalFs {
         }
         std::fs::remove_file(&path)?;
         Ok(())
+    }
+
+    /// Shared unlink tail for both delete APIs (`delete_file` and
+    /// `delete_file_guarded`): re-verify parent locality immediately before
+    /// the unlink (W60/B-M1, mirroring `commit_temp`). A parent swapped for
+    /// an out-of-vault symlink since the entry-time check - the race window
+    /// between the freshness stat and the unlink - must be refused, never
+    /// unlinked through. `NotFound` maps to [`Error::NotFound`] (the
+    /// unguarded API's contract). Leaf-swap residuals are unchanged (the
+    /// entry checks already close the walk-to-stat window; the stat-to-
+    /// unlink leaf window remains, fd-based delete is post-v1).
+    fn unlink_local_file(&self, parent: &Path, path: &Path, key: &str) -> Result<(), Error> {
+        self.ensure_locality(parent)?;
+        match std::fs::remove_file(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(Error::NotFound(key.to_string()))
+            }
+            Err(e) => Err(e.into()),
+            Ok(()) => Ok(()),
+        }
     }
 
     /// Remove now-empty directories bottom-up (R2.1 option a): children-first,
@@ -1687,6 +1703,79 @@ mod tests {
         assert_eq!(
             std::fs::read(outside.join("notes/a.md")).unwrap(),
             b"in-vault"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_file_guarded_rechecks_locality_before_unlink() {
+        // W60 (B-M1): the entry-time locality check guards the freshness
+        // stat, but the unlink itself must re-check immediately before
+        // `remove_file` (mirroring `commit_temp`). Simulate the plan-to-
+        // execute race window deterministically: the parent is swapped for an
+        // out-of-vault symlink AFTER the entry-time check passes, then the
+        // seam (the final pre-unlink check) is called directly. The outside
+        // file must survive - a parent swapped after the entry check must
+        // never be unlinked through.
+        let dir = TempDir::new("vaultsync-test");
+        let outside = TempDir::new("vaultsync-outside");
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join("notes/a.md"), "in-vault").unwrap();
+        std::fs::create_dir_all(outside.join("notes")).unwrap();
+        std::fs::write(outside.join("notes/a.md"), "outside-plant").unwrap();
+        let fs = LocalFs::new(dir.path());
+        let parent = dir.join("notes");
+        // the entry-time check passes against the real in-vault dir
+        fs.ensure_locality(&parent).unwrap();
+        // swap the parent for a symlink to the outside dir (the race window)
+        std::fs::remove_dir_all(&parent).unwrap();
+        std::os::unix::fs::symlink(outside.join("notes"), &parent).unwrap();
+        let path = parent.join("a.md");
+        let err = fs
+            .unlink_local_file(&parent, &path, "notes/a.md")
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("outside"),
+            "expected locality refusal: {err}"
+        );
+        // the outside file must survive (never unlinked through the swapped
+        // parent)
+        assert_eq!(
+            std::fs::read(outside.join("notes/a.md")).unwrap(),
+            b"outside-plant"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_file_rechecks_locality_before_unlink() {
+        // W60 (B-M1): same pre-unlink locality re-check for the unguarded
+        // `delete_file` API (test-only callers today, but public). The seam
+        // must refuse a parent swapped after the entry-time check.
+        let dir = TempDir::new("vaultsync-test");
+        let outside = TempDir::new("vaultsync-outside");
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join("notes/a.md"), "in-vault").unwrap();
+        std::fs::create_dir_all(outside.join("notes")).unwrap();
+        std::fs::write(outside.join("notes/a.md"), "outside-plant").unwrap();
+        let fs = LocalFs::new(dir.path());
+        let parent = dir.join("notes");
+        // the entry-time check passes against the real in-vault dir
+        fs.ensure_locality(&parent).unwrap();
+        // swap the parent for a symlink to the outside dir (the race window)
+        std::fs::remove_dir_all(&parent).unwrap();
+        std::os::unix::fs::symlink(outside.join("notes"), &parent).unwrap();
+        let path = parent.join("a.md");
+        let err = fs
+            .unlink_local_file(&parent, &path, "notes/a.md")
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("outside"),
+            "expected locality refusal: {err}"
+        );
+        assert_eq!(
+            std::fs::read(outside.join("notes/a.md")).unwrap(),
+            b"outside-plant"
         );
     }
 
