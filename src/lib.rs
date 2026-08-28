@@ -32,6 +32,14 @@ pub fn build_plan(
 ) -> Result<Plan, Error> {
     let local_entities = local.list()?;
     let remote_entities = store.list("")?;
+    // R4-M2: drop a remote empty key (the exact-prefix folder marker stripped
+    // to `""`) before validation. W34 removes it at the S3 backend source, but
+    // other backends could still surface one; an empty key is never a planned
+    // action. Every *other* invalid key stays fail-closed (R5-L1).
+    let remote_entities: Vec<_> = remote_entities
+        .into_iter()
+        .filter(|e| !e.key.is_empty())
+        .collect();
     for e in &remote_entities {
         crate::entity::ensure_valid_key(&e.key)?;
     }
@@ -253,6 +261,31 @@ mod tests {
         fn delete(&self, key: &str) -> Result<(), Error> {
             Err(Error::NotFound(key.to_string()))
         }
+    }
+
+    #[test]
+    fn build_plan_ignores_exact_prefix_marker_object() {
+        // R4-M2: a remote listing that yields the exact-prefix folder marker
+        // as an empty relative key (`""`) must be dropped by build_plan's
+        // remote ingest, not abort the plan with `InvalidKey("key must not be
+        // empty")`. (W34 removes it at the S3 backend source; this is the
+        // defense-in-depth lock for other backends.)
+        let dir = TempDir::new("vaultsync-lib-test");
+        let local = LocalFs::new(dir.path());
+        let store = StubStore {
+            listed: vec![Entity {
+                key: "".to_string(),
+                size: 0,
+                mtime_ms: Some(123),
+                etag: None,
+            }],
+        };
+        let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default()).unwrap();
+        assert!(
+            !p.actions.iter().any(|a| a.key.is_empty()),
+            "empty key planned: {:?}",
+            p.actions
+        );
     }
 
     #[test]

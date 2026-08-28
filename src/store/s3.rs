@@ -195,6 +195,14 @@ fn parent_folders(key: &str) -> Vec<String> {
 fn convert_listed(items: Vec<(String, u64, Option<u64>)>) -> Vec<Entity> {
     let mut map: BTreeMap<String, Entity> = BTreeMap::new();
     for (key, size, mtime) in items {
+        if key.is_empty() {
+            // R4-M2: the exact-prefix folder marker. S3-console "Make Folder"
+            // writes a zero-byte object at the folder path (and some tools
+            // write a marker at the store prefix itself); it strips to an
+            // empty relative key, which is not a valid vault key and must be
+            // dropped rather than planned.
+            continue;
+        }
         if key.ends_with('/') {
             continue; // object keys never end with '/'
         }
@@ -563,6 +571,16 @@ mod tests {
         let folder = ents.iter().find(|e| e.key == "notes/").unwrap();
         assert!(folder.is_folder());
         assert_eq!(folder.mtime_ms, None);
+    }
+
+    #[test]
+    fn s3_list_drops_exact_prefix_folder_marker() {
+        // R4-M2: a zero-byte "folder marker" object placed at the exact store
+        // prefix (S3 console creates such keys when you Make Folder) strips to
+        // an empty relative key and must be dropped - never planned as a
+        // `""` entity that would fail `ensure_valid_key`.
+        let ents = convert_listed(vec![("".to_string(), 0, Some(123))]);
+        assert_eq!(ents, Vec::<Entity>::new(), "exact-prefix marker listed");
     }
 
     #[test]
