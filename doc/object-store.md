@@ -69,6 +69,13 @@ Practical options (pick in Phase 2 spike, not earlier):
 | put_from | `PutObject` (multipart only if size > threshold; can defer multipart to v1.1) |
 | delete | `DeleteObject` (batch delete later) |
 
+Delete is **idempotent-friendly** (PR2 A-M3/B-L6): deleting an already-absent
+key may return `Ok` (S3 is idempotent) or `NotFound` (mock / local). Both are
+the achieved goal state; the executor normalizes `NotFound` to success.
+
+Keys under the reserved namespace `.vaultsync-check-*` (used by `check`'s
+connectivity probe) must not be created by user content.
+
 ### Metadata
 
 - Store client mtime in object metadata key `vaultsync-mtime` (or `mtime`) as decimal ms.

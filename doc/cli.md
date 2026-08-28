@@ -114,6 +114,26 @@ AWS_REGION
 
 Same as `aws` CLI where possible.
 
+Region resolution: when `[store].region` is not set (and `AWS_REGION` env is
+absent), the S3 client falls through to the normal AWS default chain (env,
+shared config, profile) - there is no hardcoded region guess. Deliberately,
+`AWS_REGION` (env) overrides an explicit config `region` on purpose: env is
+an operator override of a checked-in file, matching how `AWS_*` behaves
+across AWS tooling.
+
+A relative `vault_root` (e.g. `vault_root = "."` or `notes`) resolves
+against the process working directory, not the config file's directory;
+anchor it absolutely if you rely on the file's location.
+
+Uploads are single-PUT, so a single object is limited to 5 GiB; larger files
+need multipart (a post-v1 item).
+
+`--follow-symlinks` + `--delete` is a footgun: with the flag on, a followed
+symlink and its target are two names for the same inode, and deleting a key
+that is a symlink removes that inode (exactly like `rm` on the link path).
+Default mode never plans through symlinks (they are skipped and counted), so
+this only applies when you explicitly opt in.
+
 ## Output
 
 ### Human (default)
