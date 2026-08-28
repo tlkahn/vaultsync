@@ -143,7 +143,7 @@ pub fn execute_plan(
             Err(e) => fail(&mut rep, &a.key, e),
         }
     }
-    let mut deleted_local = false;
+    let mut deleted_keys: Vec<String> = Vec::new();
     for a in plan
         .actions
         .iter()
@@ -173,25 +173,30 @@ pub fn execute_plan(
         ) {
             Ok(()) => {
                 rep.executed += 1;
-                deleted_local = true;
+                deleted_keys.push(a.key.clone());
             }
             Err(Error::NotFound(_)) => {
                 // W32: the goal state (file absent) is achieved, so count a
                 // no-op delete as reaching it and keep the empty-dir cleanup
-                // pass active. (The guarded delete reports NotFound before any
-                // freshness check, matching the old delete_file contract.)
+                // pass active for this key's ancestor chain. (The guarded
+                // delete reports NotFound before any freshness check,
+                // matching the old delete_file contract.)
                 rep.executed += 1;
-                deleted_local = true;
+                deleted_keys.push(a.key.clone());
             }
             Err(e) => fail(&mut rep, &a.key, e),
         }
     }
-    // R2.1 option (a): after local deletes, clean now-empty dirs bottom-up.
-    // W16/A-L3: a cleanup top-level error is a non-fatal warning; R4/R5 nit
-    // (W47): per-dir removal failures are surfaced individually, both without
-    // changing the exit code.
-    if deleted_local {
-        match local.remove_empty_dirs_bottom_up() {
+    // R2.1 option (a), scoped (W77/r9 M1): after local deletes, clean the
+    // now-empty ancestor chains of the files deleted this run (both the Ok
+    // and the W32 NotFound goal-state arms - the goal state is "file
+    // absent", so an emptied ancestor is removable in both). Pre-existing,
+    // plan-unrelated empty dirs are never touched. W16/A-L3: a cleanup
+    // top-level error is a non-fatal warning; R4/R5 nit (W47): per-dir
+    // removal failures are surfaced individually, both without changing the
+    // exit code.
+    if !deleted_keys.is_empty() {
+        match local.remove_empty_ancestor_dirs(&deleted_keys) {
             Ok((_removed, dir_warnings)) => {
                 rep.warnings.extend(dir_warnings);
             }
@@ -730,6 +735,142 @@ mod tests {
         assert!(!dir.join("n/gone.md").exists());
         // both `sub` and `n` are now empty -> removed bottom-up; root stays.
         assert!(!dir.join("n").exists(), "empty n not cleaned");
+        assert!(dir.exists());
+    }
+
+    #[test]
+    fn pull_delete_keeps_unrelated_preexisting_empty_dirs() {
+        // r9 M1 (W77): the empty-dir post-pass is scoped to ancestor chains
+        // of files deleted this run. A pre-existing, plan-unrelated empty dir
+        // (`attachments/`) must SURVIVE a `pull --delete` that deletes a
+        // local extra elsewhere (`n/gone.md`). The plan row for
+        // `attachments/` remains `Skip(folder)`. RED today: the vault-wide
+        // pass removes `attachments/` (the r9 live-probe result).
+        let dir = TempDir::new("vaultsync-exec");
+        std::fs::create_dir_all(dir.join("attachments")).unwrap(); // intentional, pre-existing
+        std::fs::create_dir_all(dir.join("n")).unwrap();
+        std::fs::write(dir.join("n/gone.md"), "bye").unwrap();
+        let store = MemoryStore::new();
+        let local = LocalFs::new(dir.path());
+        let opts = PlanOpts {
+            delete: true,
+            ..Default::default()
+        };
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts).unwrap();
+        let folder_row = plan
+            .actions
+            .iter()
+            .find(|a| a.key == "attachments/")
+            .unwrap();
+        assert_eq!(folder_row.kind, ActionKind::Skip, "{:?}", folder_row);
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| a.key == "n/gone.md" && a.kind == ActionKind::DeleteLocal)
+        );
+        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &opts);
+        assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
+        assert!(
+            dir.join("attachments").exists(),
+            "pre-existing empty dir must survive"
+        );
+        assert!(
+            !dir.join("n").exists(),
+            "deleted-file ancestor chain cleaned"
+        );
+        assert!(dir.exists());
+    }
+
+    #[test]
+    fn pull_delete_removes_deleted_file_ancestor_chain_bottom_up() {
+        // W77 (r9 M1): a deep file `a/b/c/gone.md` deleted by pull --delete
+        // removes its emptied ancestor chain bottom-up (`a/b/c`, `a/b`, `a`);
+        // the root is kept. (Passes under the old vault-wide pass too; lands
+        // as a behavior lock with the scoped API, compile-RED shape per
+        // W52/W61.)
+        let dir = TempDir::new("vaultsync-exec");
+        std::fs::create_dir_all(dir.join("a/b/c")).unwrap();
+        std::fs::write(dir.join("a/b/c/gone.md"), "bye").unwrap();
+        let store = MemoryStore::new();
+        let local = LocalFs::new(dir.path());
+        let opts = PlanOpts {
+            delete: true,
+            ..Default::default()
+        };
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts).unwrap();
+        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &opts);
+        assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
+        assert!(!dir.join("a/b/c").exists(), "deepest ancestor not removed");
+        assert!(!dir.join("a/b").exists(), "middle ancestor not removed");
+        assert!(!dir.join("a").exists(), "top ancestor not removed");
+        assert!(dir.exists(), "root must remain");
+    }
+
+    #[test]
+    fn pull_delete_keeps_nonempty_ancestor_and_sibling_dirs() {
+        // W77 (r9 M1): a dir is only removed when the deleted file's chain
+        // emptied it. `n/gone.md` is deleted while `n/keep.md` still matches
+        // remotely -> `n/` must survive.
+        let dir = TempDir::new("vaultsync-exec");
+        std::fs::create_dir_all(dir.join("n")).unwrap();
+        std::fs::write(dir.join("n/gone.md"), "bye").unwrap();
+        std::fs::write(dir.join("n/keep.md"), "keep").unwrap();
+        let store = MemoryStore::new();
+        put_str(
+            &store,
+            "n/keep.md",
+            "keep",
+            Some(mtime_ms(&dir.join("n/keep.md"))),
+        );
+        let local = LocalFs::new(dir.path());
+        let opts = PlanOpts {
+            delete: true,
+            ..Default::default()
+        };
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts).unwrap();
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| a.key == "n/gone.md" && a.kind == ActionKind::DeleteLocal)
+        );
+        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &opts);
+        assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
+        assert!(
+            dir.join("n/keep.md").exists(),
+            "unchanged remote-matching file kept"
+        );
+        assert!(dir.join("n").exists(), "non-empty ancestor must survive");
+    }
+
+    #[test]
+    fn pull_delete_notfound_noop_still_cleans_goal_state_chain() {
+        // W77 (r9 M1) + W32: a planned DeleteLocal whose file vanished before
+        // execute (NotFound goal-state arm) still cleans its emptied ancestor
+        // chain - but never an unrelated pre-existing empty dir.
+        let dir = TempDir::new("vaultsync-exec");
+        std::fs::create_dir_all(dir.join("n/sub")).unwrap();
+        std::fs::write(dir.join("n/sub/gone.md"), "x").unwrap();
+        std::fs::create_dir_all(dir.join("attachments")).unwrap(); // unrelated
+        let store = MemoryStore::new();
+        let local = LocalFs::new(dir.path());
+        let opts = PlanOpts {
+            delete: true,
+            ..Default::default()
+        };
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts).unwrap();
+        // the file vanishes before execution (pre-cleaned by another process)
+        std::fs::remove_file(dir.join("n/sub/gone.md")).unwrap();
+        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &opts);
+        assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
+        assert!(
+            !dir.join("n/sub").exists(),
+            "emptied ancestor chain not cleaned after no-op delete"
+        );
+        assert!(!dir.join("n").exists());
+        assert!(
+            dir.join("attachments").exists(),
+            "unrelated pre-existing empty dir must survive"
+        );
         assert!(dir.exists());
     }
 
@@ -1311,13 +1452,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exec_reports_empty_dir_cleanup_warning() {
-        // W16/A-L3: an empty-dir cleanup failure (unreadable dir) is a
+        // W16/A-L3 + W47, retargeted to the scoped ancestor pass (W77): an
+        // empty-dir cleanup failure on a deleted file's ancestor chain is a
         // non-fatal warning on the report, not silently swallowed; the delete
-        // itself still succeeds and the run's exit is unaffected.
+        // itself still succeeds and the run's exit is unaffected. The parent
+        // `a` is read+traverse (0o555) so the file delete works (write is on
+        // `a/b`) but `remove_dir(a/b)` fails EACCES.
         use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new("vaultsync-exec");
-        std::fs::create_dir_all(dir.join("n/locked")).unwrap();
-        std::fs::write(dir.join("n/gone.md"), "bye").unwrap();
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        std::fs::write(dir.join("a/b/gone.md"), "bye").unwrap();
         let store = MemoryStore::new();
         let local = LocalFs::new(dir.path());
         let opts = PlanOpts {
@@ -1328,25 +1472,24 @@ mod tests {
         assert!(
             plan.actions
                 .iter()
-                .any(|a| a.key == "n/gone.md" && a.kind == ActionKind::DeleteLocal)
+                .any(|a| a.key == "a/b/gone.md" && a.kind == ActionKind::DeleteLocal)
         );
-        // lock the subdir after planning so the empty-dir cleanup pass errors
-        std::fs::set_permissions(dir.join("n/locked"), std::fs::Permissions::from_mode(0o000))
-            .unwrap();
+        // lock the parent `a` (read+traverse, no write) after planning so the
+        // file delete still succeeds but the empty-dir removal fails EACCES
+        std::fs::set_permissions(dir.join("a"), std::fs::Permissions::from_mode(0o555)).unwrap();
         let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &opts);
         // restore perms so TempDir drop can remove the tree
-        std::fs::set_permissions(dir.join("n/locked"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        std::fs::set_permissions(dir.join("a"), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
             rep.warnings
                 .iter()
-                .any(|w| w.contains("locked") && w.contains("inspect")),
-            "no cleanup warning naming the unreadable dir: {:?}",
+                .any(|w| w.contains("a/b") && w.contains("remove")),
+            "no cleanup warning naming the unremovable dir: {:?}",
             rep.warnings
         );
         // non-fatal: the delete itself succeeded, no failed keys
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep.failed);
-        assert!(!dir.join("n/gone.md").exists());
+        assert!(!dir.join("a/b/gone.md").exists());
     }
 
     #[test]

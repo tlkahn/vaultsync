@@ -536,21 +536,58 @@ impl LocalFs {
     /// not be probed (an unreadable dir, W57) - unspecified failures are
     /// surfaced instead of silently swallowed. Only touches dirs that are
     /// currently empty; file deletes are planned separately by the executor.
-    pub fn remove_empty_dirs_bottom_up(&self) -> Result<(u32, Vec<String>), Error> {
+    /// Remove now-empty ancestor directories of `keys` bottom-up (W77/r9 M1,
+    /// R2.1 option a, scoped): children-first along each deleted file's
+    /// ancestor chain, stop at the first non-empty or non-removable dir in a
+    /// chain, never remove the vault root, dedup dirs across chains. Replaces
+    /// the old vault-wide `remove_empty_dirs_bottom_up`, which removed
+    /// pre-existing, plan-unrelated empty dirs and reported nothing. Returns
+    /// how many directories were removed plus per-dir warning strings for
+    /// dirs that could not be removed (R4/R5 nit, W47) or whose emptiness
+    /// could not be probed (an unreadable dir, W57) - unspecified failures
+    /// are surfaced instead of silently swallowed. Only touches dirs that are
+    /// currently empty; file deletes are planned separately by the executor.
+    pub fn remove_empty_ancestor_dirs(&self, keys: &[String]) -> Result<(u32, Vec<String>), Error> {
         let root_canon = std::fs::canonicalize(&self.root)?;
         let mut removed = 0u32;
         let mut warnings: Vec<String> = Vec::new();
+        // Ancestor dirs of each key, deepest-first (the file's parent first,
+        // walking up to but excluding the root), dedup'd across chains.
         let mut dirs: Vec<PathBuf> = Vec::new();
-        collect_dirs(&self.root, &mut dirs)?;
-        // Post-order: deepest first (reverse of pre-order accumulation, which
-        // pushes parents before children).
-        for d in dirs.iter().rev() {
+        for key in keys {
+            // Keys come from the plan (already validated), but re-route
+            // through the single join site defensively; an invalid key simply
+            // contributes no chain.
+            let Ok(path) = key_to_local_path(&self.root, key) else {
+                continue;
+            };
+            let mut probe = path.parent();
+            while let Some(p) = probe {
+                if p == self.root {
+                    break; // never remove the vault root
+                }
+                if !dirs.iter().any(|d| d == p) {
+                    dirs.push(p.to_path_buf());
+                }
+                probe = p.parent();
+            }
+        }
+        // Deepest-first: a parent must only be probed after its children
+        // were (possibly) removed. Each single key's chain is accumulated
+        // deepest-first, but interleaving across keys can put a shallower
+        // shared ancestor before a deeper dir of another chain, so sort by
+        // path depth descending.
+        dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+        for d in &dirs {
+            // Canonicality guard (P1r7): a dir must still resolve under the
+            // canonicalized vault root - an ancestor swapped for an
+            // out-of-vault symlink is never removed through.
             let canon = match std::fs::canonicalize(d) {
                 Ok(c) => c,
                 Err(_) => continue, // vanished mid-pass
             };
             if canon == root_canon {
-                continue; // never remove the root
+                continue; // never remove the root (belt and braces)
             }
             if !canon.starts_with(&root_canon) {
                 continue;
@@ -802,30 +839,6 @@ fn set_file_mtime_ms(f: &std::fs::File, ms: u64) -> Result<(), Error> {
 fn is_empty_dir(d: &Path) -> std::io::Result<bool> {
     let mut rd = std::fs::read_dir(d)?;
     Ok(rd.next().is_none())
-}
-
-/// Pre-order accumulate of all directories under `root` (root included).
-fn collect_dirs(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> {
-    let rd = match std::fs::read_dir(root) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-        Ok(rd) => rd,
-    };
-    for entry in rd {
-        let entry = entry?;
-        let ft = entry.file_type()?;
-        let p = entry.path();
-        if ft.is_dir() {
-            out.push(p.clone());
-            // W57: an unreadable subdir must not abort the whole cleanup
-            // pass - it was already pushed, and the emptiness probe in
-            // `remove_empty_dirs_bottom_up` surfaces a per-dir warning for
-            // it instead.
-            let _ = collect_dirs(&p, out);
-        }
-    }
-    out.push(root.to_path_buf());
-    Ok(())
 }
 
 fn walk(
@@ -1972,18 +1985,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn remove_empty_dirs_bottom_up_reports_failures() {
-        // R4/R5 nit (W47): a per-dir cleanup failure (EACCES) must be surfaced
-        // as a per-dir warning naming the dir, not silently swallowed. The
-        // removed count is 0 (nothing succeeded).
+    fn remove_empty_ancestor_dirs_reports_failures() {
+        // R4/R5 nit (W47), retargeted to the scoped ancestor API (W77): a
+        // per-dir removal failure (EACCES) on a deleted file's ancestor chain
+        // must be surfaced as a per-dir warning naming the dir, not silently
+        // swallowed. The removed count is 0 (nothing succeeded).
         use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new("vaultsync-test");
         std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        std::fs::write(dir.join("a/b/gone.md"), "x").unwrap();
+        std::fs::remove_file(dir.join("a/b/gone.md")).unwrap();
         let fs = LocalFs::new(dir.path());
         // lock the parent `a` (read+traverse, no write) so remove_dir(a/b)
-        // fails EACCES while the walk can still enumerate
+        // fails EACCES while the emptiness probe can still read it
         std::fs::set_permissions(dir.join("a"), std::fs::Permissions::from_mode(0o555)).unwrap();
-        let (removed, warnings) = fs.remove_empty_dirs_bottom_up().unwrap();
+        let (removed, warnings) = fs
+            .remove_empty_ancestor_dirs(&["a/b/gone.md".to_string()])
+            .unwrap();
         // restore perms so TempDir drop can remove the tree
         std::fs::set_permissions(dir.join("a"), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(removed, 0, "no dir removed under locked parent");
@@ -1995,19 +2013,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn remove_empty_dirs_warns_on_unreadable_dir() {
-        // W57 (B nit): a directory whose emptiness cannot be probed (read_dir
-        // fails, e.g. chmod 0o000) is surfaced as a cleanup warning naming
-        // the dir - never silently treated as non-empty and skipped. The
-        // removed count is 0 (nothing succeeded). Fails today: the read_dir
-        // failure aborts the whole pass, so no warning is produced.
+    fn remove_empty_ancestor_dirs_warns_on_unreadable_dir() {
+        // W57 (B nit), retargeted to the scoped ancestor API (W77): a
+        // directory on a deleted file's ancestor chain whose emptiness cannot
+        // be probed (read_dir fails, e.g. chmod 0o000) is surfaced as a
+        // cleanup warning naming the dir - never silently treated as
+        // non-empty and skipped. The removed count is 0 (nothing succeeded).
         use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new("vaultsync-test");
         std::fs::create_dir_all(dir.join("n/zero")).unwrap();
         let fs = LocalFs::new(dir.path());
         std::fs::set_permissions(dir.join("n/zero"), std::fs::Permissions::from_mode(0o000))
             .unwrap();
-        let (removed, warnings) = fs.remove_empty_dirs_bottom_up().unwrap();
+        let (removed, warnings) = fs
+            .remove_empty_ancestor_dirs(&["n/zero/gone.md".to_string()])
+            .unwrap();
         // restore perms so TempDir drop can remove the tree
         std::fs::set_permissions(dir.join("n/zero"), std::fs::Permissions::from_mode(0o755))
             .unwrap();
@@ -2019,15 +2039,21 @@ mod tests {
     }
 
     #[test]
-    fn local_remove_empty_dirs_bottom_up() {
-        // Empty nested dirs are removed children-first; the root is never
-        // removed; a non-empty sibling stops the pass for that branch.
+    fn local_remove_empty_ancestor_dirs_removes_chain_bottom_up() {
+        // W77 (r9 M1): only the ancestor chains of the given keys are
+        // considered, deepest-first; the root is never removed; a non-empty
+        // sibling stops the pass for that branch; unrelated dirs are never
+        // touched.
         let dir = TempDir::new("vaultsync-test");
         std::fs::create_dir_all(dir.join("a/b/c")).unwrap();
+        std::fs::write(dir.join("a/b/c/gone.md"), "x").unwrap();
+        std::fs::remove_file(dir.join("a/b/c/gone.md")).unwrap();
         std::fs::create_dir_all(dir.join("keep/sub")).unwrap();
         std::fs::write(dir.join("keep/sub/file.md"), "x").unwrap();
         let fs = LocalFs::new(dir.path());
-        let (removed, _warnings) = fs.remove_empty_dirs_bottom_up().unwrap();
+        let (removed, _warnings) = fs
+            .remove_empty_ancestor_dirs(&["a/b/c/gone.md".to_string()])
+            .unwrap();
         assert!(!dir.join("a/b/c").exists());
         assert!(!dir.join("a/b").exists());
         assert!(!dir.join("a").exists());
