@@ -26,7 +26,10 @@ use crate::error::Error;
 pub struct LocalFs {
     root: PathBuf,
     follow_symlinks: bool,
-    report: std::cell::RefCell<WalkReport>,
+    /// Walk report, mutated at the end of a walk and read by `report()`.
+    /// `Mutex` (not `RefCell`) so `LocalFs` is `Send`/`Sync` ahead of Phase 3
+    /// concurrency (W82/r8a-2); single-threaded callers see no difference.
+    report: std::sync::Mutex<WalkReport>,
     /// Canonicalized vault root, computed once per instance on first use and
     /// cached (W81/r8a-1 + r9-N2). See [`LocalFs::root_canonical`].
     root_canon: std::sync::OnceLock<PathBuf>,
@@ -73,7 +76,7 @@ impl LocalFs {
         LocalFs {
             root: root.into(),
             follow_symlinks: false,
-            report: std::cell::RefCell::new(WalkReport::default()),
+            report: std::sync::Mutex::new(WalkReport::default()),
             root_canon: std::sync::OnceLock::new(),
         }
     }
@@ -84,7 +87,7 @@ impl LocalFs {
         LocalFs {
             root: root.into(),
             follow_symlinks,
-            report: std::cell::RefCell::new(WalkReport::default()),
+            report: std::sync::Mutex::new(WalkReport::default()),
             root_canon: std::sync::OnceLock::new(),
         }
     }
@@ -109,7 +112,7 @@ impl LocalFs {
 
     /// The report from the most recent walk (symlink skips/warnings).
     pub fn report(&self) -> WalkReport {
-        self.report.borrow().clone()
+        self.report.lock().unwrap().clone()
     }
 
     /// Walk files and folders under the root into vault-relative keys.
@@ -151,7 +154,7 @@ impl LocalFs {
             &mut visited,
         )?;
         out.sort_by(|a, b| a.key.cmp(&b.key));
-        *self.report.borrow_mut() = report.clone();
+        *self.report.lock().unwrap() = report.clone();
         Ok((out, report))
     }
 
