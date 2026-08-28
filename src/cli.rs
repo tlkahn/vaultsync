@@ -32,6 +32,7 @@ pub enum Command {
         json: bool,
         config: Option<PathBuf>,
         verbose: u8,
+        follow_symlinks: bool,
     },
     Push {
         vault: PathBuf,
@@ -42,6 +43,7 @@ pub enum Command {
         json: bool,
         config: Option<PathBuf>,
         verbose: u8,
+        follow_symlinks: bool,
     },
     Pull {
         vault: PathBuf,
@@ -52,6 +54,7 @@ pub enum Command {
         json: bool,
         config: Option<PathBuf>,
         verbose: u8,
+        follow_symlinks: bool,
     },
     Check {
         config: Option<PathBuf>,
@@ -69,6 +72,7 @@ impl Command {
             json: false,
             config: None,
             verbose: 0,
+            follow_symlinks: false,
         }
     }
     /// Push with a vault + delete; remaining flags at defaults.
@@ -82,6 +86,7 @@ impl Command {
             json: false,
             config: None,
             verbose: 0,
+            follow_symlinks: false,
         }
     }
     /// Pull with a vault + delete; remaining flags at defaults.
@@ -95,6 +100,7 @@ impl Command {
             json: false,
             config: None,
             verbose: 0,
+            follow_symlinks: false,
         }
     }
     /// Check with defaults.
@@ -133,6 +139,11 @@ struct Cli {
     /// Verbose noise on stderr (repeatable)
     #[arg(short = 'v', long = "verbose", global = true, action = ArgAction::Count)]
     verbose: u8,
+
+    /// Follow symlinks below the vault root (off by default; out-of-vault
+    /// targets are still skipped with a warning).
+    #[arg(long, global = true)]
+    follow_symlinks: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -186,6 +197,7 @@ impl Cli {
                 json: self.json,
                 config,
                 verbose,
+                follow_symlinks: self.follow_symlinks,
             },
             Some(Commands::Push(a)) => Command::Push {
                 vault: self.vault,
@@ -196,6 +208,7 @@ impl Cli {
                 json: self.json,
                 config,
                 verbose,
+                follow_symlinks: self.follow_symlinks,
             },
             Some(Commands::Pull(a)) => Command::Pull {
                 vault: self.vault,
@@ -206,6 +219,7 @@ impl Cli {
                 json: self.json,
                 config,
                 verbose,
+                follow_symlinks: self.follow_symlinks,
             },
             Some(Commands::Check) => Command::Check { config, verbose },
             Some(Commands::Version) => Command::Version,
@@ -305,13 +319,16 @@ pub fn run_with_io(
             json,
             config: _c,
             verbose: _v,
+            follow_symlinks,
         } => {
             if json {
                 return reject_json(err);
             }
             let opts = PlanOpts::default();
-            match crate::status_with_store(&vault, store, &opts) {
+            let local = crate::local::LocalFs::with_follow(&vault, follow_symlinks);
+            match crate::build_plan(&local, store, Mode::Status, &opts) {
                 Ok(plan) => {
+                    print_walk_warnings(&local, follow_symlinks, err);
                     let _ = write!(out, "{}", crate::format_plan_human(&plan));
                     if is_clean(&plan) { 0 } else { 2 }
                 }
@@ -330,6 +347,7 @@ pub fn run_with_io(
             json,
             config: _c,
             verbose: _v,
+            follow_symlinks,
         } => {
             if json {
                 return reject_json(err);
@@ -340,7 +358,7 @@ pub fn run_with_io(
                 force_remote,
                 ..Default::default()
             };
-            dispatch_plan(&vault, store, Mode::Push, &opts, dry_run, out, err)
+            dispatch_plan(&vault, store, Mode::Push, &opts, dry_run, follow_symlinks, out, err)
         }
         Command::Pull {
             vault,
@@ -351,6 +369,7 @@ pub fn run_with_io(
             json,
             config: _c,
             verbose: _v,
+            follow_symlinks,
         } => {
             if json {
                 return reject_json(err);
@@ -361,8 +380,24 @@ pub fn run_with_io(
                 force_remote,
                 ..Default::default()
             };
-            dispatch_plan(&vault, store, Mode::Pull, &opts, dry_run, out, err)
+            dispatch_plan(&vault, store, Mode::Pull, &opts, dry_run, follow_symlinks, out, err)
         }
+    }
+}
+
+/// Print walk-report warnings to stderr (Slice 9): out-of-vault followed
+/// symlink skips, and the default-mode skipped-symlink count hint.
+fn print_walk_warnings(local: &crate::local::LocalFs, follow: bool, err: &mut dyn Write) {
+    let rep = local.report();
+    for w in &rep.warnings {
+        let _ = writeln!(err, "warning: {w}");
+    }
+    if rep.skipped_symlinks > 0 && !follow {
+        let _ = writeln!(
+            err,
+            "warning: skipped {} symlink(s); use --follow-symlinks to include",
+            rep.skipped_symlinks
+        );
     }
 }
 
@@ -380,12 +415,14 @@ fn dispatch_plan(
     mode: Mode,
     opts: &PlanOpts,
     dry_run: bool,
+    follow_symlinks: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
-    let local = crate::local::LocalFs::new(vault);
+    let local = crate::local::LocalFs::with_follow(vault, follow_symlinks);
     match crate::build_plan(&local, store, mode, opts) {
         Ok(plan) => {
+            print_walk_warnings(&local, follow_symlinks, err);
             let _ = write!(out, "{}", crate::format_plan_human(&plan));
             if dry_run {
                 if is_clean(&plan) { 0 } else { 2 }
@@ -440,18 +477,20 @@ fn resolve_vault_from_config(cmd: Command, settings: &crate::config::Settings) -
         return cmd;
     }
     match cmd {
-        Command::Status { vault, json, config, verbose } if vault == PathBuf::from(VAULT_UNSET) => {
-            Command::Status { vault: want, json, config, verbose }
-        }
-        Command::Push { vault, delete, dry_run, force_local, force_remote, json, config, verbose }
+        Command::Status { vault, json, config, verbose, follow_symlinks }
             if vault == PathBuf::from(VAULT_UNSET) =>
         {
-            Command::Push { vault: want, delete, dry_run, force_local, force_remote, json, config, verbose }
+            Command::Status { vault: want, json, config, verbose, follow_symlinks }
         }
-        Command::Pull { vault, delete, dry_run, force_local, force_remote, json, config, verbose }
+        Command::Push { vault, delete, dry_run, force_local, force_remote, json, config, verbose, follow_symlinks }
             if vault == PathBuf::from(VAULT_UNSET) =>
         {
-            Command::Pull { vault: want, delete, dry_run, force_local, force_remote, json, config, verbose }
+            Command::Push { vault: want, delete, dry_run, force_local, force_remote, json, config, verbose, follow_symlinks }
+        }
+        Command::Pull { vault, delete, dry_run, force_local, force_remote, json, config, verbose, follow_symlinks }
+            if vault == PathBuf::from(VAULT_UNSET) =>
+        {
+            Command::Pull { vault: want, delete, dry_run, force_local, force_remote, json, config, verbose, follow_symlinks }
         }
         other => other,
     }
@@ -681,6 +720,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_follow_symlinks() {
+        let mut args = a();
+        args.push("push".into());
+        args.push("--follow-symlinks".into());
+        match parse_args(&args).unwrap() {
+            Command::Push { follow_symlinks, .. } => assert!(follow_symlinks),
+            other => panic!("expected Push, got {other:?}"),
+        }
+        // also accepted before the subcommand (global)
+        let mut args = a();
+        args.push("--follow-symlinks".into());
+        args.push("status".into());
+        match parse_args(&args).unwrap() {
+            Command::Status { follow_symlinks, .. } => assert!(follow_symlinks),
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_dry_run_flag() {
         let mut args = a();
         args.push("push".into());
@@ -885,6 +943,7 @@ mod tests {
             json: true,
             config: None,
             verbose: 0,
+            follow_symlinks: false,
         };
         let (code, _, err) = run(cmd, &MemoryStore::new());
         assert_eq!(code, 1);
@@ -1068,6 +1127,7 @@ mod tests {
             json: false,
             config: None,
             verbose: 0,
+            follow_symlinks: false,
         };
         let (code, out, _) = run(cmd, &store);
         assert_eq!(code, 2);

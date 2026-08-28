@@ -22,52 +22,88 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::entity::Entity;
 use crate::error::Error;
 
-/// Walks a vault root directory. Phase 1 only requires `list`.
+/// Walks a vault root directory.
 pub struct LocalFs {
     root: PathBuf,
+    follow_symlinks: bool,
+    report: std::cell::RefCell<WalkReport>,
+}
+
+/// Report surfaced from a walk (symlink policy, Slice 9).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct WalkReport {
+    /// Symlinks skipped (default mode, or out-of-vault followed targets).
+    pub skipped_symlinks: u32,
+    /// Human warnings (e.g. a followed symlink escaping the vault root).
+    pub warnings: Vec<String>,
+}
+
+/// Walker mode flags.
+struct WalkOpts {
+    follow_symlinks: bool,
 }
 
 impl LocalFs {
+    /// Default: symlinks below the root are skipped and counted.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        LocalFs { root: root.into() }
+        LocalFs {
+            root: root.into(),
+            follow_symlinks: false,
+            report: std::cell::RefCell::new(WalkReport::default()),
+        }
+    }
+
+    /// With `--follow-symlinks`: follow symlinks (loops guarded; out-of-vault
+    /// targets are still skipped with a warning, never synced silently).
+    pub fn with_follow(root: impl Into<PathBuf>, follow_symlinks: bool) -> Self {
+        LocalFs {
+            root: root.into(),
+            follow_symlinks,
+            report: std::cell::RefCell::new(WalkReport::default()),
+        }
+    }
+
+    /// The report from the most recent walk (symlink skips/warnings).
+    pub fn report(&self) -> WalkReport {
+        self.report.borrow().clone()
     }
 
     /// Walk files and folders under the root into vault-relative keys.
-    ///
-    /// - keys are relative, `/`-separated, no leading `/`
-    /// - folders end with `/`
-    /// - the root itself is not emitted
-    /// - symlinks are skipped
-    /// - mtime/size come from `fs::metadata`
     pub fn list(&self) -> Result<Vec<Entity>, Error> {
+        self.list_report().map(|(entities, _)| entities)
+    }
+
+    /// Walk, returning entities plus the walk report.
+    pub fn list_report(&self) -> Result<(Vec<Entity>, WalkReport), Error> {
         // The root itself must exist: a missing vault is a loud error, not an
         // empty plan. `walk` tolerates `NotFound` only for directories
         // discovered mid-walk (vanished between enumeration and recursion).
         let md = std::fs::metadata(&self.root)?;
         if !md.is_dir() {
-            // A file-as-root must fail with a clear, vaultsync-owned message
-            // (not a raw `Not a directory` OS string).
             return Err(Error::Other(format!(
                 "vault root is not a directory: {}",
                 self.root.display()
             )));
         }
+        let mut report = WalkReport::default();
+        let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         let mut out = Vec::new();
-        walk(&self.root, &self.root, &mut out)?;
+        let opts = WalkOpts {
+            follow_symlinks: self.follow_symlinks,
+        };
+        walk(
+            &self.root,
+            &self.root,
+            &mut out,
+            &opts,
+            &mut report,
+            &mut visited,
+        )?;
         out.sort_by(|a, b| a.key.cmp(&b.key));
-        Ok(out)
+        *self.report.borrow_mut() = report.clone();
+        Ok((out, report))
     }
 
-    /// Open a local file for reading (upload side), verifying it is still a
-    /// regular, non-symlink file of the expected size after walking (R3.3 /
-    /// P1r7-symlink-swap TOCTOU guard).
-    ///
-    /// - type recheck: the path must not currently be a symlink (no-follow
-    ///   look via `symlink_metadata`) and the opened descriptor must be a
-    ///   regular file;
-    /// - size recheck: the opened descriptor's own size must equal
-    ///   `expected_size` (a file that grew/shrunk between walk and open is a
-    ///   per-key error, never a silently-truncated object).
     /// Open a local file for reading (upload side), verifying it is still a
     /// regular, non-symlink file of the expected size and (optionally) mtime
     /// after walking (R3.3 / P1r7-symlink-swap TOCTOU guard).
@@ -344,7 +380,14 @@ fn collect_dirs(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> {
     Ok(())
 }
 
-fn walk(dir: &Path, root: &Path, out: &mut Vec<Entity>) -> Result<(), Error> {
+fn walk(
+    dir: &Path,
+    root: &Path,
+    out: &mut Vec<Entity>,
+    opts: &WalkOpts,
+    report: &mut WalkReport,
+    visited: &mut std::collections::HashSet<PathBuf>,
+) -> Result<(), Error> {
     // `NotFound` here means the directory vanished after its parent
     // enumerated it (or between `read_dir` and first use): skip silently.
     // All other IO errors (permission, etc.) stay fatal.
@@ -365,6 +408,12 @@ fn walk(dir: &Path, root: &Path, out: &mut Vec<Entity>) -> Result<(), Error> {
             Ok(ft) => ft,
         };
         if ft.is_symlink() {
+            if !opts.follow_symlinks {
+                // Slice 9 default: skipped + counted (not plan rows).
+                report.skipped_symlinks += 1;
+                continue;
+            }
+            handle_followed_symlink(&entry.path(), root, out, report, visited)?;
             continue;
         }
         let path = entry.path();
@@ -376,18 +425,81 @@ fn walk(dir: &Path, root: &Path, out: &mut Vec<Entity>) -> Result<(), Error> {
         // emitted. Special files (FIFO/socket/device) fall through both arms
         // below with their names never inspected: they are always skipped, so
         // an invalid name must not abort the walk (P1r7-special-node-key).
-        // Files/dirs with invalid names still fail loud (P1r4-key-ctl).
         if ft.is_dir() {
             let key = format!("{}/", path_to_key(rel)?);
             if let Some(e) = folder_entity(&path, &key)? {
                 out.push(e);
             }
-            walk(&path, root, out)?;
+            walk(&path, root, out, opts, report, visited)?;
         } else if ft.is_file() {
             let key = path_to_key(rel)?;
             if let Some(e) = file_entity(&path, &key)? {
                 out.push(e);
             }
+        }
+    }
+    Ok(())
+}
+
+/// Follow a symlink (only called with `follow_symlinks` on). A target that
+/// escapes the canonicalized vault root is skipped with a warning; a dir
+/// cycle is guarded by a canonical-path visited set.
+fn handle_followed_symlink(
+    path: &Path,
+    root: &Path,
+    out: &mut Vec<Entity>,
+    report: &mut WalkReport,
+    visited: &mut std::collections::HashSet<PathBuf>,
+) -> Result<(), Error> {
+    let rel = path
+        .strip_prefix(root)
+        .map_err(|_| Error::Other(format!("walk symlink escaped root: {}", path.display())))?;
+    let target = match std::fs::canonicalize(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+        Ok(t) => t,
+    };
+    let root_canon = match std::fs::canonicalize(root) {
+        Ok(r) => r,
+        Err(e) => return Err(e.into()),
+    };
+    if !target.starts_with(&root_canon) {
+        report.warnings.push(format!(
+            "skipping {} (symlink escapes vault root)",
+            path_to_key(rel)?
+        ));
+        report.skipped_symlinks += 1;
+        return Ok(());
+    }
+    let tmd = match std::fs::metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+        Ok(m) => m,
+    };
+    if tmd.is_dir() {
+        if !visited.insert(target) {
+            return Ok(()); // cycle guard
+        }
+        let key = format!("{}/", path_to_key(rel)?);
+        if let Some(e) = folder_entity(path, &key)? {
+            out.push(e);
+        }
+        // Recursing into a symlink-to-dir path: `read_dir` follows the link,
+        // so children get vault-relative keys under the symlink's own path.
+        walk(
+            path,
+            root,
+            out,
+            &WalkOpts {
+                follow_symlinks: true,
+            },
+            report,
+            visited,
+        )?;
+    } else if tmd.is_file() {
+        let key = path_to_key(rel)?;
+        if let Some(e) = file_entity(path, &key)? {
+            out.push(e);
         }
     }
     Ok(())
@@ -681,7 +793,9 @@ mod tests {
         let missing_sub = dir.join("sub");
         assert!(!missing_sub.exists());
         let mut out = Vec::new();
-        walk(&missing_sub, &dir, &mut out).unwrap();
+        let mut report = WalkReport::default();
+        let mut visited = std::collections::HashSet::new();
+        walk(&missing_sub, &dir, &mut out, &WalkOpts { follow_symlinks: false }, &mut report, &mut visited).unwrap();
         assert!(out.is_empty());
     }
 
@@ -944,6 +1058,87 @@ mod tests {
         assert!(dir.exists(), "root must remain");
         assert!(dir.join("keep/sub/file.md").exists(), "non-empty kept");
         assert!(removed >= 3, "removed {removed}");
+    }
+    // --- Phase 2 Slice 9: symlink policy ---
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_symlink_skipped_counted_by_default() {
+        // Default (follow=false): a symlink file is skipped and counted in the
+        // walk report; entities are unchanged from Phase 1.
+        let dir = TempDir::new("vaultsync-test");
+        let outside = TempDir::new("vaultsync-outside");
+        std::fs::write(outside.join("secret"), "s").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), dir.join("link.txt")).unwrap();
+        std::fs::write(dir.join("real.txt"), "r").unwrap();
+        let fs = LocalFs::new(dir.path());
+        let (ents, report) = fs.list_report().unwrap();
+        let keys: Vec<String> = ents.iter().map(|e| e.key.clone()).collect();
+        assert!(keys.iter().any(|k| k == "real.txt"));
+        assert!(!keys.iter().any(|k| k == "link.txt"), "symlink not skipped");
+        assert_eq!(report.skipped_symlinks, 1, "report count");
+        assert!(report.warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_follow_symlinks_includes_in_vault_target() {
+        // follow=true: a symlink whose target is in-vault is followed.
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        std::fs::write(dir.join("target/f.md"), "x").unwrap();
+        std::os::unix::fs::symlink("target", dir.join("lnk")).unwrap();
+        let fs = LocalFs::with_follow(dir.path(), true);
+        let (ents, _) = fs.list_report().unwrap();
+        let keys: Vec<String> = ents.iter().map(|e| e.key.clone()).collect();
+        assert!(keys.iter().any(|k| k == "lnk/"), "followed dir listed: {keys:?}");
+        assert!(
+            keys.iter().any(|k| k == "lnk/f.md"),
+            "followed child listed: {keys:?}"
+        );
+        // the real target still lists too
+        assert!(keys.iter().any(|k| k == "target/f.md"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_follow_symlinks_skips_escaping_target_with_warning() {
+        // follow=true: a symlink escaping the vault root is skipped with a
+        // warning (never synced silently).
+        let dir = TempDir::new("vaultsync-test");
+        let outside = TempDir::new("vaultsync-outside");
+        std::fs::write(outside.join("secret"), "s").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), dir.join("escape")).unwrap();
+        let fs = LocalFs::with_follow(dir.path(), true);
+        let (ents, report) = fs.list_report().unwrap();
+        let keys: Vec<String> = ents.iter().map(|e| e.key.clone()).collect();
+        assert!(!keys.iter().any(|k| k == "escape"), "escaping target emitted: {keys:?}");
+        assert!(!keys.iter().any(|k| k.starts_with("escape/")));
+        assert!(
+            report.warnings.iter().any(|w| w.contains("escape") && w.contains("vault root")),
+            "warning missing: {:?}",
+            report.warnings
+        );
+        assert_eq!(report.skipped_symlinks, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_follow_symlinks_loop_safe() {
+        // A dir cycle (a/back -> a) must terminate under follow.
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::write(dir.join("a/leaf.md"), "x").unwrap();
+        std::os::unix::fs::symlink(dir.join("a"), dir.join("a/back")).unwrap();
+        let fs = LocalFs::with_follow(dir.path(), true);
+        let (ents, _) = fs.list_report().unwrap(); // must not hang
+        // bounded - the cycle is cut after one level
+        let keys: Vec<String> = ents.iter().map(|e| e.key.clone()).collect();
+        assert!(keys.iter().any(|k| k == "a/leaf.md"));
+        assert!(keys.iter().any(|k| k == "a/back/"));
+        // a/back/back must NOT reappear (cycle cut)
+        assert!(!keys.iter().any(|k| k == "a/back/back/"), "cycle not cut: {keys:?}");
+        assert!(keys.len() < 8, "unexpected expansion: {keys:?}");
     }
 }
 
