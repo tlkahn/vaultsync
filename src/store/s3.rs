@@ -180,7 +180,15 @@ fn dt_millis(dt: &aws_sdk_s3::primitives::DateTime) -> Option<u64> {
     if secs < 0 {
         Some(0)
     } else {
-        Some((secs as u64).saturating_mul(1000))
+        // R5-L7/W45: keep subsecond millis (discarding up to 999 ms made every
+        // S3 LastModified truncate to the second). `subsec_nanos` is within
+        // [0, 1e9), so `/1_000_000` is a lossless ms carry for non-negative
+        // secs.
+        Some(
+            (secs as u64)
+                .saturating_mul(1000)
+                .saturating_add(dt.subsec_nanos() as u64 / 1_000_000),
+        )
     }
 }
 
@@ -676,6 +684,22 @@ mod tests {
         assert_eq!(
             dt_millis(&DateTime::from_secs(1_700_000_000)),
             Some(1_700_000_000_000)
+        );
+    }
+
+    #[test]
+    fn dt_millis_preserves_subsecond() {
+        // R5-L7/W45: `dt_millis` discards subsecond `LastModified` (up to 999
+        // ms). It must keep the millis so a plan at ms granularity does not
+        // truncate every S3 LastModified to the second.
+        use aws_sdk_s3::primitives::DateTime;
+        assert_eq!(
+            dt_millis(&DateTime::from_millis(1_700_000_000_123)),
+            Some(1_700_000_000_123)
+        );
+        assert_eq!(
+            dt_millis(&DateTime::from_secs_and_nanos(1_700_000_000, 999_000_000)),
+            Some(1_700_000_000_999)
         );
     }
 
