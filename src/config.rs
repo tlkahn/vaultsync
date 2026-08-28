@@ -15,8 +15,12 @@ pub const DEFAULT_MTIME_TOLERANCE_MS: u64 = 1000;
 pub const DEFAULT_CONCURRENCY: u32 = 4;
 
 /// On-disk config mirroring [cli.md]. All sections optional; defaults applied
-/// at resolution time.
+/// at resolution time. Unknown keys anywhere in the file are rejected loudly
+/// (W56, B nit): a typo like `mtime_tolerance` (missing `_ms`) or a
+/// misspelled section key surfaces as a parse error naming the key instead of
+/// silently keeping a default.
 #[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileConfig {
     #[serde(default)]
     pub vault_root: Option<PathBuf>,
@@ -31,6 +35,7 @@ pub struct FileConfig {
 /// `[store]` section. `type` must be `"s3"`; `bucket` is required when the
 /// section is present. Credentials are never configured here.
 #[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoreConfig {
     #[serde(default, rename = "type")]
     pub store_type: Option<String>,
@@ -48,6 +53,7 @@ pub struct StoreConfig {
 
 /// `[ignore]` section (patterns are a Phase 3 feature; parsed but unused).
 #[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IgnoreConfig {
     #[serde(default)]
     pub patterns: Vec<String>,
@@ -55,6 +61,7 @@ pub struct IgnoreConfig {
 
 /// `[transfer]` section.
 #[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TransferConfig {
     #[serde(default)]
     pub concurrency: Option<u32>,
@@ -412,6 +419,34 @@ mtime_tolerance_ms = 1000
         let cfg = parse_config_str(text).unwrap();
         let s = settings(&cfg).unwrap();
         assert_eq!(s.store.region, None);
+    }
+
+    #[test]
+    fn config_unknown_transfer_key_rejected() {
+        // W56 (B nit): unknown TOML keys must fail loudly instead of being
+        // silently ignored - a `mtime_tolerance` typo (missing `_ms`) must
+        // surface as a parse error naming the key, not keep the 1000 default
+        // (consistent with the W25/W28 loud-on-inert-config posture).
+        let text = "[transfer]\nmtime_tolerance = 5000\n";
+        let err = parse_config_str(text).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("mtime_tolerance"),
+            "unknown key not named in: {msg}"
+        );
+    }
+
+    #[test]
+    fn config_unknown_top_level_key_rejected() {
+        // W56 (B nit): a misspelled top-level key (e.g. `vault_rooot`) is a
+        // loud parse error, not a silently ignored unknown.
+        let text = "vault_rooot = \"/x\"\n";
+        let err = parse_config_str(text).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("vault_rooot"),
+            "unknown key not named in: {msg}"
+        );
     }
 
     #[test]
