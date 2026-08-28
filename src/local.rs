@@ -159,7 +159,10 @@ impl LocalFs {
         // symlink since the walk canonicalizes outside the root and must be
         // refused - the outside file must never be uploaded under a vault key.
         let parent = path.parent().ok_or_else(|| {
-            Error::Other(format!("open_verified has no parent dir: {}", path.display()))
+            Error::Other(format!(
+                "open_verified has no parent dir: {}",
+                path.display()
+            ))
         })?;
         self.ensure_locality(parent)?;
         let f = std::fs::File::open(&path)?;
@@ -248,24 +251,15 @@ impl LocalFs {
         // W6/B-M3: re-verify locality immediately before the atomic rename
         // (mirrors write_atomic's post-create_dir_all re-check). A parent
         // swapped for an out-of-vault symlink since `tmp_path_for` must not
-        // be renamed through; on refusal the temp sibling is removed.
+        // be renamed through; on refusal the temp sibling is removed. W15/
+        // A-L2: a rename error likewise cleans the temp sibling.
         let parent = path.parent().ok_or_else(|| {
             Error::Other(format!(
                 "finalize_write has no parent dir: {}",
                 path.display()
             ))
         })?;
-        if let Err(e) = self.ensure_locality(parent) {
-            let _ = std::fs::remove_file(tmp);
-            return Err(e);
-        }
-        // W15/A-L2: a rename error must also clean the temp sibling (the
-        // mtime/sync path above already does on its own failures).
-        if let Err(e) = std::fs::rename(tmp, &path) {
-            let _ = std::fs::remove_file(tmp);
-            return Err(e.into());
-        }
-        Ok(())
+        self.commit_temp(parent, tmp, &path)
     }
 
     /// Pull destination freshness (W13/B-L4, symmetric to upload R3.3): before
@@ -376,8 +370,10 @@ impl LocalFs {
             // Surface the underlying short-write as such, not a rename failure.
             return write_result;
         }
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
+        // W27/M5: route the commit through the shared locality-rechecking tail
+        // (pre-rename locality + temp cleanup on any failure), matching
+        // finalize_write's W6/W15 behavior.
+        self.commit_temp(parent, &tmp, &path)
     }
 
     /// Delete a single file (never a directory). Missing keys are
@@ -445,6 +441,23 @@ impl LocalFs {
                 _ => return Ok(()),
             }
         }
+    }
+
+    /// Shared commit tail for the two atomic write paths (`write_atomic` and
+    /// `finalize_write`): re-verify parent locality immediately before the
+    /// atomic rename (W6/M5) and remove the temp sibling on any failure
+    /// (W15/A-L2). Keeping both write paths on one helper prevents them from
+    /// drifting (W27/M5).
+    fn commit_temp(&self, parent: &Path, tmp: &Path, final_path: &Path) -> Result<(), Error> {
+        if let Err(e) = self.ensure_locality(parent) {
+            let _ = std::fs::remove_file(tmp);
+            return Err(e);
+        }
+        if let Err(e) = std::fs::rename(tmp, final_path) {
+            let _ = std::fs::remove_file(tmp);
+            return Err(e.into());
+        }
+        Ok(())
     }
 }
 
@@ -1254,6 +1267,32 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn write_atomic_removes_tmp_on_rename_failure() {
+        // W27/M5: write_atomic's commit tail must clean its temp on a rename
+        // failure (parity with finalize_write/W15) and re-verify parent
+        // locality before the rename (parity with finalize_write/W6). Fails
+        // today: the bare `rename` propagates the error without removing the
+        // temp sibling.
+        let dir = TempDir::new("vaultsync-test");
+        let fs = LocalFs::new(dir.path());
+        // make the final path an existing directory so the rename fails
+        // (file -> dir -> EISDIR on Unix); the parent stays a real, writable
+        // dir so the cleanup itself can succeed.
+        std::fs::create_dir_all(dir.join("sub/a.md")).unwrap();
+        let err = fs
+            .write_atomic("sub/a.md", &mut std::io::Cursor::new(b"x"), 1, None)
+            .unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "expected io error, got: {err}");
+        let leftover: Vec<String> = std::fs::read_dir(dir.join("sub"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("vaultsync-tmp"))
+            .collect();
+        assert!(leftover.is_empty(), "write_atomic tmp leaked: {leftover:?}");
+    }
+
     #[test]
     fn finalize_write_rechecks_locality_before_rename() {
         // W6/B-M3: a parent swapped for an out-of-vault symlink between tmp
