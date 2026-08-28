@@ -134,11 +134,15 @@ pub fn execute_plan(
         }
     }
     // R2.1 option (a): after local deletes, clean now-empty dirs bottom-up.
-    // W16/A-L3: a cleanup error is a non-fatal warning (exit code unchanged),
-    // not silently swallowed.
+    // W16/A-L3: a cleanup top-level error is a non-fatal warning; R4/R5 nit
+    // (W47): per-dir removal failures are surfaced individually, both without
+    // changing the exit code.
     if deleted_local {
-        if let Err(e) = local.remove_empty_dirs_bottom_up() {
-            rep.warnings.push(format!("empty-dir cleanup: {e}"));
+        match local.remove_empty_dirs_bottom_up() {
+            Ok((_removed, dir_warnings)) => {
+                rep.warnings.extend(dir_warnings);
+            }
+            Err(e) => rep.warnings.push(format!("empty-dir cleanup: {e}")),
         }
     }
 
