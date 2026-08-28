@@ -673,8 +673,10 @@ pub(crate) fn is_check_probe_name(name: &str) -> bool {
     name.starts_with(".vaultsync-check-")
 }
 
-/// Whether a file name is a reserved vaultsync temp/probe name. The walker
-/// treats these as never-syncable and skips/counts them. Covers:
+/// Whether a file name (a key's final segment or a path's file name) is a
+/// reserved vaultsync temp/probe name. The string form of
+/// [`is_reserved_vaultsync_name`], shared by the local walker and the remote
+/// ingest filter so the two policies cannot drift (W63/A-L3). Covers:
 ///
 /// - the temp sibling pattern `.*.vaultsync-tmp-*` (`.name.vaultsync-tmp-
 ///   <pid>-<n>`), written by the download/upload temp paths and never
@@ -682,10 +684,15 @@ pub(crate) fn is_check_probe_name(name: &str) -> bool {
 /// - the connectivity-probe prefix `.vaultsync-check-*`, a crashed `check`
 ///   leftover (W19/W24 + R4-L4/W42) - a materialized stray probe must never
 ///   re-upload.
+pub(crate) fn is_reserved_vaultsync_key_name(name: &str) -> bool {
+    (name.starts_with('.') && name.contains(".vaultsync-tmp-")) || is_check_probe_name(name)
+}
+
+/// Whether a file name is a reserved vaultsync temp/probe name. The walker
+/// treats these as never-syncable and skips/counts them.
 fn is_reserved_vaultsync_name(name: Option<&std::ffi::OsStr>) -> bool {
     let Some(name) = name else { return false };
-    let s = name.to_string_lossy();
-    (s.starts_with('.') && s.contains(".vaultsync-tmp-")) || is_check_probe_name(&s)
+    is_reserved_vaultsync_key_name(&name.to_string_lossy())
 }
 
 /// Set a file's mtime in ms since epoch (std `File::set_times`, stable).

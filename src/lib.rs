@@ -39,21 +39,19 @@ pub fn build_plan(
     let remote_entities: Vec<_> = remote_entities
         .into_iter()
         .filter(|e| !e.key.is_empty())
-        // R4-L4/W42 + W54/A-L2: the reserved connectivity-probe namespace.
-        // A crashed `check` (SIGKILL between probe put and delete) can leave
-        // a `.vaultsync-check-*` object remotely; it must never plan a
-        // Download (which would materialize a stray dotfile). The filter
-        // matches the local walker's final-segment policy (a
-        // `.vaultsync-check-*` *name* in any directory, both sides) via
-        // `is_check_probe_name`, so a nested `notes/.vaultsync-check-*`
-        // leftover is dropped here exactly as the walker would skip it.
-        // Users must not create such keys (object-store.md reserved
-        // namespace).
+        // R4-L4/W42 + W54/A-L2 + W63/A-L3: the reserved vaultsync namespace,
+        // final-segment policy shared with the local walker so the two sides
+        // cannot drift. A crashed `check` (SIGKILL between probe put and
+        // delete) can leave a `.vaultsync-check-*` object remotely, and a
+        // tmp-sibling key (`.name.vaultsync-tmp-*`) can reach the store
+        // out-of-band; neither must ever plan a Download (which would
+        // materialize a reserved dotfile locally). Users must not create
+        // such keys (object-store.md reserved namespace).
         .filter(|e| {
             !e.key
                 .rsplit('/')
                 .next()
-                .is_some_and(crate::local::is_check_probe_name)
+                .is_some_and(crate::local::is_reserved_vaultsync_key_name)
         })
         .collect();
     for e in &remote_entities {
@@ -349,6 +347,33 @@ mod tests {
                 .iter()
                 .any(|a| a.key == "notes/.vaultsync-check-1-2-3"),
             "nested probe leftover planned: {:?}",
+            p.actions
+        );
+    }
+
+    #[test]
+    fn build_plan_remote_tmp_sibling_never_downloads() {
+        // W63/A-L3: a tmp-sibling key (`.name.vaultsync-tmp-*`) that reached
+        // the store out-of-band must never plan a Download - the walker
+        // treats that namespace as never-syncable, so a materialized
+        // download would write a reserved dotfile locally. Same final-
+        // segment policy as the walker, both at the root and nested. Fails
+        // today: plans Download (only the check-probe namespace is
+        // filtered).
+        let dir = TempDir::new("vaultsync-lib-test");
+        let local = LocalFs::new(dir.path());
+        let store = StubStore {
+            listed: vec![
+                crate::entity::file(".a.md.vaultsync-tmp-1-2", 25, Some(100)),
+                crate::entity::file("notes/.a.md.vaultsync-tmp-3-4", 25, Some(100)),
+            ],
+        };
+        let p = build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        assert!(
+            !p.actions.iter().any(|a| {
+                a.key == ".a.md.vaultsync-tmp-1-2" || a.key == "notes/.a.md.vaultsync-tmp-3-4"
+            }),
+            "tmp-sibling key planned: {:?}",
             p.actions
         );
     }
