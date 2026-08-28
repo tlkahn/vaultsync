@@ -15,6 +15,8 @@
 //!   chars and whitespace-only segments, P1r4-key-ctl) fails the walk loud
 //!   instead of emitting a corrupt key.
 
+// The test-only unguarded write variant (W90) needs the trait in scope.
+#[cfg(test)]
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -412,10 +414,14 @@ impl LocalFs {
         }
     }
 
-    /// Atomically write `expected_size` bytes from `r` to `key`'s file and set
-    /// its mtime. Created via a temp sibling + rename so a partial write is
-    /// never visible at the final path. Rejects a path escaping the canonical
-    /// vault root (P1r7 download half).
+    /// TEST-ONLY (r10-N1/W90): the unguarded atomic write variant. Gated
+    /// `#[cfg(test)]` because no production path uses it - the executor
+    /// writes through `tmp_path_for` + [`LocalFs::finalize_write`]
+    /// (exec.rs:298-308). Must stay behaviorally unified with
+    /// `finalize_write` (both route the commit through the shared
+    /// [`LocalFs::commit_temp`] tail - the W27/M5 invariant, which has
+    /// already needed re-unification twice: W27 and W76).
+    #[cfg(test)]
     pub fn write_atomic(
         &self,
         key: &str,
@@ -464,11 +470,14 @@ impl LocalFs {
         self.commit_temp(parent, &tmp, &path)
     }
 
-    /// Delete a single file (never a directory). Missing keys are
-    /// [`Error::NotFound`] (not idempotent, matching the store trait).
-    /// W50/A-M1: re-verifies parent locality before `remove_file` (mirrors
-    /// `open_verified`): a parent swapped for an out-of-vault symlink since
-    /// the walk must be refused, never unlinked through.
+    /// TEST-ONLY (r10-N1/W90): the unguarded delete variant. Gated
+    /// `#[cfg(test)]` because no production path uses it - the executor
+    /// deletes through [`LocalFs::delete_file_guarded`] (exec.rs:166). Must
+    /// stay behaviorally unified with `delete_file_guarded` (both route the
+    /// unlink through the shared [`LocalFs::unlink_local_file`] seam - the
+    /// W76/r8b M1 invariant). Missing keys are [`Error::NotFound`] (not
+    /// idempotent, matching the store trait).
+    #[cfg(test)]
     pub fn delete_file(&self, key: &str) -> Result<(), Error> {
         let path = key_to_local_path(&self.root, key)?;
         let parent = path.parent().ok_or_else(|| {
