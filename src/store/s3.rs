@@ -159,9 +159,16 @@ fn decode_mtime(meta_val: Option<&str>, last_modified_ms: Option<u64>) -> Option
     last_modified_ms
 }
 
-/// Convert `aws-smithy` DateTime to ms since epoch.
+/// Convert `aws-smithy` DateTime to ms since epoch. Pre-epoch times saturate
+/// to `Some(0)`, mirroring the local side's `system_time_to_ms` policy
+/// (W8/A-M4/B-L2): a negative secs count must not wrap to a huge `u64`.
 fn dt_millis(dt: &aws_sdk_s3::primitives::DateTime) -> Option<u64> {
-    Some((dt.secs() as u64).saturating_mul(1000))
+    let secs = dt.secs();
+    if secs < 0 {
+        Some(0)
+    } else {
+        Some((secs as u64).saturating_mul(1000))
+    }
 }
 
 /// Ancestor folder keys (each trailing-`/` prefix) of a key, like the mock.
@@ -480,6 +487,20 @@ mod tests {
         let ents = convert_listed(vec![("notes/a.md".to_string(), 1, None)]);
         assert_eq!(ents.len(), 2);
         assert!(ents.iter().any(|e| e.key == "notes/" && e.is_folder()));
+    }
+
+    #[test]
+    fn dt_millis_saturates_pre_epoch() {
+        // W8/A-M4/B-L2: pre-epoch LastModified (negative secs) saturates to
+        // Some(0) like the local side, never wrapping to a huge u64.
+        use aws_sdk_s3::primitives::DateTime;
+        assert_eq!(dt_millis(&DateTime::from_secs(-1)), Some(0));
+        assert_eq!(dt_millis(&DateTime::from_secs(-10_000)), Some(0));
+        assert_eq!(dt_millis(&DateTime::from_secs(0)), Some(0));
+        assert_eq!(
+            dt_millis(&DateTime::from_secs(1_700_000_000)),
+            Some(1_700_000_000_000)
+        );
     }
 
     #[test]
