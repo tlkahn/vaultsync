@@ -222,7 +222,12 @@ impl LocalFs {
     /// the canonical vault root (P1r7 download half). The file is created with
     /// `create_new` + bounded retry (R4-L2/W40) so a pre-planted symlink or
     /// stale leftover at a predictable name is skipped, never followed.
-    pub fn tmp_path_for(&self, key: &str) -> Result<(PathBuf, std::fs::File), Error> {
+    ///
+    /// The returned third element is the chain of directories this call is
+    /// about to create (`create_dir_all(parent)`), deepest-first (W66/A-L2):
+    /// a later download failure removes exactly what we created, never a
+    /// pre-existing empty dir.
+    pub fn tmp_path_for(&self, key: &str) -> Result<(PathBuf, std::fs::File, Vec<PathBuf>), Error> {
         let path = key_to_local_path(&self.root, key)?;
         let parent = path.parent().ok_or_else(|| {
             Error::Other(format!(
@@ -231,9 +236,13 @@ impl LocalFs {
             ))
         })?;
         self.ensure_locality(parent)?;
+        // W66/A-L2: computed BEFORE `create_dir_all` so the failure cleanup
+        // can remove exactly the dirs we created.
+        let created_dirs = created_dir_chain(parent);
         std::fs::create_dir_all(parent)?;
         self.ensure_locality(parent)?;
-        alloc_temp_sibling(&path)
+        let (tmp, f) = alloc_temp_sibling(&path)?;
+        Ok((tmp, f, created_dirs))
     }
 
     /// Commit a temp file written by a download to its final path, applying
@@ -686,6 +695,28 @@ pub(crate) fn is_check_probe_name(name: &str) -> bool {
 ///   re-upload.
 pub(crate) fn is_reserved_vaultsync_key_name(name: &str) -> bool {
     (name.starts_with('.') && name.contains(".vaultsync-tmp-")) || is_check_probe_name(name)
+}
+
+/// The directories `create_dir_all(parent)` will create (W66/A-L2): the chain
+/// from `parent` up to but excluding the deepest pre-existing ancestor, in
+/// deepest-first order (children before parents) so a later bottom-up
+/// best-effort removal can iterate as-is and only touch what we created.
+/// Computed BEFORE `create_dir_all`, so a failure cleanup never removes a
+/// pre-existing empty dir.
+fn created_dir_chain(parent: &Path) -> Vec<PathBuf> {
+    let mut created = Vec::new();
+    let mut probe = parent;
+    loop {
+        if probe.exists() {
+            break;
+        }
+        created.push(probe.to_path_buf());
+        match probe.parent() {
+            Some(p) if !p.as_os_str().is_empty() => probe = p,
+            _ => break,
+        }
+    }
+    created
 }
 
 /// Whether a file name is a reserved vaultsync temp/probe name. The walker
@@ -1517,7 +1548,7 @@ mod tests {
         let dir = TempDir::new("vaultsync-test");
         let outside = TempDir::new("vaultsync-outside");
         let fs = LocalFs::new(dir.path());
-        let (tmp, _f) = fs.tmp_path_for("sub/a.md").unwrap(); // creates root/sub
+        let (tmp, _f, _created) = fs.tmp_path_for("sub/a.md").unwrap(); // creates root/sub
         // swap `sub` for an out-of-vault symlink; the tmp now resolves to
         // outside/.a.md.tmp, which we repopulate so finalize's open()/sync
         // succeed and only the locality re-check can refuse.
@@ -1545,7 +1576,7 @@ mod tests {
         // read-only-parent variant would also block remove_file).
         let dir = TempDir::new("vaultsync-test");
         let fs = LocalFs::new(dir.path());
-        let (tmp, _f) = fs.tmp_path_for("sub/a.md").unwrap();
+        let (tmp, _f, _created) = fs.tmp_path_for("sub/a.md").unwrap();
         std::fs::write(&tmp, "payload").unwrap();
         std::fs::create_dir_all(dir.join("sub/a.md")).unwrap();
         let err = fs.finalize_write("sub/a.md", &tmp, None).unwrap_err();

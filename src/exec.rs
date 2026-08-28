@@ -14,6 +14,8 @@
 //!   a per-key error, the run continues, and exit is non-zero at dispatch;
 //! - per-key failures are isolated; the report collects `(key, error)`.
 
+use std::path::PathBuf;
+
 use crate::error::Error;
 use crate::local::LocalFs;
 use crate::plan::{ActionKind, Mode, Plan};
@@ -216,8 +218,14 @@ fn exec_download(
     a: &crate::plan::Action,
     tolerance_ms: u64,
 ) -> Result<(), Error> {
-    let (tmp, mut f) = local.tmp_path_for(&a.key)?;
-    let result = (|| -> Result<Option<u64>, Error> {
+    let (tmp, mut f, created_dirs) = local.tmp_path_for(&a.key)?;
+    // W66/A-L2: every post-creation failure removes the temp sibling AND the
+    // parent dirs `tmp_path_for` created (best-effort, only while empty - a
+    // pre-existing empty dir is never touched). Without this, a pull with
+    // per-key failures accumulates empty dirs that the next walk lists as
+    // folder entities. The temp is removed first so the dirs are empty when
+    // the bottom-up pass reaches them.
+    let result = (|| -> Result<(), Error> {
         let remote_mtime = {
             let remote = store.get_to(&a.key, &mut f)?;
             // A-H1/B-L3: truth-check the bytes actually on disk (not just the
@@ -238,44 +246,17 @@ fn exec_download(
             // on-disk size re-stat above is kept (it is the correctness check).
             remote.mtime_ms
         };
-        Ok(remote_mtime)
-    })();
-    let (remote_mtime, err) = match result {
-        Ok(m) => (m, None),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            (None, Some(e))
-        }
-    };
-    if let Some(e) = err {
-        return Err(e);
-    }
-    // W22/N2/L3: a pull key with no planned local entity (remote only) still
-    // guards the destination. A file/dir/symlink that appeared since the plan
-    // is never clobbered by the rename - the key fails, the appeared content
-    // survives.
-    if a.local.is_none() {
-        let absent = match local.destination_absent(&a.key) {
-            Ok(b) => b,
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(e);
-            }
-        };
-        if !absent {
-            // R4-L5/W43: distinguish a destination that was *skipped by the
-            // walk* (a pre-existing symlink - the key is remote-only because
-            // the walk skipped it, not because it appeared) from one that
-            // truly appeared since the plan. Both fail closed; only the message
-            // differs.
-            let is_symlink = match local.is_symlink_destination(&a.key) {
-                Ok(b) => b,
-                Err(e) => {
-                    let _ = std::fs::remove_file(&tmp);
-                    return Err(e);
-                }
-            };
-            let _ = std::fs::remove_file(&tmp);
+        // W22/N2/L3: a pull key with no planned local entity (remote only)
+        // still guards the destination. A file/dir/symlink that appeared since
+        // the plan is never clobbered by the rename - the key fails, the
+        // appeared content survives.
+        if a.local.is_none() && !local.destination_absent(&a.key)? {
+            // R4-L5/W43: distinguish a destination that was *skipped by
+            // the walk* (a pre-existing symlink - the key is remote-only
+            // because the walk skipped it, not because it appeared) from
+            // one that truly appeared since the plan. Both fail closed;
+            // only the message differs.
+            let is_symlink = local.is_symlink_destination(&a.key)?;
             if is_symlink {
                 return Err(Error::Other(format!(
                     "destination {} exists but was skipped by the walk (symlink); not overwriting",
@@ -287,42 +268,57 @@ fn exec_download(
                 a.key
             )));
         }
-    }
 
-    // W13/B-L4: pull destination-freshness guard (symmetric to upload R3.3).
-    // A destination that changed since the plan is NOT overwritten - the
-    // user's newer edits survive; a vanished destination is recreated.
-    //
-    // N3: this is a check-then-act stat (std has no `renameat2(NOREPLACE)`/
-    // fd-exchange), so a writer that lands between the stat and the rename is
-    // still silently overwritten - documented limitation; the upload half (R3.3)
-    // re-checks the OPENED descriptor on the same fd, which this download path
-    // cannot (it renames a separate temp file).
-    if let Some(planned) = &a.local {
-        let freshness =
-            local.destination_freshness(&a.key, planned.size, planned.mtime_ms, tolerance_ms);
-        // W21/N1: every error path after the temp was written must remove it,
-        // including a refusal from `destination_freshness` itself (e.g. the
-        // destination became a symlink) - mirroring the `Changed` arm below.
-        let freshness = match freshness {
-            Ok(f) => f,
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(e);
-            }
-        };
-        match freshness {
-            crate::local::Freshness::Changed => {
-                let _ = std::fs::remove_file(&tmp);
+        // W13/B-L4: pull destination-freshness guard (symmetric to upload
+        // R3.3). A destination that changed since the plan is NOT overwritten
+        // - the user's newer edits survive; a vanished destination is
+        // recreated.
+        //
+        // N3: this is a check-then-act stat (std has no `renameat2(NOREPLACE)`/
+        // fd-exchange), so a writer that lands between the stat and the rename
+        // is still silently overwritten - documented limitation; the upload
+        // half (R3.3) re-checks the OPENED descriptor on the same fd, which
+        // this download path cannot (it renames a separate temp file).
+        if let Some(planned) = &a.local {
+            // W21/N1: every error path after the temp was written must remove
+            // it, including a refusal from `destination_freshness` itself (e.g.
+            // the destination became a symlink) - the outer cleanup covers
+            // this and the `Changed` arm below uniformly.
+            let freshness = local.destination_freshness(
+                &a.key,
+                planned.size,
+                planned.mtime_ms,
+                tolerance_ms,
+            )?;
+            if freshness == crate::local::Freshness::Changed {
                 return Err(Error::Other(format!(
                     "destination changed since plan for {}; not overwriting",
                     a.key
                 )));
             }
-            crate::local::Freshness::Fresh | crate::local::Freshness::Vanished => {}
+        }
+        local.finalize_write(&a.key, &tmp, remote_mtime)
+    })();
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            remove_created_dirs(&created_dirs);
+            Err(e)
         }
     }
-    local.finalize_write(&a.key, &tmp, remote_mtime)
+}
+
+/// Best-effort bottom-up removal of the dirs a failed download created
+/// (W66/A-L2): `remove_dir` refuses a non-empty dir (and a `NotFound` is the
+/// goal state), so only still-empty dirs we created are removed, deepest-
+/// first as `created_dir_chain` produced them. Errors are swallowed: the
+/// primary failure is already being reported, and any leftover is either
+/// pre-existing or will be cleaned by the next empty-dir pass.
+fn remove_created_dirs(created: &[PathBuf]) {
+    for d in created {
+        let _ = std::fs::remove_dir(d);
+    }
 }
 
 /// Upload one key, re-verifying size + mtime at open (R3.3).
@@ -948,6 +944,64 @@ mod tests {
         // other keys still download
         assert!(dir.join("ok.md").exists());
         assert_eq!(rep.executed, 1, "{:?}", rep);
+    }
+
+    #[test]
+    fn exec_download_failure_removes_created_parent_dirs() {
+        // W66/A-L2: a pull key `a/b/c.md` into an empty vault whose get_to
+        // fails (object deleted between plan and execute) must remove the
+        // dirs the download created (`a/`, `a/b/`) - no empty-dir litter, no
+        // folder entities for the next walk. Fails today (dirs remain).
+        let dir = TempDir::new("vaultsync-exec");
+        let store = MemoryStore::new();
+        put_str(&store, "a/b/c.md", "x", Some(100));
+        let local = LocalFs::new(dir.path());
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        // remote vanishes between plan and execute
+        store.delete("a/b/c.md").unwrap();
+        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+        assert!(
+            rep.failed.iter().any(|fl| fl.key == "a/b/c.md"),
+            "a/b/c.md not failed: {:?}",
+            rep.failed
+        );
+        assert!(
+            !dir.join("a").exists(),
+            "download left created empty dirs behind: {:?}",
+            std::fs::read_dir(dir.path())
+                .map(|rd| rd.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+                .unwrap_or_default()
+        );
+        assert!(dir.exists(), "vault root must survive");
+    }
+
+    #[test]
+    fn exec_download_failure_keeps_preexisting_empty_dirs() {
+        // W66/A-L2: a pre-existing empty dir is never touched by the cleanup
+        // - only the dirs the failed download created are removed. `keep/`
+        // existed before the pull; `keep/sub/` was created by the download
+        // itself and must be removed on failure.
+        let dir = TempDir::new("vaultsync-exec");
+        std::fs::create_dir_all(dir.join("keep")).unwrap();
+        let store = MemoryStore::new();
+        put_str(&store, "keep/sub/x.md", "x", Some(100));
+        let local = LocalFs::new(dir.path());
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        store.delete("keep/sub/x.md").unwrap();
+        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+        assert!(
+            rep.failed.iter().any(|fl| fl.key == "keep/sub/x.md"),
+            "keep/sub/x.md not failed: {:?}",
+            rep.failed
+        );
+        assert!(
+            !dir.join("keep/sub").exists(),
+            "created sub dir left behind"
+        );
+        assert!(
+            dir.join("keep").exists(),
+            "pre-existing empty dir must survive"
+        );
     }
 
     #[test]
