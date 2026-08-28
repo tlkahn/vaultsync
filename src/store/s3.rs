@@ -240,9 +240,13 @@ fn parent_folders(key: &str) -> Vec<String> {
 }
 
 /// Pure conversion of a raw listing (key, size, mtime) into sorted entities
-/// with synthesized folder views (same shape as the mock).
-fn convert_listed(items: Vec<(String, u64, Option<u64>)>) -> Vec<Entity> {
+/// with synthesized folder views (same shape as the mock). Also returns the
+/// dropped `*/` keys that carried bytes (size > 0) - S3-console folder
+/// markers are zero-byte, so a non-empty trailing-`/` key is a real object
+/// that must be surfaced, never silently dropped (W70/A-N2).
+fn convert_listed(items: Vec<(String, u64, Option<u64>)>) -> (Vec<Entity>, Vec<(String, u64)>) {
     let mut map: BTreeMap<String, Entity> = BTreeMap::new();
+    let mut dropped_nonempty: Vec<(String, u64)> = Vec::new();
     for (key, size, mtime) in items {
         if key.is_empty() {
             // R4-M2: the exact-prefix folder marker. S3-console "Make Folder"
@@ -253,7 +257,15 @@ fn convert_listed(items: Vec<(String, u64, Option<u64>)>) -> Vec<Entity> {
             continue;
         }
         if key.ends_with('/') {
-            continue; // object keys never end with '/'
+            // W70/A-N2: a zero-byte trailing-`/` key is the intended console
+            // folder marker and is dropped silently (object keys never end
+            // with '/'); one carrying actual bytes is a real object that
+            // would become invisible - never planned, never warned. Surface
+            // it instead of hiding it.
+            if size > 0 {
+                dropped_nonempty.push((key, size));
+            }
+            continue;
         }
         map.insert(
             key.clone(),
@@ -274,7 +286,7 @@ fn convert_listed(items: Vec<(String, u64, Option<u64>)>) -> Vec<Entity> {
             etag: None,
         });
     }
-    map.into_values().collect()
+    (map.into_values().collect(), dropped_nonempty)
 }
 
 /// Validate a key for object operations (head/get/delete): folders are not
@@ -398,7 +410,17 @@ fn create_temp_upload_file() -> Result<(PathBuf, std::fs::File), Error> {
 impl ObjectStore for S3Store {
     fn list(&self, prefix: &str) -> Result<Vec<Entity>, Error> {
         let raw = self.list_prefix_objects(prefix)?;
-        Ok(convert_listed(raw))
+        let (entities, dropped_nonempty) = convert_listed(raw);
+        // W70/A-N2: `ObjectStore::list` has no warning channel, so the v1
+        // surface is a best-effort one-line stderr warning per dropped key
+        // ("surface, don't hide") - a non-empty `*/` key would otherwise be
+        // invisible: never planned, never warned.
+        for (key, size) in dropped_nonempty {
+            eprintln!(
+                "warning: ignoring remote object {key} ({size} bytes): keys ending in '/' are folder markers; rename it to sync"
+            );
+        }
+        Ok(entities)
     }
 
     fn head(&self, key: &str) -> Result<Entity, Error> {
@@ -625,10 +647,11 @@ mod tests {
 
     #[test]
     fn s3_list_synthesizes_folders() {
-        let ents = convert_listed(vec![
+        let (ents, dropped) = convert_listed(vec![
             ("notes/b.md".to_string(), 3, Some(100)),
             ("a.md".to_string(), 1, Some(200)),
         ]);
+        assert_eq!(dropped, Vec::<(String, u64)>::new());
         let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(keys, vec!["a.md", "notes/", "notes/b.md"]);
         let folder = ents.iter().find(|e| e.key == "notes/").unwrap();
@@ -642,17 +665,38 @@ mod tests {
         // prefix (S3 console creates such keys when you Make Folder) strips to
         // an empty relative key and must be dropped - never planned as a
         // `""` entity that would fail `ensure_valid_key`.
-        let ents = convert_listed(vec![("".to_string(), 0, Some(123))]);
+        let (ents, dropped) = convert_listed(vec![("".to_string(), 0, Some(123))]);
         assert_eq!(ents, Vec::<Entity>::new(), "exact-prefix marker listed");
+        assert_eq!(dropped, Vec::<(String, u64)>::new());
     }
 
     #[test]
     fn s3_list_prefix_scoping_keeps_rel_keys() {
         // convert_listed keeps vault-relative keys; folder synthesis is within
         // the returned set.
-        let ents = convert_listed(vec![("notes/a.md".to_string(), 1, None)]);
+        let (ents, _) = convert_listed(vec![("notes/a.md".to_string(), 1, None)]);
         assert_eq!(ents.len(), 2);
         assert!(ents.iter().any(|e| e.key == "notes/" && e.is_folder()));
+    }
+
+    #[test]
+    fn convert_listed_reports_dropped_nonempty_folder_keys() {
+        // W70/A-N2: a trailing-`/` key carrying actual bytes is dropped from
+        // the entities (object keys never end with '/') BUT reported, so the
+        // S3 list surface can warn instead of hiding it; a zero-byte `*/` key
+        // is the intended console folder marker and stays silent.
+        let (ents, dropped) = convert_listed(vec![
+            ("odd/".to_string(), 10, None),
+            ("marker/".to_string(), 0, None),
+            ("real.md".to_string(), 3, Some(1)),
+        ]);
+        assert!(
+            !ents.iter().any(|e| e.key == "odd/" || e.key == "marker/"),
+            "trailing-slash keys listed: {:?}",
+            ents
+        );
+        assert_eq!(dropped, vec![("odd/".to_string(), 10)]);
+        assert!(ents.iter().any(|e| e.key == "real.md"));
     }
 
     #[cfg(unix)]
