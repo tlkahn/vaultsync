@@ -69,6 +69,10 @@ pub struct Settings {
     pub store: StoreSettings,
     pub mtime_tolerance_ms: u64,
     pub concurrency: u32,
+    /// Parsed non-empty `[ignore].patterns` (W25/M3). A Phase 3 feature that
+    /// is surfaced loudly - never silently applied - so a user copying the
+    /// cli.md example is not let to believe patterns are in effect.
+    pub ignore_patterns: Vec<String>,
 }
 
 /// Resolved store connection settings (no credentials - those stay in the AWS
@@ -155,11 +159,17 @@ pub fn resolve_settings(cfg: &FileConfig, cli: &Cli, env: &EnvSnapshot) -> Resul
         .as_ref()
         .and_then(|t| t.concurrency)
         .unwrap_or(DEFAULT_CONCURRENCY);
+    let ignore_patterns = cfg
+        .ignore
+        .as_ref()
+        .map(|i| i.patterns.clone())
+        .unwrap_or_default();
     Ok(Settings {
         vault_root,
         store,
         mtime_tolerance_ms,
         concurrency,
+        ignore_patterns,
     })
 }
 

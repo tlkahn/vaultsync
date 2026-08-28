@@ -103,8 +103,12 @@ mtime_tolerance_ms = 1000
 # max_delete = 100
 ```
 
-Credentials: environment / shared AWS config, not the TOML file.
+> `[ignore].patterns` is a **Phase 3 feature**: it is parsed and validated
+> but not yet applied. A `push`/`pull`/`check` run refuses loudly when it is
+> present (exit 1); `status` warns on stderr and proceeds. Do not expect it
+> to filter the plan until the roadmap's ignore-patterns phase lands.
 
+Credentials: environment / shared AWS config, not the TOML file.
 ```text
 AWS_ACCESS_KEY_ID
 AWS_SECRET_ACCESS_KEY

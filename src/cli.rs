@@ -599,6 +599,29 @@ fn run_with_settings(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
+    // W25/M3: `[ignore].patterns` is a Phase 3 feature (parsed but not yet
+    // applied). A mutating command that would silently not apply it must
+    // refuse loudly; `status` (read-only) warns and proceeds with the plan.
+    if !settings.ignore_patterns.is_empty() {
+        match &cmd {
+            Command::Push { .. } | Command::Pull { .. } | Command::Check { .. } => {
+                let _ = writeln!(
+                    err,
+                    "error: [ignore].patterns is a Phase 3 feature and is not yet applied; refusing {} ({:?} ignored). Remove the [ignore] section or use `status` to preview.",
+                    command_name(&cmd),
+                    settings.ignore_patterns
+                );
+                return 1;
+            }
+            _ => {
+                let _ = writeln!(
+                    err,
+                    "warning: [ignore].patterns is a Phase 3 feature and is not yet applied ({:?} ignored)",
+                    settings.ignore_patterns
+                );
+            }
+        }
+    }
     if requires_real_store(&cmd) && settings.store.bucket.is_empty() {
         let _ = writeln!(
             err,
@@ -1193,7 +1216,82 @@ mod tests {
             },
             mtime_tolerance_ms: 1000,
             concurrency: 4,
+            ignore_patterns: Vec::new(),
         }
+    }
+
+    fn settings_with_ignore(vault: &std::path::Path, patterns: Vec<&str>) -> crate::config::Settings {
+        let mut s = no_store_settings(vault);
+        s.ignore_patterns = patterns.iter().map(|s| s.to_string()).collect();
+        s
+    }
+
+    #[test]
+    fn push_with_ignore_patterns_errors_loudly() {
+        // W25/M3: `[ignore].patterns` is a Phase 3 feature; a mutating command
+        // that would silently not apply it must refuse loudly, naming the key
+        // and the phase.
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "hi").unwrap();
+        let settings = settings_with_ignore(dir.path(), vec![".trash/"]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings(
+            Command::push(dir.path().into(), false),
+            &settings,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(code, 1);
+        assert!(
+            err.to_lowercase().contains("ignore") && err.contains("Phase 3"),
+            "expected ignore/Phase-3 refusal: {err}"
+        );
+    }
+
+    #[test]
+    fn pull_with_ignore_patterns_errors_loudly() {
+        let dir = TempDir::new("vaultsync-cli-test");
+        let settings = settings_with_ignore(dir.path(), vec![".trash/"]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings(
+            Command::pull(dir.path().into(), false),
+            &settings,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(code, 1);
+        assert!(
+            err.to_lowercase().contains("ignore") && err.contains("Phase 3"),
+            "expected ignore/Phase-3 refusal: {err}"
+        );
+    }
+
+    #[test]
+    fn status_with_ignore_patterns_warns_but_runs() {
+        // W25/M3: `status` is read-only, so ignore patterns warn on stderr but
+        // the plan is still produced (exit 0 on a clean vault).
+        let dir = TempDir::new("vaultsync-cli-test");
+        let settings = settings_with_ignore(dir.path(), vec![".trash/"]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings(
+            Command::status(dir.path().into()),
+            &settings,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(code, 0);
+        assert!(
+            err.to_lowercase().contains("ignore") && err.contains("Phase 3"),
+            "expected ignore/Phase-3 warning: {err}"
+        );
+        assert!(out.contains("plan:"), "plan produced: {out}");
     }
 
     #[test]
