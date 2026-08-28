@@ -437,6 +437,9 @@ fn dispatch_plan(
                 if is_clean(&plan) { 0 } else { 2 }
             } else {
                 let report = crate::exec::execute_plan(&local, store, &plan, mode, opts);
+                for w in &report.warnings {
+                    let _ = writeln!(err, "warning: {w}");
+                }
                 for f in &report.failed {
                     let _ = writeln!(err, "error: {}\n  {}", f.key, f.message);
                 }

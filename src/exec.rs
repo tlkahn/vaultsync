@@ -27,6 +27,9 @@ pub struct ExecReport {
     pub executed: u32,
     /// Failed keys with a human message (one bad key never aborts the run).
     pub failed: Vec<ExecFailure>,
+    /// Non-fatal warnings (e.g. an empty-dir cleanup error, W16/A-L3)
+    /// surfaced to stderr; do not affect the exit code.
+    pub warnings: Vec<String>,
 }
 
 /// A single failed key.
@@ -92,8 +95,12 @@ pub fn execute_plan(
         }
     }
     // R2.1 option (a): after local deletes, clean now-empty dirs bottom-up.
+    // W16/A-L3: a cleanup error is a non-fatal warning (exit code unchanged),
+    // not silently swallowed.
     if deleted_local {
-        let _ = local.remove_empty_dirs_bottom_up();
+        if let Err(e) = local.remove_empty_dirs_bottom_up() {
+            rep.warnings.push(format!("empty-dir cleanup: {e}"));
+        }
     }
 
     rep
@@ -621,6 +628,44 @@ mod tests {
             rep.failed
         );
         assert!(!dir.join("a.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_reports_empty_dir_cleanup_warning() {
+        // W16/A-L3: an empty-dir cleanup failure (unreadable dir) is a
+        // non-fatal warning on the report, not silently swallowed; the delete
+        // itself still succeeds and the run's exit is unaffected.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("vaultsync-exec");
+        std::fs::create_dir_all(dir.join("n/locked")).unwrap();
+        std::fs::write(dir.join("n/gone.md"), "bye").unwrap();
+        let store = MemoryStore::new();
+        let local = LocalFs::new(dir.path());
+        let opts = PlanOpts {
+            delete: true,
+            ..Default::default()
+        };
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts).unwrap();
+        assert!(plan
+            .actions
+            .iter()
+            .any(|a| a.key == "n/gone.md" && a.kind == ActionKind::DeleteLocal));
+        // lock the subdir after planning so the empty-dir cleanup pass errors
+        std::fs::set_permissions(dir.join("n/locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &opts);
+        // restore perms so TempDir drop can remove the tree
+        std::fs::set_permissions(dir.join("n/locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            rep.warnings
+                .iter()
+                .any(|w| w.contains("empty-dir") || w.contains("cleanup")),
+            "no cleanup warning: {:?}",
+            rep.warnings
+        );
+        // non-fatal: the delete itself succeeded, no failed keys
+        assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep.failed);
+        assert!(!dir.join("n/gone.md").exists());
     }
 
     #[test]
