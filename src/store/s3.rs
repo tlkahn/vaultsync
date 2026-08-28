@@ -269,28 +269,54 @@ fn temp_upload_path() -> PathBuf {
     std::env::temp_dir().join(format!("vaultsync-upload-{}-{n}", std::process::id()))
 }
 
-/// Create the upload temp buffer file. Owner-only `0o600` perms (W14/A-L1/
-/// B-L1) and `create_new` (no reuse of an existing file, killing the
-/// predictable-name race). On non-unix it is plain `create_new`.
-fn create_temp_upload_file() -> Result<(PathBuf, std::fs::File), Error> {
-    let tmp = temp_upload_path();
+/// Create a single upload temp buffer file (**not** retried). Owner-only
+/// `0o600` perms (W14/A-L1/B-L1) and `create_new` (no reuse). On non-unix it
+/// is plain `create_new`.
+fn create_temp_upload_file_at(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
-    let f = {
+    {
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&tmp)
-            .map_err(Error::Io)?
-    };
+            .open(path)
+    }
     #[cfg(not(unix))]
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .map_err(Error::Io)?;
-    Ok((tmp, f))
+    {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    }
+}
+
+/// Allocate the first free candidate path exclusively (W29/N4). A stale
+/// leftover at an earlier candidate - a crashed run's `vaultsync-upload-
+/// <pid>-<n>` + pid reuse - is skipped, leaving it untouched; only if every
+/// candidate is taken is it a loud error (never an infinite loop).
+fn alloc_first(candidates: &[PathBuf]) -> Result<(PathBuf, std::fs::File), Error> {
+    for p in candidates {
+        match create_temp_upload_file_at(p) {
+            Ok(f) => return Ok((p.clone(), f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(Error::Io(e)),
+        }
+    }
+    Err(Error::Io(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique upload temp file",
+    )))
+}
+
+/// Create the upload temp buffer file. Owner-only `0o600` perms (W14/A-L1/
+/// B-L1) and `create_new`, retrying past a stale leftover from a crashed run
+/// (W29/N4): a predictable name + pid reuse would otherwise hard-fail the
+/// first upload(s) of a later process. Bounded (100 candidate names) so a
+/// pathological collision space is still a loud error.
+fn create_temp_upload_file() -> Result<(PathBuf, std::fs::File), Error> {
+    let candidates: Vec<PathBuf> = (0..100).map(|_| temp_upload_path()).collect();
+    alloc_first(&candidates)
 }
 
 impl ObjectStore for S3Store {
@@ -524,6 +550,36 @@ mod tests {
         let mode = std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "upload temp perms must be 0600, got {mode:o}");
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn create_temp_upload_file_skips_stale_leftover() {
+        // W29/N4: a stale leftover at an earlier candidate (a crashed run's
+        // predictable `vaultsync-upload-<pid>-<n>` + pid reuse) must be
+        // skipped untouched, not a hard failure; the fresh file is allocated at
+        // the next free candidate.
+        let c0 = std::env::temp_dir().join(format!(
+            "vaultsync-upload-{}-W29-stale-0",
+            std::process::id()
+        ));
+        let c1 = std::env::temp_dir().join(format!(
+            "vaultsync-upload-{}-W29-stale-1",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&c0);
+        let _ = std::fs::remove_file(&c1);
+        std::fs::write(&c0, "stale").unwrap();
+        let (tmp, _f) = alloc_first(&[c0.clone(), c1.clone()]).unwrap();
+        assert_ne!(tmp, c0, "must skip the stale candidate");
+        assert_eq!(tmp, c1, "fresh file allocated at the next candidate");
+        assert_eq!(
+            std::fs::read(&c0).unwrap(),
+            b"stale",
+            "stale leftover must be left untouched"
+        );
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&c0);
+        let _ = std::fs::remove_file(&c1);
     }
 
     #[test]
