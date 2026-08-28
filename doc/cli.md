@@ -84,6 +84,47 @@ region = "us-west-2"
 # prefix = "notes/"
 # path_style = true
 
+# [ignore]     # Phase 3 (ignored patterns are not yet applied)
+# patterns = [
+#   ".git/",
+#   ".trash/",
+#   ".DS_Store",
+#   ".obsidian/workspace",
+#   ".obsidian/workspace.json",
+#   ".obsidian/workspace-mobile.json",
+# ]
+
+[transfer]
+# concurrency = 4   # Phase 3 (parallel transfers are not yet applied); an explicit copy of the default is silent
+mtime_tolerance_ms = 1000
+# max_delete = 100
+```
+
+> `[ignore].patterns` is a **Phase 3 feature**: it is parsed and validated
+> but not yet applied. A `push`/`pull`/`check` run refuses loudly when it is
+> present (exit 1); `status` warns on stderr and proceeds. Do not expect it
+> to filter the plan until the roadmap's ignore-patterns phase lands.
+>
+> `[transfer].concurrency` is likewise a **Phase 3 feature** (inert until the
+> pool exists). Setting a value that differs from the default warns on every
+> run; an explicit copy of the default (`4`) is silent.
+
+If you want the full populated form (Phase 3, not yet applied), it is shown
+here for reference; copying it as-is will refuse `push`/`pull`/`check` until
+the ignore-patterns phase lands.
+
+```toml
+# Phase 3 (not yet applied): do not copy verbatim
+vault_root = "/Users/me/Notes"
+
+[store]
+type = "s3"
+bucket = "my-vaults"
+region = "us-west-2"
+endpoint = "https://minio.example"
+prefix = "notes/"
+path_style = true
+
 [ignore]
 patterns = [
   ".git/",
@@ -97,13 +138,8 @@ patterns = [
 [transfer]
 concurrency = 4
 mtime_tolerance_ms = 1000
-# max_delete = 100
+max_delete = 100
 ```
-
-> `[ignore].patterns` is a **Phase 3 feature**: it is parsed and validated
-> but not yet applied. A `push`/`pull`/`check` run refuses loudly when it is
-> present (exit 1); `status` warns on stderr and proceeds. Do not expect it
-> to filter the plan until the roadmap's ignore-patterns phase lands.
 
 Credentials: environment / shared AWS config, not the TOML file.
 ```text
