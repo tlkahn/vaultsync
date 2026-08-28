@@ -14,7 +14,6 @@
 //!   a per-key error, the run continues, and exit is non-zero at dispatch;
 //! - per-key failures are isolated; the report collects `(key, error)`.
 
-use std::io::Write;
 
 use crate::local::LocalFs;
 use crate::plan::{ActionKind, Mode, Plan};

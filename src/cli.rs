@@ -114,7 +114,8 @@ impl Command {
     version,
     about = "Minimal, Unix-style sync of a plain directory (Obsidian vault) to object storage",
     subcommand_negates_reqs = true,
-    disable_help_subcommand = true
+    disable_help_subcommand = true,
+    after_help = "WARNING: --delete removes files permanently with no confirmation prompt until Phase 3"
 )]
 struct Cli {
     /// Config file (default: ./.vaultsync.toml then ~/.config/vaultsync/config.toml)
@@ -283,7 +284,7 @@ pub fn run_with_io(
             0
         }
         Command::Check { config: _c, verbose: _v } => {
-            let _ = writeln!(out, "check: ok (mock)");
+            let _ = writeln!(out, "check: ok");
             0
         }
         Command::Status {
@@ -320,14 +321,13 @@ pub fn run_with_io(
             if json {
                 return reject_json(err);
             }
-            let _ = dry_run;
             let opts = PlanOpts {
                 delete,
                 force_local,
                 force_remote,
                 ..Default::default()
             };
-            dispatch_plan_stub(&vault, store, Mode::Push, &opts, out, err)
+            dispatch_plan(&vault, store, Mode::Push, &opts, dry_run, out, err)
         }
         Command::Pull {
             vault,
@@ -342,32 +342,57 @@ pub fn run_with_io(
             if json {
                 return reject_json(err);
             }
-            let _ = dry_run;
             let opts = PlanOpts {
                 delete,
                 force_local,
                 force_remote,
                 ..Default::default()
             };
-            dispatch_plan_stub(&vault, store, Mode::Pull, &opts, out, err)
+            dispatch_plan(&vault, store, Mode::Pull, &opts, dry_run, out, err)
         }
     }
 }
 
-fn dispatch_plan_stub(
+/// Build a plan and dispatch push/pull execution. Exit codes (P1r-stub-exit,
+/// retired in Slice 6):
+/// - `0` all selected actions succeeded and no conflict rows;
+/// - `2` the plan contained any Conflict rows (non-conflict actions still
+///   execute);
+/// - `1` any transfer/fatal error.
+/// With `--dry-run`: print the plan, mutate nothing, exit like status
+/// (2 if dirty/conflicts, else 0).
+fn dispatch_plan(
     vault: &PathBuf,
     store: &dyn ObjectStore,
     mode: Mode,
     opts: &PlanOpts,
+    dry_run: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
     let local = crate::local::LocalFs::new(vault);
     match crate::build_plan(&local, store, mode, opts) {
         Ok(plan) => {
-            let _ = writeln!(out, "dry-run (phase 1 stub)");
             let _ = write!(out, "{}", crate::format_plan_human(&plan));
-            0
+            if dry_run {
+                if is_clean(&plan) { 0 } else { 2 }
+            } else {
+                let report = crate::exec::execute_plan(&local, store, &plan, mode);
+                for f in &report.failed {
+                    let _ = writeln!(err, "error: {}\n  {}", f.key, f.message);
+                }
+                if !report.failed.is_empty() {
+                    1
+                } else if plan
+                    .actions
+                    .iter()
+                    .any(|a| a.kind == crate::plan::ActionKind::Conflict)
+                {
+                    2
+                } else {
+                    0
+                }
+            }
         }
         Err(e) => {
             let _ = writeln!(err, "error: {e}");
@@ -785,7 +810,7 @@ mod tests {
 
     // --- dispatch ---
 
-    fn run(cmd: Command, store: &MemoryStore) -> (i32, String, String) {
+    fn run(cmd: Command, store: &dyn ObjectStore) -> (i32, String, String) {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = run_with_io(cmd, store, &mut out, &mut err);
@@ -842,17 +867,63 @@ mod tests {
         assert!(err.contains("--json"), "err: {err}");
     }
 
-    #[test]
-    fn run_check_stub_exit_0() {
-        let (code, out, _) = run(Command::check(), &MemoryStore::new());
-        assert_eq!(code, 0);
-        assert!(out.contains("check: ok (mock)"));
+    /// A store whose `put_from` always fails, to inject a transfer failure.
+    struct FailPutStore {
+        inner: MemoryStore,
+    }
+    impl ObjectStore for FailPutStore {
+        fn list(&self, prefix: &str) -> Result<Vec<crate::entity::Entity>, crate::error::Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.head(key)
+        }
+        fn get_to(
+            &self,
+            key: &str,
+            w: &mut dyn std::io::Write,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            _r: &mut dyn std::io::Read,
+            _size: u64,
+            _mtime: Option<u64>,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            Err(crate::error::Error::Other(format!(
+                "injected put failure for {key}"
+            )))
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
+            self.inner.delete(key)
+        }
     }
 
     #[test]
-    fn run_push_stub_conflict_exit_0_placeholder() {
-        // Characterization lock (P1r6 / L2): the Phase 1 dry-run stub returns
-        // exit 0 even with a conflict. Phase 2 Slice 6 defines real exit codes.
+    fn run_check_exit_0_no_mock_label() {
+        let (code, out, _) = run(Command::check(), &MemoryStore::new());
+        assert_eq!(code, 0);
+        assert!(out.contains("check: ok"));
+        assert!(!out.contains("(mock)"), "(mock) marker removed: {out}");
+    }
+
+    #[test]
+    fn run_push_executes_uploads_exit_0() {
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "hi").unwrap();
+        let store = MemoryStore::new();
+        let (code, out, _) = run(Command::push(dir.path().into(), false), &store);
+        assert_eq!(code, 0);
+        // store gains the file; stdout has a summary
+        assert!(store.head("a.md").is_ok());
+        assert!(out.contains("plan:"), "no summary: {out}");
+        assert!(out.lines().any(|l| l.starts_with("U  a.md")));
+    }
+
+    #[test]
+    fn run_push_conflict_exit_2() {
         let dir = TempDir::new("vaultsync-cli-test");
         std::fs::write(dir.join("c.md"), "x").unwrap();
         let mt = std::fs::metadata(dir.join("c.md"))
@@ -867,24 +938,26 @@ mod tests {
         let mut cursor = std::io::Cursor::new(b"xx".to_vec());
         store.put_from("c.md", &mut cursor, 2, Some(ms)).unwrap();
         let (code, out, _) = run(Command::push(dir.path().into(), false), &store);
-        assert_eq!(code, 0);
-        assert!(out.lines().any(|l| l.starts_with("*  c.md")), "conflict row missing: {out}");
+        assert_eq!(code, 2, "conflict -> exit 2");
+        assert!(out.lines().any(|l| l.starts_with("*  c.md")), "conflict row: {out}");
+        // the conflicting key is NOT transferred (remote unchanged)
+        assert_eq!(store.head("c.md").unwrap().size, 2);
     }
 
     #[test]
-    fn run_push_stub_prints_plan_no_store_mutation() {
+    fn run_push_transfer_failure_exit_1() {
         let dir = TempDir::new("vaultsync-cli-test");
         std::fs::write(dir.join("a.md"), "hi").unwrap();
-        let store = MemoryStore::new();
-        let (code, out, _) = run(Command::push(dir.path().into(), false), &store);
-        assert_eq!(code, 0);
-        assert!(out.contains("dry-run (phase 1 stub)"));
-        assert!(out.lines().any(|l| l.starts_with("U  a.md")));
-        assert!(store.list("").unwrap().is_empty());
+        let store = FailPutStore {
+            inner: MemoryStore::new(),
+        };
+        let (code, _, err) = run(Command::push(dir.path().into(), false), &store);
+        assert_eq!(code, 1, "transfer failure -> exit 1");
+        assert!(err.contains("a.md"), "stderr names key: {err}");
     }
 
     #[test]
-    fn run_push_delete_stub_prints_delete_remote() {
+    fn run_push_delete_removes_remote_exit_0() {
         let store = MemoryStore::new();
         let mut cursor = std::io::Cursor::new(b"x".to_vec());
         store.put_from("gone.md", &mut cursor, 1, Some(100)).unwrap();
@@ -892,17 +965,46 @@ mod tests {
         let (code, out, _) = run(Command::push(dir.path().into(), true), &store);
         assert_eq!(code, 0);
         assert!(out.lines().any(|l| l.starts_with("DR gone.md")));
+        assert!(matches!(
+            store.head("gone.md").unwrap_err(),
+            crate::error::Error::NotFound(_)
+        ));
     }
 
     #[test]
-    fn run_pull_delete_stub_prints_delete_local() {
+    fn run_pull_delete_removes_local_exit_0() {
         let dir = TempDir::new("vaultsync-cli-test");
         std::fs::write(dir.join("gone.md"), "bye").unwrap();
         let store = MemoryStore::new();
         let (code, out, _) = run(Command::pull(dir.path().into(), true), &store);
         assert_eq!(code, 0);
         assert!(out.lines().any(|l| l.starts_with("DL gone.md")));
-        assert!(dir.join("gone.md").exists());
+        assert!(!dir.join("gone.md").exists(), "local extra removed");
+    }
+
+    #[test]
+    fn run_pull_dry_run_mutates_nothing_exit_2() {
+        // pull --dry-run with a remote-only key: plan printed (Download =
+        // dirty -> exit 2), but nothing written to disk.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = MemoryStore::new();
+        let mut cursor = std::io::Cursor::new(b"x".to_vec());
+        store.put_from("b.md", &mut cursor, 1, Some(100)).unwrap();
+        let cmd = Command::Pull {
+            vault: dir.path().into(),
+            delete: false,
+            dry_run: true,
+            force_local: false,
+            force_remote: false,
+            json: false,
+            config: None,
+            verbose: 0,
+        };
+        let (code, out, _) = run(cmd, &store);
+        assert_eq!(code, 2);
+        assert!(out.contains("plan:"), "plan printed: {out}");
+        assert!(out.lines().any(|l| l.starts_with("D  b.md")));
+        assert!(!dir.join("b.md").exists(), "dry-run mutates nothing");
     }
 
     #[test]

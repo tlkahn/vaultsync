@@ -105,7 +105,6 @@ mod reason {
     pub const CONFLICT_UNKNOWN_MTIME: &str = "conflict_mtime_unknown";
     pub const EQUAL_UNKNOWN_MTIME: &str = "equal_unknown_mtime";
     pub const PATH_COLLISION: &str = "path_collision";
-    pub const CASE_COLLISION: &str = "case_collision";
     pub const FOLDER: &str = "folder";
     pub const FORCE_LOCAL: &str = "force_local";
     pub const FORCE_REMOTE: &str = "force_remote";
