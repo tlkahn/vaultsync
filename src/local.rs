@@ -400,8 +400,15 @@ impl LocalFs {
 
     /// Delete a single file (never a directory). Missing keys are
     /// [`Error::NotFound`] (not idempotent, matching the store trait).
+    /// W50/A-M1: re-verifies parent locality before `remove_file` (mirrors
+    /// `open_verified`): a parent swapped for an out-of-vault symlink since
+    /// the walk must be refused, never unlinked through.
     pub fn delete_file(&self, key: &str) -> Result<(), Error> {
         let path = key_to_local_path(&self.root, key)?;
+        let parent = path.parent().ok_or_else(|| {
+            Error::Other(format!("delete_file has no parent dir: {}", path.display()))
+        })?;
+        self.ensure_locality(parent)?;
         match std::fs::remove_file(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Err(Error::NotFound(key.to_string()))
@@ -416,6 +423,17 @@ impl LocalFs {
     /// remove a file on the plan's say-so alone. Re-stats the path (no-follow)
     /// and refuses when it vanished (`NotFound`), became a symlink or a
     /// non-regular file, or drifted in size / mtime beyond `tolerance_ms`.
+    ///
+    /// W50/A-M1: re-verifies parent locality *before* the freshness stat -
+    /// a parent swapped for an out-of-vault symlink must be refused even
+    /// when the planted outside inode matches the planned size/mtime
+    /// (freshness authenticates the inode, not the path resolution).
+    ///
+    /// N3-residual (W59): the guarded delete is a check-then-act stat
+    /// followed by a by-path `remove_file` (std has no fd-based delete), so
+    /// a leaf swapped in the window between the stat and the unlink is still
+    /// removed - the same residual class as the download note; fd-based
+    /// delete is a post-v1 item.
     pub fn delete_file_guarded(
         &self,
         key: &str,
@@ -424,6 +442,17 @@ impl LocalFs {
         tolerance_ms: u64,
     ) -> Result<(), Error> {
         let path = key_to_local_path(&self.root, key)?;
+        let parent = path.parent().ok_or_else(|| {
+            Error::Other(format!(
+                "delete_file_guarded has no parent dir: {}",
+                path.display()
+            ))
+        })?;
+        // W50/A-M1: re-verify parent locality before the freshness stat. A
+        // `notes/` -> out-of-vault symlink swap between walk and execute must
+        // be refused (fail closed) even when the outside file matches the
+        // planned size/mtime - the outside inode is never unlinked.
+        self.ensure_locality(parent)?;
         let smd = match std::fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(Error::NotFound(key.to_string()));
@@ -513,7 +542,7 @@ impl LocalFs {
                 let canon = std::fs::canonicalize(probe)?;
                 if !canon.starts_with(&root_canon) {
                     return Err(Error::Other(format!(
-                        "refusing to write outside the vault root: {}",
+                        "refusing to operate outside the vault root: {}",
                         probe.display()
                     )));
                 }
@@ -1586,6 +1615,79 @@ mod tests {
             fs.delete_file("a.md").unwrap_err(),
             Error::NotFound(_)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_file_guarded_refuses_out_of_vault_parent_swap() {
+        // W50/A-M1: if a parent dir is swapped for an out-of-vault symlink
+        // between walk and delete, `delete_file_guarded` must refuse
+        // (locality) before its freshness stat - the outside file must never
+        // be unlinked under a vault key. Mirrors open_verified (upload) and
+        // the download sides, which already re-check locality. Fails today:
+        // the outside file is unlinked (the freshness stat authenticates the
+        // inode through the swapped parent).
+        let dir = TempDir::new("vaultsync-test");
+        let outside = TempDir::new("vaultsync-outside");
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join("notes/a.md"), "in-vault").unwrap();
+        std::fs::create_dir_all(outside.join("notes")).unwrap();
+        // plant a matching outside file: same size + mtime, so only the
+        // locality re-check can refuse (freshness would authenticate it).
+        let md = std::fs::metadata(dir.join("notes/a.md")).unwrap();
+        std::fs::write(outside.join("notes/a.md"), "in-vault").unwrap();
+        {
+            let f = std::fs::File::open(outside.join("notes/a.md")).unwrap();
+            f.set_times(std::fs::FileTimes::new().set_modified(md.modified().unwrap()))
+                .unwrap();
+        }
+        let fs = LocalFs::new(dir.path());
+        // swap the parent for a symlink to the outside dir
+        std::fs::remove_dir_all(dir.join("notes")).unwrap();
+        std::os::unix::fs::symlink(outside.join("notes"), dir.join("notes")).unwrap();
+        let err = fs
+            .delete_file_guarded(
+                "notes/a.md",
+                md.len(),
+                system_time_to_ms(md.modified().unwrap()),
+                1000,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("outside"),
+            "expected locality refusal: {err}"
+        );
+        // the outside file must survive (never unlinked through the swapped parent)
+        assert_eq!(
+            std::fs::read(outside.join("notes/a.md")).unwrap(),
+            b"in-vault"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_file_refuses_out_of_vault_parent_swap() {
+        // W50/A-M1: the unguarded `delete_file` API has the same locality gap
+        // (test-only callers today, but public). A parent swapped for an
+        // out-of-vault symlink must be refused and the outside file survives.
+        let dir = TempDir::new("vaultsync-test");
+        let outside = TempDir::new("vaultsync-outside");
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join("notes/a.md"), "in-vault").unwrap();
+        std::fs::create_dir_all(outside.join("notes")).unwrap();
+        std::fs::write(outside.join("notes/a.md"), "OUTSIDE-SECRET").unwrap();
+        let fs = LocalFs::new(dir.path());
+        std::fs::remove_dir_all(dir.join("notes")).unwrap();
+        std::os::unix::fs::symlink(outside.join("notes"), dir.join("notes")).unwrap();
+        let err = fs.delete_file("notes/a.md").unwrap_err();
+        assert!(
+            format!("{err}").contains("outside"),
+            "expected locality refusal: {err}"
+        );
+        assert_eq!(
+            std::fs::read(outside.join("notes/a.md")).unwrap(),
+            b"OUTSIDE-SECRET"
+        );
     }
 
     #[cfg(unix)]
