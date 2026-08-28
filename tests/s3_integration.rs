@@ -199,86 +199,127 @@ fn s3_integ_prefix_isolation() {
     });
 }
 
-#[test]
-fn s3_integ_path_style_toggle() -> Result<(), String> {
-    // W12/A-M8: build the same bucket/prefix with BOTH path-style flavors and
-    // require a put/list round-trip on each. The old test asserted only that
-    // one configured flavor put/list succeeded and could not fail either way.
-    let Some(bucket) = std::env::var("VAULTSYNC_TEST_S3_BUCKET").ok() else {
-        eprintln!("[skip] pathstyle: VAULTSYNC_TEST_S3_BUCKET not set (set to run real S3 tests)");
-        return Ok(());
-    };
+/// Shared env resolution for the path-style flavor tests (W94/r2-M5):
+/// returns `None` (caller prints the suite-skip note) when
+/// `VAULTSYNC_TEST_S3_BUCKET` is unset.
+fn path_style_env(name: &str) -> Option<(String, String, Option<String>, String)> {
+    let bucket = std::env::var("VAULTSYNC_TEST_S3_BUCKET").ok()?;
     let region = std::env::var("VAULTSYNC_TEST_S3_REGION").unwrap_or_else(|_| "us-west-1".into());
     let endpoint = std::env::var("VAULTSYNC_TEST_S3_ENDPOINT").ok();
     let base = std::env::var("VAULTSYNC_TEST_S3_PREFIX").unwrap_or_default();
-    let prefix = format!("{base}vaultsync-itest-pathstyle-{}", unique_num());
+    let prefix = format!("{base}vaultsync-itest-{name}-{}", unique_num());
+    Some((bucket, region, endpoint, prefix))
+}
 
-    let mut stores: Vec<(bool, S3Store)> = Vec::new();
-    stores.push((
+/// Put a probe object, assert exactly one non-folder object lists back, then
+/// delete the probe (W94/r2-M5). Returns an error string on failure.
+fn path_style_roundtrip(flavor: &str, s: &S3Store) -> Result<(), String> {
+    put_bytes(s, "f.txt", b"ps", None)?;
+    let n = s
+        .list("")
+        .unwrap()
+        .iter()
+        .filter(|e| !e.is_folder())
+        .count();
+    if n != 1 {
+        return Err(format!("path-style {flavor}: expected 1 file, got {n}"));
+    }
+    // cleanup the probe
+    if let Ok(ents) = s.list("") {
+        for e in ents {
+            if !e.is_folder() {
+                let _ = s.delete(&e.key);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn s3_integ_path_style_true() -> Result<(), String> {
+    // r2-M5 (W94): the path-style addressing flavor must be exercised on
+    // EVERY enabled run (AWS and MinIO/R2 alike) - the old combined
+    // `path_style_toggle` test could pass with only one flavor via
+    // `roundtrip >= 1`, masking a mis-skip. `roundtrip == stores.len()` is
+    // the lock: a skip here is a loud failure, not a silent one-flavor pass.
+    let Some((bucket, region, endpoint, prefix)) = path_style_env("pathstyle-true") else {
+        eprintln!(
+            "[skip] path-style true: VAULTSYNC_TEST_S3_BUCKET not set (set to run real S3 tests)"
+        );
+        return Ok(());
+    };
+    let stores: Vec<(bool, S3Store)> = vec![(
         true,
         S3Store::new(&StoreSettings {
-            bucket: bucket.clone(),
-            region: Some(region.clone()),
-            endpoint: endpoint.clone(),
-            prefix: prefix.clone(),
+            bucket,
+            region: Some(region),
+            endpoint,
+            prefix,
             path_style: true,
         })
         .map_err(|e| format!("path-style true store: {e}"))?,
-    ));
-    // Skip the false flavor only when a custom endpoint is known to require
-    // path-style addressing (the true flavor above still exercised).
-    if endpoint.is_none() {
-        stores.push((
-            false,
-            S3Store::new(&StoreSettings {
-                bucket: bucket.clone(),
-                region: Some(region.clone()),
-                endpoint: None,
-                prefix: prefix.clone(),
-                path_style: false,
-            })
-            .map_err(|e| format!("path-style false store: {e}"))?,
-        ));
-    }
-
+    )];
     let mut roundtrip = 0usize;
-    let mut result: Result<(), String> = Ok(());
     for (flavor, s) in &stores {
-        if let Err(e) = (|| -> Result<(), String> {
-            put_bytes(s, "f.txt", b"ps", None)?;
-            let n = s
-                .list("")
-                .unwrap()
-                .iter()
-                .filter(|e| !e.is_folder())
-                .count();
-            if n != 1 {
-                return Err(format!("path-style {flavor}: expected 1 file, got {n}"));
-            }
-            Ok(())
-        })() {
-            result = Err(format!("path-style {flavor}: {e}"));
-            break;
-        }
+        path_style_roundtrip(&format!("{flavor}"), s)
+            .map_err(|e| format!("path-style {flavor}: {e}"))?;
         roundtrip += 1;
     }
-
-    // cleanup both stores' objects (same prefix)
-    for (_, s) in &stores {
-        if let Ok(ents) = s.list("") {
-            for e in ents {
-                if !e.is_folder() {
-                    let _ = s.delete(&e.key);
-                }
-            }
-        }
+    if roundtrip != stores.len() {
+        return Err(format!(
+            "path-style true: expected {} flavor(s) exercised, got {roundtrip}",
+            stores.len()
+        ));
     }
+    eprintln!("[ok] pathstyle true");
+    Ok(())
+}
 
-    if roundtrip == 0 {
-        return Err("no path-style flavor was exercised".to_string());
+#[test]
+fn s3_integ_path_style_vhost() -> Result<(), String> {
+    // r2-M5 (W94): the vhost addressing flavor is AWS-only - a custom
+    // endpoint (MinIO/R2) requires path-style addressing, so this test
+    // early-returns with an explicit note there. On AWS (no endpoint) it
+    // MUST exercise; the `roundtrip == stores.len()` lock makes a mis-skip
+    // fail loudly instead of passing on the other flavor. (W12/A-M8
+    // original rationale; split out of `path_style_toggle` in W94.)
+    let Some((bucket, region, endpoint, prefix)) = path_style_env("pathstyle-vhost") else {
+        eprintln!(
+            "[skip] path-style vhost: VAULTSYNC_TEST_S3_BUCKET not set (set to run real S3 tests)"
+        );
+        return Ok(());
+    };
+    if endpoint.is_some() {
+        eprintln!(
+            "[skip] path-style vhost: VAULTSYNC_TEST_S3_ENDPOINT set (custom endpoints require path-style addressing; vhost is AWS-only)"
+        );
+        return Ok(());
     }
-    eprintln!("[ok] pathstyle");
-    result
+    let stores: Vec<(bool, S3Store)> = vec![(
+        false,
+        S3Store::new(&StoreSettings {
+            bucket,
+            region: Some(region),
+            endpoint: None,
+            prefix,
+            path_style: false,
+        })
+        .map_err(|e| format!("path-style vhost store: {e}"))?,
+    )];
+    let mut roundtrip = 0usize;
+    for (flavor, s) in &stores {
+        path_style_roundtrip(&format!("{flavor}"), s)
+            .map_err(|e| format!("path-style {flavor}: {e}"))?;
+        roundtrip += 1;
+    }
+    if roundtrip != stores.len() {
+        return Err(format!(
+            "path-style vhost: expected {} flavor(s) exercised, got {roundtrip}",
+            stores.len()
+        ));
+    }
+    eprintln!("[ok] pathstyle vhost");
+    Ok(())
 }
 
 #[test]
