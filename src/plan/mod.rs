@@ -32,7 +32,11 @@ pub struct PlanOpts {
 impl Default for PlanOpts {
     fn default() -> Self {
         PlanOpts {
-            mtime_tolerance_ms: 1000,
+            // r2-L1/W95: read the config constant (coupling lock
+            // `plan_opts_default_matches_config_constant` guards this) - a
+            // second hardcoded 1000 here would silently split from the
+            // product default.
+            mtime_tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
             delete: false,
             force_local: false,
             force_remote: false,
@@ -414,6 +418,19 @@ mod tests {
             ..Default::default()
         };
         plan(local, remote, Mode::Status, &o)
+    }
+
+    #[test]
+    fn plan_opts_default_matches_config_constant() {
+        // r2-L1 (W95) coupling lock: `PlanOpts::default()` must read
+        // `config::DEFAULT_MTIME_TOLERANCE_MS`, not a second hardcoded 1000 -
+        // two sites changing in lockstep if the product default ever moves.
+        // Passes today (both 1000); its teeth are shown by mutation (flip one
+        // side and the lock fails).
+        assert_eq!(
+            PlanOpts::default().mtime_tolerance_ms,
+            crate::config::DEFAULT_MTIME_TOLERANCE_MS
+        );
     }
 
     #[test]
