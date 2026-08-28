@@ -2,6 +2,9 @@
 name = "vaultsync"
 version = "0.1.0"
 edition = "2024"
+# MSRV: the edition-2024 floor; exact verification against the final dep tree
+# is Phase 3 (CI) per the roadmap note.
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "Minimal, Unix-style sync of a plain directory (Obsidian vault) to object storage"
 readme = "README.md"
@@ -10,3 +13,9 @@ categories = ["command-line-utilities", "filesystem"]
 publish = false
 
 [dependencies]
+aws-config = { version = "1.11.0" }
+aws-sdk-s3 = { version = "1.144.0" }
+clap = { version = "4.6.6", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.53.1", features = ["rt"] }
+toml = { version = "1.1.4" }

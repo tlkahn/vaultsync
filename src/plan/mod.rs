@@ -32,7 +32,11 @@ pub struct PlanOpts {
 impl Default for PlanOpts {
     fn default() -> Self {
         PlanOpts {
-            mtime_tolerance_ms: 1000,
+            // r2-L1/W95: read the config constant (coupling lock
+            // `plan_opts_default_matches_config_constant` guards this) - a
+            // second hardcoded 1000 here would silently split from the
+            // product default.
+            mtime_tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
             delete: false,
             force_local: false,
             force_remote: false,
@@ -88,19 +92,32 @@ enum Delta {
     LocalNewer,
     RemoteNewer,
     Conflict,
+    /// Both sides present, either mtime unknown, sizes equal -> visible skip.
+    EqualUnknownMtime,
+    /// Both sides present, either mtime unknown, sizes differ -> conflict.
+    ConflictUnknownMtime,
 }
 
 /// Reason strings stable enough for tests and human output.
-mod reason {
+pub(crate) mod reason {
     pub const EQUAL: &str = "equal";
     pub const LOCAL_ONLY: &str = "local_only";
     pub const REMOTE_ONLY: &str = "remote_only";
     pub const LOCAL_NEWER: &str = "local_newer";
     pub const REMOTE_NEWER: &str = "remote_newer";
     pub const CONFLICT_MTIME_SIZE: &str = "conflict_mtime_size";
+    pub const CONFLICT_UNKNOWN_MTIME: &str = "conflict_mtime_unknown";
+    pub const EQUAL_UNKNOWN_MTIME: &str = "equal_unknown_mtime";
+    pub const PATH_COLLISION: &str = "path_collision";
     pub const FOLDER: &str = "folder";
     pub const FORCE_LOCAL: &str = "force_local";
     pub const FORCE_REMOTE: &str = "force_remote";
+    /// Case-only-collision reason, exported so `build_plan` and tests share the
+    /// one constant (A-L6/B-nit-1, W17).
+    pub const CASE_COLLISION: &str = "case_collision";
+    /// R4-M1/W38: a row from a followed *file* symlink, overridden to Skip in
+    /// mutating modes (--follow-symlinks is inventory-only in v1).
+    pub const FOLLOWED_SYMLINK: &str = "followed_symlink";
 }
 
 /// Classify one local/remote pair into a delta.
@@ -110,25 +127,27 @@ fn classify_pair(local: Option<&Entity>, remote: Option<&Entity>, tol: u64) -> D
         (Some(_), None) => Delta::LocalOnly,
         (None, Some(_)) => Delta::RemoteOnly,
         (Some(l), Some(r)) => {
-            // Folders never reach here: `resolve` short-circuits folder keys
-            // before classify. A same-key file/folder pair is impossible
-            // (folder keys end with `/`).
             debug_assert!(
                 !l.is_folder() && !r.is_folder(),
                 "folders must be filtered in resolve"
             );
-            // Phase 1 classify rule: a missing mtime reads as `0`
-            // (`None -> 0`), and pre-epoch mtimes saturate to `Some(0)`
-            // (P1r4-mtime-pre-epoch). The classifier therefore cannot tell
-            // "unknown" apart from "pre-epoch": an equal-size pair skips on
-            // zero evidence, a diff-size pair conflicts (P1r6-mtime-zero).
-            // Phase 2 etag comparison is the resolution; classify stays
-            // unchanged in Phase 1.
-            let lm = l.mtime_ms.unwrap_or(0);
-            let rm = r.mtime_ms.unwrap_or(0);
+            // Phase 2 (4b) unknown-mtime policy: whether either side's mtime is
+            // unknown (`None` - the FS could not provide it), an equal-size
+            // pair is a visible Skip (zero overwrite risk), a diff-size pair is
+            // a Conflict - never a one-sided winner. The old `None -> 0`
+            // classifier rule and its silent-pull hole are retired.
+            if l.mtime_ms.is_none() || r.mtime_ms.is_none() {
+                return if l.size == r.size {
+                    Delta::EqualUnknownMtime
+                } else {
+                    Delta::ConflictUnknownMtime
+                };
+            }
+            // Both mtimes known. Pre-epoch times saturate to `Some(0)` and
+            // remain comparable (P1r4-mtime-pre-epoch).
+            let lm = l.mtime_ms.unwrap();
+            let rm = r.mtime_ms.unwrap();
             if lm.abs_diff(rm) <= tol {
-                // Within tolerance of one another: equal only when size matches,
-                // otherwise the two sides disagree and it is a conflict.
                 if l.size == r.size {
                     Delta::Equal
                 } else {
@@ -137,7 +156,6 @@ fn classify_pair(local: Option<&Entity>, remote: Option<&Entity>, tol: u64) -> D
             } else if lm > rm {
                 Delta::LocalNewer
             } else {
-                // rm > lm (abs_diff beyond tol means they cannot be equal)
                 Delta::RemoteNewer
             }
         }
@@ -165,11 +183,16 @@ pub fn plan(local: &[Entity], remote: &[Entity], mode: Mode, opts: &PlanOpts) ->
     keys.sort_unstable();
     keys.dedup();
 
+    // 4a: detect file/folder path collisions (e.g. file `K` coexisting with
+    // folder `K/` or a child `K/x`). Such rows are Conflicts in every mode and
+    // are never force-resolvable.
+    let path_collided = path_collision_keys(&keys);
+
     let mut actions: Vec<Action> = Vec::new();
     for key in keys {
         let loc = local_map.get(key).copied();
         let rem = remote_map.get(key).copied();
-        let (kind, reason) = resolve(loc, rem, mode, opts);
+        let (kind, reason) = resolve(loc, rem, mode, opts, path_collided.contains(key));
         actions.push(Action {
             key: key.to_string(),
             kind,
@@ -194,14 +217,57 @@ pub fn plan(local: &[Entity], remote: &[Entity], mode: Mode, opts: &PlanOpts) ->
     Plan { actions, stats }
 }
 
+/// Keys involved in a file-vs-folder path collision (P1r-type-collision):
+/// any file key `K` that coexists with a `K/` folder key or a `K/...`
+/// descendant, plus the colliding folder keys themselves.
+///
+/// W52/B-M2: the input contract is `plan()`'s sorted, dedup'd key list
+/// (callers must sort + dedup first). That makes every `K/...` descendant
+/// of a non-folder key `K` contiguous, so the scan is a binary search
+/// (`partition_point`) + a forward windowed scan - O(n log n) overall
+/// instead of the old per-key full-list O(n^2). Folder keys binary-search
+/// their exact base instead of a linear `contains`.
+pub(crate) fn path_collision_keys(keys: &[&str]) -> std::collections::BTreeSet<String> {
+    let mut collided = std::collections::BTreeSet::new();
+    for k in keys {
+        if k.ends_with('/') {
+            let base = k.strip_suffix('/').unwrap();
+            if keys.binary_search(&base).is_ok() {
+                collided.insert(k.to_string());
+                collided.insert(base.to_string());
+            }
+        } else {
+            let prefix = format!("{k}/");
+            // Descendants `k/...` are contiguous from the first key >= "{k}/".
+            let start = keys.partition_point(|k2| *k2 < prefix.as_str());
+            for k2 in &keys[start..] {
+                if k2.starts_with(&prefix) {
+                    collided.insert(k.to_string());
+                    collided.insert(k2.to_string());
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    collided
+}
+
 /// Map a key's delta to an action kind + reason given the mode and options.
 fn resolve(
     local: Option<&Entity>,
     remote: Option<&Entity>,
     mode: Mode,
     opts: &PlanOpts,
+    path_collided: bool,
 ) -> (ActionKind, &'static str) {
-    // Folders never carry transfer meaning in Phase 1.
+    // 4a: a path collision is a Conflict in every mode and is never
+    // force-resolvable (the executor never touches these rows).
+    if path_collided {
+        return (ActionKind::Conflict, reason::PATH_COLLISION);
+    }
+
+    // Folders never carry transfer meaning.
     if local.is_some_and(|e| e.is_folder()) || remote.is_some_and(|e| e.is_folder()) {
         return (ActionKind::Skip, reason::FOLDER);
     }
@@ -210,6 +276,8 @@ fn resolve(
     use ActionKind::*;
     match delta {
         Delta::Equal => (Skip, reason::EQUAL),
+        // 4b: equal-size with unknown mtime - visible skip, zero overwrite risk.
+        Delta::EqualUnknownMtime => (Skip, reason::EQUAL_UNKNOWN_MTIME),
         Delta::LocalOnly => match mode {
             Mode::Status => (Upload, reason::LOCAL_ONLY),
             Mode::Push => (Upload, reason::LOCAL_ONLY),
@@ -242,31 +310,89 @@ fn resolve(
             Mode::Push => (Skip, reason::REMOTE_NEWER),
             Mode::Pull => (Download, reason::REMOTE_NEWER),
         },
-        Delta::Conflict => {
-            let forcing = opts.force_local as u8 + opts.force_remote as u8;
-            if forcing > 1 {
-                // Both forces set: they cancel. Treat as no force rather than
-                // silently letting local (or remote) win by arbitrary precedence.
-                (Conflict, reason::CONFLICT_MTIME_SIZE)
-            } else if opts.force_local {
-                match mode {
-                    // Push and Status may plan Upload; Pull must keep local
-                    // (mode invariant: Pull never plans Upload).
-                    Mode::Push | Mode::Status => (Upload, reason::FORCE_LOCAL),
-                    Mode::Pull => (Skip, reason::FORCE_LOCAL),
-                }
-            } else if opts.force_remote {
-                match mode {
-                    // Pull and Status may plan Download; Push must keep remote
-                    // (mode invariant: Push never plans Download).
-                    Mode::Pull | Mode::Status => (Download, reason::FORCE_REMOTE),
-                    Mode::Push => (Skip, reason::FORCE_REMOTE),
-                }
-            } else {
-                (Conflict, reason::CONFLICT_MTIME_SIZE)
+        Delta::Conflict => force_conflict(opts, mode, reason::CONFLICT_MTIME_SIZE),
+        Delta::ConflictUnknownMtime => force_conflict(opts, mode, reason::CONFLICT_UNKNOWN_MTIME),
+    }
+}
+
+/// Mode-aware force handling shared by the Conflict variants. Both forces set
+/// => they cancel (P1r-both-forces), treated as no force.
+fn force_conflict(
+    opts: &PlanOpts,
+    mode: Mode,
+    default_reason: &'static str,
+) -> (ActionKind, &'static str) {
+    use ActionKind::*;
+    let forcing = opts.force_local as u8 + opts.force_remote as u8;
+    if forcing > 1 {
+        (Conflict, default_reason)
+    } else if opts.force_local {
+        match mode {
+            Mode::Push | Mode::Status => (Upload, reason::FORCE_LOCAL),
+            Mode::Pull => (Skip, reason::FORCE_LOCAL),
+        }
+    } else if opts.force_remote {
+        match mode {
+            Mode::Pull | Mode::Status => (Download, reason::FORCE_REMOTE),
+            Mode::Push => (Skip, reason::FORCE_REMOTE),
+        }
+    } else {
+        (Conflict, default_reason)
+    }
+}
+
+/// Keys involved in a case-only collision (A2/B4 preflight, 4c lock).
+///
+/// v1 key identity is case-sensitive, codepoint-exact, with **no NFC
+/// normalization** (documented). This detects case-only collisions - within
+/// either side's list or across the local/remote pairing - via a Unicode
+/// lower-case fold heuristic, so a `Note.md` vs `note.md` clash is a Conflict
+/// (`case_collision`) that is never auto-paired as Equal.
+///
+/// Pure: no IO.
+pub fn case_collision_keys(
+    local: &[Entity],
+    remote: &[Entity],
+) -> std::collections::BTreeSet<String> {
+    use std::collections::{BTreeSet, HashMap};
+    // fold -> (local actual keys, remote actual keys)
+    let mut fold_map: HashMap<String, (BTreeSet<String>, BTreeSet<String>)> = HashMap::new();
+    for e in local {
+        fold_map
+            .entry(fold_key(&e.key))
+            .or_default()
+            .0
+            .insert(e.key.clone());
+    }
+    for e in remote {
+        fold_map
+            .entry(fold_key(&e.key))
+            .or_default()
+            .1
+            .insert(e.key.clone());
+    }
+    let mut collided = BTreeSet::new();
+    for (_, (lset, rset)) in fold_map {
+        let same_side_dup = lset.len() > 1 || rset.len() > 1;
+        let cross_side = !lset.is_empty() && !rset.is_empty() && lset != rset;
+        if same_side_dup || cross_side {
+            for k in &lset {
+                collided.insert(k.clone());
+            }
+            for k in &rset {
+                collided.insert(k.clone());
             }
         }
     }
+    collided
+}
+
+/// Normalized case-fold key for collision detection (A-H3): lowercase the
+/// key with a single trailing `/` stripped, so a file `Notes` and a folder
+/// `notes/` (case variant) fold to the same value. Keeps file-vs-file and
+/// folder-vs-folder distinctions intact elsewhere (`a` vs `a/` vs `a.md`).
+fn fold_key(key: &str) -> String {
+    key.strip_suffix('/').unwrap_or(key).to_lowercase()
 }
 
 #[cfg(test)]
@@ -295,12 +421,24 @@ mod tests {
     }
 
     #[test]
-    fn plan_pre_epoch_zero_vs_none_mtime_same_size_skips_as_equal() {
-        // Characterization lock (P1r6-mtime-zero): pre-epoch mtimes saturate
-        // to `Some(0)` (P1r4-mtime-pre-epoch), which the Phase 1 `None -> 0`
-        // classifier rule cannot tell apart from an unknown mtime. An
-        // equal-size pair therefore skips on zero evidence. Phase 2 etag
-        // comparison is the resolution; classify stays unchanged in Phase 1.
+    fn plan_opts_default_matches_config_constant() {
+        // r2-L1 (W95) coupling lock: `PlanOpts::default()` must read
+        // `config::DEFAULT_MTIME_TOLERANCE_MS`, not a second hardcoded 1000 -
+        // two sites changing in lockstep if the product default ever moves.
+        // Passes today (both 1000); its teeth are shown by mutation (flip one
+        // side and the lock fails).
+        assert_eq!(
+            PlanOpts::default().mtime_tolerance_ms,
+            crate::config::DEFAULT_MTIME_TOLERANCE_MS
+        );
+    }
+
+    #[test]
+    fn plan_pre_epoch_zero_vs_none_mtime_same_size_skips_unknown_mtime() {
+        // Phase 2 4b ENTERS (decision row 4b): the retired Phase 1 rule
+        // `None -> 0` is deleted. `Some(0)` vs `None` with equal size now
+        // classifies `equal_unknown_mtime` (visible Skip, zero overwrite risk)
+        // because either side's mtime is unknown. Amends P1r6-mtime-zero.
         let p = plan(
             &[file("a.md", 5, Some(0))],
             &[file("a.md", 5, None)],
@@ -308,15 +446,13 @@ mod tests {
             &opts(),
         );
         assert_eq!(kinds(&p), vec![ActionKind::Skip]);
-        assert_eq!(p.actions[0].reason, "equal");
+        assert_eq!(p.actions[0].reason, "equal_unknown_mtime");
     }
 
     #[test]
-    fn plan_pre_epoch_zero_vs_none_mtime_diff_size_conflicts() {
-        // Same `Some(0)`/`None` collision with different sizes: the pair
-        // surfaces as a Conflict row (conflict_mtime_size), never a silent
-        // winner. Documents that the collision is detectable as a conflict
-        // when sizes disagree (P1r6-mtime-zero).
+    fn plan_pre_epoch_zero_vs_none_mtime_diff_size_conflicts_unknown() {
+        // Phase 2 4b ENTERS: `Some(0)` vs `None` with different sizes now
+        // surfaces a `conflict_mtime_unknown` row (never a silent winner).
         let p = plan(
             &[file("a.md", 5, Some(0))],
             &[file("a.md", 6, None)],
@@ -324,30 +460,29 @@ mod tests {
             &opts(),
         );
         assert_eq!(kinds(&p), vec![ActionKind::Conflict]);
-        assert_eq!(p.actions[0].reason, "conflict_mtime_size");
+        assert_eq!(p.actions[0].reason, "conflict_mtime_unknown");
     }
 
     #[test]
-    fn plan_pull_remote_none_mtime_diff_size_skips_as_local_newer() {
-        // Characterization lock (P1r5-mtime-pull): under the Phase 1
-        // `None -> 0` rule, a remote missing mtime against a present local
-        // classifies `local_newer`; Pull plans Skip (local kept). Phase 2
-        // must revisit this pull-direction staleness deliberately.
+    fn plan_pull_remote_none_mtime_diff_size_conflicts() {
+        // Phase 2 4b ENTERS (fixes the P1r5-mtime-pull hole): a remote missing
+        // mtime against a present local with different sizes is a Conflict
+        // `conflict_mtime_unknown`, not a local-wins Skip.
         let p = plan(
             &[file("a.md", 100, Some(5000))],
             &[file("a.md", 200, None)],
             Mode::Pull,
             &opts(),
         );
-        assert_eq!(kinds(&p), vec![ActionKind::Skip]);
-        assert_eq!(p.actions[0].reason, "local_newer");
+        assert_eq!(kinds(&p), vec![ActionKind::Conflict]);
+        assert_eq!(p.actions[0].reason, "conflict_mtime_unknown");
     }
 
     #[test]
-    fn plan_pull_remote_none_mtime_same_size_skips_as_local_newer() {
-        // Same-size variant: Equal is *not* chosen because `5000` vs the
-        // None-derived `0` exceeds the tolerance; the pair still classifies
-        // `local_newer` and Pull keeps local.
+    fn plan_pull_remote_none_mtime_same_size_skips_unknown() {
+        // Phase 2 4b ENTERS: same-size with a None-mtime remote is a visible
+        // Skip `equal_unknown_mtime` (no overwrite risk), not a local-wins
+        // Skip.
         let p = plan(
             &[file("a.md", 100, Some(5000))],
             &[file("a.md", 100, None)],
@@ -355,22 +490,22 @@ mod tests {
             &opts(),
         );
         assert_eq!(kinds(&p), vec![ActionKind::Skip]);
-        assert_eq!(p.actions[0].reason, "local_newer");
+        assert_eq!(p.actions[0].reason, "equal_unknown_mtime");
     }
 
     #[test]
-    fn plan_status_remote_none_mtime_diff_size_uploads_as_local_newer() {
-        // Counters the "no signal" framing: Status *does* surface a row for
-        // a None-mtime remote (Upload / local_newer); the real hole is the
-        // misleading Pull Skip, not a total absence of output.
+    fn plan_status_remote_none_mtime_diff_size_conflicts() {
+        // Phase 2 4b ENTERS: Status now surfaces a None-mtime remote with a
+        // size mismatch as a Conflict (was Upload / local_newer under the
+        // retired `None -> 0` rule).
         let p = plan(
             &[file("a.md", 100, Some(5000))],
             &[file("a.md", 200, None)],
             Mode::Status,
             &opts(),
         );
-        assert_eq!(kinds(&p), vec![ActionKind::Upload]);
-        assert_eq!(p.actions[0].reason, "local_newer");
+        assert_eq!(kinds(&p), vec![ActionKind::Conflict]);
+        assert_eq!(p.actions[0].reason, "conflict_mtime_unknown");
     }
 
     #[test]
@@ -834,5 +969,360 @@ mod tests {
             assert_eq!(kinds(&p), vec![ActionKind::Skip]);
             assert_eq!(p.actions[0].reason, "folder");
         }
+    }
+    // --- Phase 2 Slice 4a: file/folder path collision ---
+
+    #[test]
+    fn plan_file_vs_folder_key_conflicts() {
+        // Local file `K` + remote folder `K/` (and its child) -> Conflict
+        // path_collision, not Upload+Download.
+        let p = plan(
+            &[file("K", 5, Some(1000))],
+            &[folder("K"), file("K/x", 1, Some(1))],
+            Mode::Status,
+            &opts(),
+        );
+        let acts: Vec<_> = p.actions.iter().map(|a| (a.key.as_str(), a.kind)).collect();
+        assert!(
+            acts.iter()
+                .any(|(k, kind)| *k == "K" && *kind == ActionKind::Conflict)
+        );
+    }
+
+    #[test]
+    fn plan_folder_vs_file_key_conflicts() {
+        // Mirror: local folder `K/` vs remote file `K` -> Conflict.
+        let p = plan(
+            &[folder("K"), file("K/child.md", 1, Some(1))],
+            &[file("K", 5, Some(1000))],
+            Mode::Status,
+            &opts(),
+        );
+        let act = p.actions.iter().find(|a| a.key == "K").unwrap();
+        assert_eq!(act.kind, ActionKind::Conflict);
+        assert_eq!(act.reason, "path_collision");
+    }
+
+    #[test]
+    fn path_collision_survives_all_modes() {
+        // Status/Push/Pull all Conflict; forces do not resolve type collisions.
+        for mode in [Mode::Status, Mode::Push, Mode::Pull] {
+            for force in [
+                PlanOpts {
+                    force_local: true,
+                    ..Default::default()
+                },
+                PlanOpts {
+                    force_remote: true,
+                    ..Default::default()
+                },
+                PlanOpts {
+                    force_local: true,
+                    force_remote: true,
+                    ..Default::default()
+                },
+            ] {
+                let p = plan(
+                    &[file("K", 5, Some(1000))],
+                    &[file("K/x", 1, Some(1))],
+                    mode,
+                    &force,
+                );
+                let act = p.actions.iter().find(|a| a.key == "K").unwrap();
+                assert_eq!(
+                    act.kind,
+                    ActionKind::Conflict,
+                    "mode {mode:?} force {force:?}"
+                );
+                assert_eq!(act.reason, "path_collision");
+            }
+        }
+    }
+
+    // --- Phase 2 Slice 4b: unknown-mtime policy ---
+
+    #[test]
+    fn plan_none_mtime_diff_size_conflicts() {
+        // Local mtime set, remote None, sizes differ -> Conflict
+        // conflict_mtime_unknown (fixes the silent-pull hole).
+        for mode in [Mode::Status, Mode::Push, Mode::Pull] {
+            let p = plan(
+                &[file("a.md", 100, Some(5000))],
+                &[file("a.md", 200, None)],
+                mode,
+                &opts(),
+            );
+            let act = p.actions.iter().find(|a| a.key == "a.md").unwrap();
+            assert_eq!(act.kind, ActionKind::Conflict, "mode {mode:?}");
+            assert_eq!(act.reason, "conflict_mtime_unknown");
+        }
+    }
+
+    #[test]
+    fn plan_none_mtime_same_size_skips_visible() {
+        let p = plan(
+            &[file("a.md", 100, Some(5000))],
+            &[file("a.md", 100, None)],
+            Mode::Status,
+            &opts(),
+        );
+        assert_eq!(kinds(&p), vec![ActionKind::Skip]);
+        assert_eq!(p.actions[0].reason, "equal_unknown_mtime");
+    }
+
+    #[test]
+    fn plan_both_none_mtime_diff_size_conflicts() {
+        let p = plan(
+            &[file("a.md", 5, None)],
+            &[file("a.md", 6, None)],
+            Mode::Status,
+            &opts(),
+        );
+        assert_eq!(kinds(&p), vec![ActionKind::Conflict]);
+        assert_eq!(p.actions[0].reason, "conflict_mtime_unknown");
+    }
+
+    #[test]
+    fn plan_local_none_remote_set_diff_size_conflicts() {
+        // Symmetric direction to plan_none_mtime_diff_size_conflicts.
+        let p = plan(
+            &[file("a.md", 200, None)],
+            &[file("a.md", 100, Some(5000))],
+            Mode::Pull,
+            &opts(),
+        );
+        assert_eq!(kinds(&p), vec![ActionKind::Conflict]);
+        assert_eq!(p.actions[0].reason, "conflict_mtime_unknown");
+    }
+
+    #[test]
+    fn plan_pre_epoch_real_zero_still_compares() {
+        // `Some(0)` is a real (pre-epoch saturating) mtime, not "unknown":
+        // Some(0) vs Some(5000) is remote_newer, as before.
+        let p = plan(
+            &[file("a.md", 5, Some(0))],
+            &[file("a.md", 5, Some(5000))],
+            Mode::Status,
+            &opts(),
+        );
+        assert_eq!(kinds(&p), vec![ActionKind::Download]);
+        assert_eq!(p.actions[0].reason, "remote_newer");
+    }
+
+    #[test]
+    fn plan_unknown_mtime_conflict_force_resolvable() {
+        // conflict_mtime_unknown is force-resolvable per the mode-aware table
+        // (unlike path_collision).
+        let o = PlanOpts {
+            force_local: true,
+            ..Default::default()
+        };
+        let p = plan(
+            &[file("a.md", 100, Some(5000))],
+            &[file("a.md", 200, None)],
+            Mode::Push,
+            &o,
+        );
+        assert_eq!(kinds(&p), vec![ActionKind::Upload]);
+        assert_eq!(p.actions[0].reason, "force_local");
+    }
+
+    // --- Phase 2 Slice 4d: etag policy (decision only, no planner code) ---
+
+    #[test]
+    fn plan_etag_ignored() {
+        // Phase 2 does not compare etags and never hashes local files (4d
+        // lock). plan() ignores etag fields entirely: same size + mtime with
+        // DIFFERENT etags still plans Equal (skip).
+        let mut l = file("a.md", 5, Some(1000));
+        l.etag = Some("etag-A".to_string());
+        let mut r = file("a.md", 5, Some(1000));
+        r.etag = Some("etag-B".to_string());
+        let p = plan(&[l], &[r], Mode::Status, &opts());
+        assert_eq!(kinds(&p), vec![ActionKind::Skip]);
+        assert_eq!(p.actions[0].reason, "equal");
+    }
+    // --- Phase 2 Slice 4c: case-collision preflight (pure detection) ---
+
+    #[test]
+    fn case_collision_same_side_detected() {
+        // Two keys differing only by case on one side -> both flagged. (Tested
+        // at the pure layer because a real dir on a case-insensitive FS cannot
+        // hold both `Note.md` and `note.md`.)
+        let local = vec![file("Note.md", 1, Some(1)), file("note.md", 1, Some(1))];
+        let c = case_collision_keys(&local, &[]);
+        assert!(c.contains("Note.md"));
+        assert!(c.contains("note.md"));
+    }
+
+    #[test]
+    fn case_collision_cross_side_detected() {
+        // local `Note.md` vs remote `note.md` (different content) -> both
+        // flagged, never auto-paired as Equal.
+        let local = vec![file("Note.md", 5, Some(1000))];
+        let remote = vec![file("note.md", 9, Some(2000))];
+        let c = case_collision_keys(&local, &remote);
+        assert!(c.contains("Note.md"), "c: {c:?}");
+        assert!(c.contains("note.md"), "c: {c:?}");
+    }
+
+    #[test]
+    fn case_collision_file_vs_folder_case_variant() {
+        // W4/A-H3: a local file `Notes` and a remote folder `notes/` (+ child)
+        // differ only by case. Folding the full key misses it (`notes` vs
+        // `notes/`); a normalized fold (single trailing `/` stripped) catches
+        // it. Note `notes/x` is NOT flagged: on a case-sensitive FS a file
+        // `Notes` and a folder `notes/` with a child coexist fine (the parent
+        // folder `notes/` itself is the case-collision row).
+        let local = vec![file("Notes", 5, Some(1))];
+        let remote = vec![folder("notes"), file("notes/x", 1, Some(1))];
+        let c = case_collision_keys(&local, &remote);
+        assert!(c.contains("Notes"), "c: {c:?}");
+        assert!(c.contains("notes/"), "c: {c:?}");
+        assert!(!c.contains("notes/x"), "child not a case collision: {c:?}");
+    }
+
+    #[test]
+    fn case_collision_folder_vs_folder_case_variant() {
+        // W4/A-H3 same-side form: `Notes/` and `notes/` folders collide; a
+        // file/folder pair that folds to distinct names (`A/` vs `a.md`) must
+        // NOT collide.
+        let folders = vec![folder("Notes"), folder("notes")];
+        let c = case_collision_keys(&folders, &[]);
+        assert!(c.contains("Notes/"), "c: {c:?}");
+        assert!(c.contains("notes/"), "c: {c:?}");
+
+        let no = vec![folder("A"), file("a.md", 1, Some(1))];
+        assert!(
+            case_collision_keys(&no, &[]).is_empty(),
+            "folded distinct: {:?}",
+            no
+        );
+    }
+
+    #[test]
+    fn case_collision_none_for_distinct_keys() {
+        // Keys that differ beyond case are not collisions.
+        let local = vec![file("Note.md", 1, Some(1)), file("other.md", 1, Some(1))];
+        let remote = vec![file("note2.md", 1, Some(1))];
+        let c = case_collision_keys(&local, &remote);
+        assert!(c.is_empty(), "c: {c:?}");
+    }
+
+    // --- W52/B-M2: path_collision_keys complexity + equivalence ---
+
+    #[test]
+    fn path_collision_keys_matches_naive_reference() {
+        // W52/B-M2: the production (binary-search, windowed-scan)
+        // implementation must agree exactly with the O(n^2) reference over
+        // sorted+dedup'd key sets - the sorted-input contract `plan()` feeds
+        // it.
+        let mut rng = Lcg::new(0x5EED_BEEF);
+        for trial in 0..40usize {
+            let n = 10 + (rng.next() % 60) as usize;
+            let mut keys: Vec<String> = (0..n).map(|_| random_key(&mut rng)).collect();
+            // sprinkled explicit edges: `K` vs `K/x`, `K/` folder markers,
+            // case variants, trailing-slash edges
+            match trial {
+                0 => keys.extend(["K".into(), "K/x".into()]),
+                1 => keys.extend(["K/".into(), "K".into()]),
+                2 => keys.extend(["Notes".into(), "notes/x".into()]),
+                3 => keys.extend(["a/".into(), "a/b".into(), "a/b/c".into()]),
+                4 => keys.extend(["zz".into(), "zz/".into()]),
+                _ => {}
+            }
+            keys.sort();
+            keys.dedup();
+            let refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+            let expect = naive_path_collision_keys(&refs);
+            let got = crate::plan::path_collision_keys(&refs);
+            assert_eq!(got, expect, "trial {trial}: keys={keys:?}");
+        }
+    }
+
+    #[test]
+    fn path_collision_keys_catches_collision_at_scale() {
+        // W52/B-M2: windowed-scan boundary guard at scale. 100k synthetic
+        // dirNNNNN/fileNNNNN.md keys plus one planted `zz/collide` +
+        // `zz/collide/x.md` pair; only the pair (both members) is reported.
+        // Debug-build-safe (a runtime assertion, not a benchmark); the
+        // O(n^2) algorithm does not complete this in a reasonable time.
+        let mut keys: Vec<String> = Vec::with_capacity(100_002);
+        for i in 0..100_000 {
+            keys.push(format!("dir{i:05}/file{i:05}.md"));
+        }
+        keys.push("zz/collide".into());
+        keys.push("zz/collide/x.md".into());
+        keys.sort();
+        keys.dedup();
+        let refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+        let got = crate::plan::path_collision_keys(&refs);
+        assert_eq!(got.len(), 2, "expected only the planted pair: {got:?}");
+        assert!(got.contains("zz/collide"), "got: {got:?}");
+        assert!(got.contains("zz/collide/x.md"), "got: {got:?}");
+    }
+
+    /// Deterministic tiny LCG for the W52 randomized equivalence test (no
+    /// external crates).
+    struct Lcg(u64);
+    impl Lcg {
+        fn new(seed: u64) -> Self {
+            Lcg(seed)
+        }
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+    }
+
+    /// Random vault-ish key over a tiny alphabet (segments `a`-`c`,
+    /// occasional uppercase, occasional trailing `/`), so randomized sorted
+    /// sets hit file/folder/case/trailing-slash edges.
+    fn random_key(rng: &mut Lcg) -> String {
+        let segs = 1 + (rng.next() % 3) as usize;
+        let mut parts: Vec<String> = Vec::new();
+        for _ in 0..segs {
+            let len = 1 + (rng.next() % 3) as usize;
+            let mut s = String::new();
+            for _ in 0..len {
+                s.push((b'a' + (rng.next() % 3) as u8) as char);
+            }
+            if rng.next() % 5 == 0 {
+                s = s.to_uppercase();
+            }
+            parts.push(s);
+        }
+        let mut k = parts.join("/");
+        if rng.next() % 7 == 0 {
+            k.push('/');
+        }
+        k
+    }
+
+    /// The pre-W52 O(n^2) algorithm, copied verbatim as the equivalence
+    /// reference.
+    fn naive_path_collision_keys(keys: &[&str]) -> std::collections::BTreeSet<String> {
+        let mut collided = std::collections::BTreeSet::new();
+        for k in keys {
+            if k.ends_with('/') {
+                let base = k.strip_suffix('/').unwrap();
+                if keys.contains(&base) {
+                    collided.insert(k.to_string());
+                    collided.insert(base.to_string());
+                }
+            } else {
+                let prefix = format!("{k}/");
+                for k2 in keys {
+                    if k2.starts_with(&prefix) {
+                        collided.insert(k.to_string());
+                        collided.insert(k2.to_string());
+                    }
+                }
+            }
+        }
+        collided
     }
 }

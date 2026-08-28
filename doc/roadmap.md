@@ -7,7 +7,7 @@
 - [x] Review pass: lock open `TODO(decision)` items
 - [x] `cargo init` structure (single package recommended)
 
-## Phase 1 - Skeleton (current)
+## Phase 1 - Skeleton (done)
 
 - [x] Rust package with `vaultsync` binary + library modules: `entity`, `plan`, `local`, `store` (trait + mock)
 - [x] Planner unit tests with fixture trees (no network)
@@ -17,23 +17,36 @@ Exit criteria: `cargo test` green (138 tests); `vaultsync status` against mock s
 
 ## Phase 2 - Real local FS + S3
 
-1. Local walker/reader/writer
-2. S3 backend spike (list/get/put/delete, metadata mtime, prefix, path-style, custom endpoint)
-3. Config TOML + AWS credential chain
-4. `check` against a real bucket
-5. Manual test matrix: AWS + one S3-compatible endpoint
+1. [x] Local walker/reader/writer (Slices 3)
+2. [x] S3 backend spike (Slice 0, D1 closed: `aws-sdk-s3` + `aws-config` + `tokio`; list/get/put/delete, metadata mtime, prefix, path-style, custom endpoint)
+3. [x] Config TOML + AWS credential chain (Slice 2, 7, 8)
+4. [x] `check` against a real bucket (Slice 8)
+5. [x] Manual test matrix: AWS done; **R2 row pending** (no R2 endpoint/creds this session) - see [test-matrix.md](test-matrix.md)
 
-Exit criteria: push/pull a sample vault including nested folders and a binary attachment.
+Exit criteria: push/pull a sample vault including nested folders and a binary attachment is verified on **AWS S3** (byte-identical + exact mtimes); **Cloudflare R2** row remains open (P2-matrix).
 
 ## Phase 3 - Hardening
 
 1. `--delete` safety (`--yes`, `--max-delete`, confirm prompt)
 2. Ignore patterns + Obsidian default profile
 3. Concurrency limits, retries with backoff on transient S3 errors
-4. Streaming for large objects if not already done
+4. Multipart upload above the 5 GiB single-PUT ceiling (get/put already
+   stream: `get_to` streams the body; `put_from` buffers to a disk temp and
+   streams it - never a size-sized memory buffer; the ceiling is rejected
+   client-side before buffering, W80)
 5. Lock file to prevent concurrent runs on same vault
 6. JSON schema stability for `--json`
 7. Integration test optional gate in CI
+8. Head-on-list (or HEAD-sample on size-equal candidates) so list-driven plans
+   see client mtimes instead of upload `LastModified` (PR2 A-M1 follow-up)
+9. CI: pin the toolchain and verify MSRV 1.85 (A-L9); set
+   `VAULTSYNC_TEST_S3_BUCKET` in CI so the env-gated suite genuinely runs,
+   and consider `#[ignore]` + `--ignored` or a CI sentinel so a silent skip
+   cannot look green (B-L7 hardening)
+10. Consider anchoring a relative `vault_root` to the config file's directory
+    instead of the cwd (PR2 B-L10) - breaking-change review
+11. Cloudflare R2 endpoint matrix row (still pending; the path-style toggle
+    test exercises both flavors there, PR2 A-M8/W12)
 
 Exit criteria: daily-driver usable for single-user backup (`push --delete` from trusted machine).
 
@@ -116,6 +129,38 @@ Record choices here as they are made.
 | 2026-08-27 | P1r7-special-node-key | Walker validates keys only for emittable nodes (`is_dir`/`is_file`); special files (FIFO/socket/device) are skipped unconditionally, name never inspected. Files/dirs with invalid names still fail loud (P1r4-key-ctl). Locked by `local_list_skips_special_file_with_backslash_name`. |
 | 2026-08-27 | P1r7-delete-repeat | Repeated `--delete` is a parse error (fail loud), matching repeated `--vault` (P1r4-vault-value). Locked by `parse_repeated_delete_flag_errors`. |
 | 2026-08-27 | P1r7-parse-usage | Every `parse_args` error message ends with the USAGE block (uniform rule). Locked by `parse_errors_always_include_usage`. |
+| 2026-08-28 | D1 S3 client stack | Official `aws-sdk-s3` + `aws-config` + `tokio` accepted after the Slice 0 spike cleared the AWS matrix: all 6 probes passed (list/head/get/put/delete, metadata mtime, prefix, path-style, custom-endpoint path, default cred chain). Weight: ~12.9 MiB stripped over the 435 KiB Phase 1 binary, 1m28s clean release build, 654-tree nodes. R2 row still unverified (no endpoint this session; lands in the integration suite). Notes: `doc/spikes/phase-2-s3.md`. `rust-s3` remains docs-only. |
+| 2026-08-28 | D2 async runtime | tokio; async lives only inside `store::s3` (`S3Store` owns a private runtime and `block_on`s per call). Planner/executor/CLI stay sync and runtime-free. No `async` outside `store::s3` without a new log entry. |
+| 2026-08-28 | P2-scope | Phase 2 = Roadmap 5 items plus the full deferred Phase 2 checklist; each item lands or is explicitly re-deferred with a log entry. |
+| 2026-08-28 | P2-matrix | Manual test matrix = AWS S3 + Cloudflare R2 (S3-compatible row). |
+| 2026-08-28 | P2-integ | Env-gated automated integration tests (`tests/`, off by default) plus a manual matrix checklist doc. |
+| 2026-08-28 | P2-toml | Config parsing via `toml` + `serde` (derive). |
+| 2026-08-28 | P2-cli | Migrate CLI parse to `clap` (global flags, `--flag=value`, `--` terminator). |
+| 2026-08-28 | 4a path collision | A file key `K` coexisting with a `K/` folder key or `K/...` child is a Conflict `path_collision` in every mode; never force-resolvable; the executor never touches these rows. |
+| 2026-08-28 | 4b unknown mtime | When both sides exist and either mtime is `None`: sizes equal -> Skip `equal_unknown_mtime` (visible row, zero overwrite risk); sizes differ -> Conflict `conflict_mtime_unknown` (forces apply per the mode-aware table). Retires the Phase 1 `None -> 0` rule. Pre-epoch `Some(0)` stays comparable, not aliased to `None`. Retired characterization tests flipped in the same commit. |
+| 2026-08-28 | 4c key identity | v1 key identity is case-sensitive, codepoint-exact, no NFC normalization (bytes preserved). `build_plan` preflights case-only collisions (same-side and cross-side) to Conflict `case_collision`; Collisions are never auto-paired as Equal, and (Slice 5) never executed. |
+| 2026-08-28 | 4d etag policy | Phase 2 does not compare etags and never hashes local files. Real-S3 etags are MD5 only for single-part uploads and provider-dependent (R2), so no cross-store etag equality is portable. `Entity::etag` stays an opaque remote token; `plan()` ignores etag fields. `--checksum` content comparison remains post-v1. The 4b policy is the sole guard for zero-evidence pairs. |
+| 2026-08-28 | R2.1 folder + `--delete` | Option (a): the executor runs transfers first, destination deletes last, then a bottom-up `remove_empty_dirs_bottom_up` post-pass cleans now-empty local dirs outside the plan (remote has no folder objects, so nothing to do there). Folder actions stay Skip; no folder delete rows. Characterization Skip tests remain. |
+| 2026-08-28 | exit-code lock (P1r-stub-exit) | `status` 0 clean / 2 dirty / 1 error. `push`/`pull` execute the plan: 0 if all selected actions succeeded and no Conflict rows; 2 if the plan contained any Conflict rows (non-conflict actions still execute); 1 on any transfer failure or fatal error. `--dry-run` prints the plan, mutates nothing, exits like status. Retires `run_push_stub_conflict_exit_0_placeholder` in the same commit. Help carries a permanent-`--delete`-no-confirmation warning until Phase 3. |
+| 2026-08-28 | check probe lock | `check` writes a tiny probe object (`<prefix>.vaultsync-check-<pid>`), reads it back, deletes it; success only on put+get+delete round-trip. No head-bucket-only fallback - probe failure is a failure. 404 -> not found, 401/403 -> actionable credentials hint, exit 1. Credentials come from the ambient AWS chain (Slice 8). |
+| 2026-08-28 | symlink policy (P1r4-symlink) | Default remains skip all symlinks below the root (symlinked root still followed, P1r6-root-symlink). `--follow-symlinks` (off by default, global flag): the walker follows symlinks, guards dir cycles with a canonical-path visited set, and still skips (with a warning) any target escaping the canonicalized vault root - never syncs out-of-vault content silently. Off-by-default skipped symlinks surface as a walk warning count on stderr (`skipped N symlink(s); use --follow-symlinks`), not plan Skip rows. |
+| 2026-08-28 | PR2-defer-head-on-list | Deferred (PR2 A-M1): a head-on-list (or HEAD-sample on size-equal candidates) so list-driven plans see client mtimes is a Phase 3 optimization; today the plan compares upload `LastModified` (documented in README). |
+| 2026-08-28 | PR2-defer-path-collision-perf | Landed by W52 (PR2 A-M6/B-L8): `path_collision_keys` is the sorted-window + `partition_point` rewrite - O(n log n) on the sorted, dedup'd key list, with naive-equivalence and scale tests. A benchmark before advertising large-vault use remains a perf gate (Phase 4 item 4). |
+| 2026-08-28 | PR2-defer-ci | Deferred (PR2 A-L9/B-L7): CI is Phase 3 - pin the toolchain + verify MSRV 1.85, set `VAULTSYNC_TEST_S3_BUCKET` so the env-gated suite runs for real, and use `#[ignore]`/`--ignored` or a CI sentinel so a silent skip cannot look green. |
+| 2026-08-28 | PR2-defer-vault-root-baseline | Deferred (PR2 B-L10): anchoring a relative `vault_root` to the config file's directory is a breaking-change Phase 3 review; today it resolves against the cwd (documented in cli.md). |
+| 2026-08-28 | PR2-defer-r2-row | Deferred (PR2 W12/A-M8 matrix): the Cloudflare R2 endpoint row is still pending; the path-style toggle test now exercises both addressing flavors there. |
+| 2026-08-28 | PR2-W76 guarded-delete-seam | `delete_file_guarded` routes its unlink through the shared `unlink_local_file` seam (pre-unlink locality re-check + `NotFound` mapping); a `#[cfg(test)]` pre-unlink hook in the seam lets tests inject the stat-to-unlink race through production APIs (r8b M1 / r8a-5, the merge-bar item). |
+| 2026-08-28 | PR2-W77 scoped-empty-dir-pass | The `pull --delete` empty-dir post-pass is scoped to the ancestor chains of the files deleted this run (both the Ok and the W32 NotFound goal-state arms), deepest-first, never the root, dedup'd across chains; pre-existing plan-unrelated empty dirs are kept. Replaces the vault-wide pass (r9 M1, the merge-bar item). |
+| 2026-08-28 | PR2-W78 tmp-path-self-cleanup | `tmp_path_for`'s post-creation tail (create_dir_all, second ensure_locality, alloc_temp_sibling) runs under a cleanup-on-error helper, so no failure can leak created dirs (r9 L2). `remove_created_dirs` is shared with exec's W66 download cleanup. |
+| 2026-08-28 | PR2-W79 reserved-keys-warn | Reserved-namespace remote keys dropped by `build_plan` are counted and surfaced on stderr (first 5 names + "and N more"), via a pure `partition_reserved_remote_keys` helper (r9 L1). |
+| 2026-08-28 | PR2-W80 single-put-ceiling | `S3Store::put_from` rejects a size above the 5 GiB single-PUT ceiling client-side, before buffering or upload (r8b L3). |
+| 2026-08-28 | PR2-W81 root-canon-cache | The vault root is canonicalized once per `LocalFs` (OnceLock) and threaded through `ensure_locality`, the scoped dir cleanup, and the walk; a mid-run root-symlink swap yields one consistent boundary decision per instance (r8a-1 / r9-N2). |
+| 2026-08-28 | PR2-W82 report-mutex | `RefCell<WalkReport>` -> `Mutex<WalkReport>` so `LocalFs` is Send/Sync ahead of Phase 3 concurrency (r8a-2). |
+| 2026-08-28 | PR2-W83 single-vault-merge-site | The `Cli.vault` merge arm is removed from `resolve_settings` (test-only in production); `resolve_vault_from_config` is the single `--vault`/config merge site; precedence tests retargeted (r9 N1). |
+| 2026-08-28 | PR2-W106 download-size-cap | `exec_download` caps the store's `get_to` stream at the planned remote size (crate-private `CappedWriter`, `WriteZero` past the cap), so a remote object replaced after the plan with a larger body is refused mid-stream before the extra bytes reach disk; `a.remote` is now required on Download rows (r12 M1). |
+| 2026-08-28 | PR2-W107 finalize-temp-guard | `finalize_write` refuses a temp that is no longer a regular file (symlink swap or node replacement) before re-opening it by path, removes the temp, and fails the key with the observed type; the rustdoc drops the false "provably harmless" claim (r12 M2). |
+| 2026-08-28 | PR2-W108 temp-owner-only | Download temp siblings are created owner-only `0600` like upload buffers (W14), via a shared `create_new_owner_only` helper used by both sides so the policy cannot drift again (r12 L1). |
+| 2026-08-28 | PR2-W109 reserved-folder-filter | `partition_reserved_remote_keys` strips one trailing `/` before extracting the final segment, so folder-form keys (`.vaultsync-check-1/`, `a/.name.vaultsync-tmp-1-2/`) are filtered like file keys (r12 L4). |
 
 ## Open decisions
 
@@ -125,21 +170,21 @@ None. Spike-gated work (D1/D2 final crate pick) lives in Phase 2, not as design 
 
 Written down so they are not silently dropped. Do not implement in this fix PR.
 
-- [ ] File-vs-folder path collision: reject/Conflict a `K` file vs a `K/` folder (or children under a file key). P1r-type-collision.
-- [ ] Unknown-mtime policy: revisit `mtime None -> 0` when a real backend is present; consider Conflict when either side lacks mtime and sizes differ. P1r-mtime-none. Revisit must cover **pull-direction staleness** (remote `None` + local present classifies `local_newer`; Pull plans Skip and keeps local) and `status` visibility for None-mtime pairs (P1r5-mtime-pull).
-- [ ] **Etag-aware equality (P1r7):** within-tolerance same-size pairs currently classify `Equal` with zero content evidence; Phase 2 must decide the local-hash policy (`--checksum` / size-gated hashing / never) before any etag short-circuit, since local entities never carry etags today. Mock etags are content-derived (P1r4-etag), so the comparison is testable the moment a policy exists. Complements P1r6-mtime-zero.
-- [ ] Real `push`/`pull` exit codes: executor-era `push`/`pull` must return non-zero when the executed plan contained conflicts (sync-model: "non-zero exit if any conflict"); the Phase 1 stub's unconditional 0 is a placeholder locked by `run_push_stub_conflict_exit_0_placeholder`. P1r-stub-exit.
-- [ ] Force-flag combination surface: if/reopen how `--force-local --force-remote` is exposed at the CLI. Currently planner cancels both to Conflict. P1r-both-forces.
-- [ ] Real backend `put_from` must stream without the mock's `size as usize` full-buffer read. P1r-put-size.
-- [ ] **Folder + `--delete` policy (R2.1):** choose (a) post-pass empty-dir cleanup outside the plan, (b) plan `DeleteLocal`/`DeleteRemote` for folders when `opts.delete`, or (c) document permanent orphan empty dirs as a known limitation. Characterization tests lock current Skip behavior until this lands. P1r3-folder-delete.
-- [ ] **Remote key ingest validation (R2.2):** validate keys on list/head ingest (or once in `build_plan`) before any local path join. Control chars + ws-only segments are now rejected at `ensure_valid_key` and `build_plan` validates `list` output (P1r4-key-ctl, P1r4-remote-ingest); remaining executor work: validate `head` responses too, and route *all* local path construction through a single `key_to_local_path(vault, key) -> Result<PathBuf>` that validates before joining. Extends P1r-key-validation.
-- [ ] **Key identity across filesystems (A2/B4):** decide canonicalization before the real backend lands - NFC-normalize at emit/ingest vs preserve bytes; detect case-only collisions (`Note.md` vs `note.md`) in a plan preflight when the local volume is case-insensitive (Conflict or warn); document v1 key identity as case-sensitive / codepoint-exact.
-- [ ] **Symlink policy (P1r4-symlink):** `--follow-symlinks` (off by default) or a warn-side Skip reason for skipped symlinked dirs; Obsidian users symlink attachment folders.
-- [ ] **Symlink-swap TOCTOU (P1r7):** walker and executor must defend against entry swaps between `file_type` (no-follow) and open - re-verify type at open time (or open with no-follow semantics); on download, resolve the real path and confirm it stays under the canonicalized vault root before writing. Pairs with R2.2 (`key_to_local_path` single join site).
-- [ ] **Folder mtime use:** folder mtimes are asymmetric by design (P1r4-folder-mtime); do not build Phase 2 logic on cross-side folder mtime comparison.
-- [ ] **Walker depth (Phase 3 note):** recursion is unbounded; add a depth cap or iterative walk during hardening, before executor-era deep trees (L3; next to the symlink-policy item).
-- [ ] **MSRV + CI (Phase 2/3 note):** pin `rust-version` and add a fmt/clippy/test workflow when CI exists.
-- [ ] **Executor `put_from` size verification (R3.3):** real backend/executor must **re-stat after read and fail on size/mtime mismatch** - not merely trust the declared size (a file that grew between walk and put would otherwise yield a silently truncated, self-consistent object). Extends P1r-put-size (mock "exactly size bytes" contract stays).
-- [ ] **Skip-row output policy (R3 low):** hide `S` rows by default or behind `-v` once vaults are large; Phase 1 fixtures may keep full print.
+- [[x]]  File-vs-folder path collision: reject/Conflict a `K` file vs a `K/` folder (or children under a file key). P1r-type-collision. LANDED (Slice 4a): Conflict `path_collision`, never force-resolvable, never executed.
+- [[x]]  Unknown-mtime policy: revisit `mtime None -> 0` when a real backend is present; consider Conflict when either side lacks mtime and sizes differ. P1r-mtime-none. Revisit must cover **pull-direction staleness** (remote `None` + local present classifies `local_newer`; Pull plans Skip and keeps local) and `status` visibility for None-mtime pairs (P1r5-mtime-pull). LANDED (Slice 4b): either-mtime-None -> size-equal Skip `equal_unknown_mtime` / size-diff Conflict `conflict_mtime_unknown`; `None -> 0` retired; pull-direction hole closed.
+- [[x]]  **Etag-aware equality (P1r7):** within-tolerance same-size pairs currently classify `Equal` with zero content evidence; Phase 2 must decide the local-hash policy (`--checksum` / size-gated hashing / never) before any etag short-circuit, since local entities never carry etags today. Mock etags are content-derived (P1r4-etag), so the comparison is testable the moment a policy exists. Complements P1r6-mtime-zero. LANDED (Slice 4d): policy = never hash local files / never compare etags (MD5-only + provider-dependent); plan() ignores etag; `--checksum` stays post-v1.
+- [[x]]  Real `push`/`pull` exit codes: executor-era `push`/`pull` must return non-zero when the executed plan contained conflicts (sync-model: "non-zero exit if any conflict"); the Phase 1 stub's unconditional 0 is a placeholder locked by `run_push_stub_conflict_exit_0_placeholder`. P1r-stub-exit. LANDED (Slice 6): 0/2/1; placeholder test retired.
+- [[x]]  Force-flag combination surface: if/reopen how `--force-local --force-remote` is exposed at the CLI. Currently planner cancels both to Conflict. P1r-both-forces. LANDED (Slice 1): `--force-local --force-remote` parse; planner cancels to Conflict.
+- [[x]]  Real backend `put_from` must stream without the mock's `size as usize` full-buffer read. P1r-put-size. LANDED (Slice 7): temp-file + `ByteStream::from_path` streaming; no size-sized in-memory buffer (s3_integ_streaming_put_large).
+- [[x]]  **Folder + `--delete` policy (R2.1):** choose (a) post-pass empty-dir cleanup outside the plan, (b) plan `DeleteLocal`/`DeleteRemote` for folders when `opts.delete`, or (c) document permanent orphan empty dirs as a known limitation. Characterization tests lock current Skip behavior until this lands. P1r3-folder-delete. LANDED (Slice 5, option a): transfers first, deletes last, bottom-up empty-dir post-pass.
+- [[x]]  **Remote key ingest validation (R2.2):** validate keys on list/head ingest (or once in `build_plan`) before any local path join. Control chars + ws-only segments are now rejected at `ensure_valid_key` and `build_plan` validates `list` output (P1r4-key-ctl, P1r4-remote-ingest); remaining executor work: validate `head` responses too, and route *all* local path construction through a single `key_to_local_path(vault, key) -> Result<PathBuf>` that validates before joining. Extends P1r-key-validation. LANDED (Slice 3+7): `key_to_local_path` single join site; head/list ingest validates keys; S3 validates before any outbound call.
+- [[x]]  **Key identity across filesystems (A2/B4):** decide canonicalization before the real backend lands - NFC-normalize at emit/ingest vs preserve bytes; detect case-only collisions (`Note.md` vs `note.md`) in a plan preflight when the local volume is case-insensitive (Conflict or warn); document v1 key identity as case-sensitive / codepoint-exact. LANDED (Slice 4c): v1 key identity case-sensitive, codepoint-exact, no NFC normalization; case-only collisions -> Conflict `case_collision`.
+- [[x]]  **Symlink policy (P1r4-symlink):** `--follow-symlinks` (off by default) or a warn-side Skip reason for skipped symlinked dirs; Obsidian users symlink attachment folders. LANDED (Slice 9): `--follow-symlinks` off by default + skipped-symlink count warning; follow guards loops and skips escaping targets with a warning.
+- [[x]]  **Symlink-swap TOCTOU (P1r7):** walker and executor must defend against entry swaps between `file_type` (no-follow) and open - re-verify type at open time (or open with no-follow semantics); on download, resolve the real path and confirm it stays under the canonicalized vault root before writing. Pairs with R2.2 (`key_to_local_path` single join site). LANDED (Slice 3): open_verified no-follow type recheck + opened-fd size/mtime recheck; download locality (canonical root) guard.
+- [[x]]  **Folder mtime use:** folder mtimes are asymmetric by design (P1r4-folder-mtime); do not build Phase 2 logic on cross-side folder mtime comparison. Constraint honored: folder mtimes not compared cross-side (4b tests use file entities only).
+- [[ ]]  **Walker depth (Phase 3 note):** recursion is unbounded; add a depth cap or iterative walk during hardening, before executor-era deep trees (L3; next to the symlink-policy item). RE-DEFERRED to Phase 3: recursion still unbounded (roadmap Phase 3 hardening item).
+- [[x]]  **MSRV + CI (Phase 2/3 note):** pin `rust-version` and add a fmt/clippy/test workflow when CI exists. PARTIAL: `rust-version = "1.85"` pinned (Slice 10); CI fmt/clippy/test workflow remains Phase 3.
+- [[x]]  **Executor `put_from` size verification (R3.3):** real backend/executor must **re-stat after read and fail on size/mtime mismatch** - not merely trust the declared size (a file that grew between walk and put would otherwise yield a silently truncated, self-consistent object). Extends P1r-put-size (mock "exactly size bytes" contract stays). LANDED (Slice 3+5): open_verified re-stats opened fd (size + mtime) before put.
+- [[x]]  **Skip-row output policy (R3 low):** hide `S` rows by default or behind `-v` once vaults are large; Phase 1 fixtures may keep full print. LANDED (Slice 10): formatter hides S rows by default; -v shows them.
 - [x] **`--vault` value hygiene (R3 low):** landed - empty/flag-like (leading `-`) values rejected and repeated `--vault` is a parse error (P1r4-vault-value).
-- [ ] **`--vault` `-foo` escape hatch (P1r5):** support `--vault=<path>` and/or `--` so a vault literally named `-foo` is reachable. Documented tradeoff of P1r4-vault-value (leading `-` values rejected); clap migration note, not a Phase 1 defect (L4).
+- [[x]]  **`--vault` `-foo` escape hatch (P1r5):** support `--vault=<path>` and/or `--` so a vault literally named `-foo` is reachable. Documented tradeoff of P1r4-vault-value (leading `-` values rejected); clap migration note, not a Phase 1 defect (L4). LANDED (Slice 1): `--vault=-foo` via clap equals form.

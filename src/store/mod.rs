@@ -10,6 +10,21 @@ use crate::entity::Entity;
 use crate::error::Error;
 
 pub mod mock;
+pub mod s3;
+
+/// A listing result: the entities plus advisory warnings the backend wants
+/// surfaced (e.g. keys dropped while listing). A struct, not a tuple, so
+/// Phase 3 fields extend without another signature break. The CLI prints
+/// `warnings` (one `warning: ...` line each); library consumers may inspect
+/// or ignore them. Warnings never fail the listing - they describe what was
+/// silently dropped so nothing vanishes without a trace (W70/A-N2, H1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Listing {
+    /// The listed entities (sorted by key).
+    pub entities: Vec<Entity>,
+    /// Advisory warnings about the listing, printed by the CLI layer.
+    pub warnings: Vec<String>,
+}
 
 /// An object store holding a set of vault-relative keys.
 ///
@@ -37,10 +52,15 @@ pub trait ObjectStore {
     /// segment. Callers that want only the contents of a folder must pass a
     /// trailing `/` (e.g. `notes/`); passing `notes` will also match `notes.md`
     /// and any sibling whose key merely starts with `notes`.
-    fn list(&self, prefix: &str) -> Result<Vec<Entity>, Error>;
+    fn list(&self, prefix: &str) -> Result<Listing, Error>;
     /// Fetch metadata for a single object.
     fn head(&self, key: &str) -> Result<Entity, Error>;
     /// Stream object bytes into `w`, returning its metadata.
+    ///
+    /// Contract (W30/N6/L2): the returned entity's `size` must be the true
+    /// number of bytes written to `w`. Backends must not report a placeholder
+    /// (e.g. 0) when the body length is not known up front; the executor's
+    /// size check relies on this.
     fn get_to(&self, key: &str, w: &mut dyn Write) -> Result<Entity, Error>;
     /// Store exactly `size` bytes read from `r`. File keys only: a trailing
     /// `/` (folder marker) is rejected with [`Error::InvalidKey`].
@@ -59,5 +79,10 @@ pub trait ObjectStore {
         mtime_ms: Option<u64>,
     ) -> Result<Entity, Error>;
     /// Remove an object.
+    ///
+    /// Delete is idempotent-friendly (W10/A-M3/B-L6): deleting an already-
+    /// absent key MAY return `Ok` (S3 is idempotent) **or** [`Error::NotFound`]
+    /// (the mock and `LocalFs::delete_file` do). Callers must treat both as
+    /// reaching the goal state; the executor normalizes `NotFound` to success.
     fn delete(&self, key: &str) -> Result<(), Error>;
 }
