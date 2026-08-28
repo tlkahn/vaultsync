@@ -45,8 +45,9 @@ pub enum Freshness {
 pub struct WalkReport {
     /// Symlinks skipped (default mode, or out-of-vault followed targets).
     pub skipped_symlinks: u32,
-    /// Reserved vaultsync temp siblings (`.*.vaultsync-tmp-*`) skipped
-    /// (W23/M1: a crash leftover is never surfaced as a real key).
+    /// Reserved vaultsync temp/probe files skipped (W23/M1 + R4-L4/W42): a
+    /// crash leftover `.*.vaultsync-tmp-*` or `.vaultsync-check-*` is never
+    /// surfaced as a real key. W41 reports this count on stderr.
     pub skipped_temp_files: u32,
     /// Keys of followed *file* symlinks (R4-M1/W38). The planner uses this to
     /// mark such rows `Skip(followed_symlink)` in mutating modes: the walker
@@ -585,14 +586,19 @@ fn alloc_temp_sibling_from(candidates: &[PathBuf]) -> Result<(PathBuf, std::fs::
     )))
 }
 
-/// Whether a file name is a reserved vaultsync temp sibling (W23/M1): a
-/// leading dot plus `.vaultsync-tmp-` inside. Such names are written only by
-/// the download/upload temp paths (`.name.vaultsync-tmp-<pid>-<n>`); the
-/// walker treats them as never-syncable and skips them.
-fn is_vaultsync_tmp(name: Option<&std::ffi::OsStr>) -> bool {
+/// Whether a file name is a reserved vaultsync temp/probe name. The walker
+/// treats these as never-syncable and skips/counts them. Covers:
+///
+/// - the temp sibling pattern `.*.vaultsync-tmp-*` (`.name.vaultsync-tmp-
+///   <pid>-<n>`), written by the download/upload temp paths and never
+///   syncable (W23/M1);
+/// - the connectivity-probe prefix `.vaultsync-check-*`, a crashed `check`
+///   leftover (W19/W24 + R4-L4/W42) - a materialized stray probe must never
+///   re-upload.
+fn is_reserved_vaultsync_name(name: Option<&std::ffi::OsStr>) -> bool {
     let Some(name) = name else { return false };
     let s = name.to_string_lossy();
-    s.starts_with('.') && s.contains(".vaultsync-tmp-")
+    (s.starts_with('.') && s.contains(".vaultsync-tmp-")) || s.starts_with(".vaultsync-check-")
 }
 
 /// Set a file's mtime in ms since epoch (std `File::set_times`, stable).
@@ -684,7 +690,7 @@ fn walk(
         } else if ft.is_file() {
             // W23/M1: a reserved vaultsync temp sibling (crash leftover) is
             // never emitted as a key.
-            if is_vaultsync_tmp(path.file_name()) {
+            if is_reserved_vaultsync_name(path.file_name()) {
                 report.skipped_temp_files += 1;
             } else {
                 let key = path_to_key(rel)?;
@@ -752,7 +758,7 @@ fn handle_followed_symlink(
     } else if tmd.is_file() {
         // W23/M1: skip a reserved temp sibling reached via a followed symlink,
         // for symmetry with the default walk.
-        if is_vaultsync_tmp(path.file_name()) {
+        if is_reserved_vaultsync_name(path.file_name()) {
             report.skipped_temp_files += 1;
             return Ok(());
         }
@@ -1521,6 +1527,21 @@ mod tests {
         let (ents, rep) = fs.list_report().unwrap();
         let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(keys, vec!["note.md"], "tmp sibling listed: {keys:?}");
+        assert_eq!(rep.skipped_temp_files, 1);
+    }
+
+    #[test]
+    fn walk_skips_check_probe_leftovers() {
+        // R4-L4/W42: a `.vaultsync-check-*` probe leftover on the local side
+        // (materialized by an earlier stray download) must be skipped and
+        // counted, never re-uploaded as a real key.
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::write(dir.join("note.md"), "real").unwrap();
+        std::fs::write(dir.join(".vaultsync-check-1-2-3"), "stray").unwrap();
+        let fs = LocalFs::new(dir.path());
+        let (ents, rep) = fs.list_report().unwrap();
+        let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["note.md"], "check leftover listed: {keys:?}");
         assert_eq!(rep.skipped_temp_files, 1);
     }
 

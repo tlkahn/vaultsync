@@ -39,6 +39,12 @@ pub fn build_plan(
     let remote_entities: Vec<_> = remote_entities
         .into_iter()
         .filter(|e| !e.key.is_empty())
+        // R4-L4/W42: the reserved connectivity-probe namespace. A crashed
+        // `check` (SIGKILL between probe put and delete) can leave a
+        // `.vaultsync-check-*` object remotely; it must never plan a Download
+        // (which would materialize a stray dotfile). Users must not create
+        // such keys (object-store.md reserved namespace).
+        .filter(|e| !e.key.starts_with(".vaultsync-check-"))
         .collect();
     for e in &remote_entities {
         crate::entity::ensure_valid_key(&e.key)?;
@@ -280,6 +286,27 @@ mod tests {
         fn delete(&self, key: &str) -> Result<(), Error> {
             Err(Error::NotFound(key.to_string()))
         }
+    }
+
+    #[test]
+    fn build_plan_ignores_remote_check_probe_leftovers() {
+        // R4-L4/W42: a crashed `check` can leave a `.vaultsync-check-*` probe
+        // object remotely; it must NEVER plan as a `remote_only` -> Download
+        // (which would materialize a stray dotfile). Such keys are dropped
+        // from the remote ingest before planning.
+        let dir = TempDir::new("vaultsync-lib-test");
+        let local = LocalFs::new(dir.path());
+        let store = StubStore {
+            listed: vec![crate::entity::file(".vaultsync-check-1-2-3", 25, Some(100))],
+        };
+        let p = build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        assert!(
+            !p.actions
+                .iter()
+                .any(|a| a.key.starts_with(".vaultsync-check-")),
+            "probe leftover planned: {:?}",
+            p.actions
+        );
     }
 
     #[cfg(unix)]
