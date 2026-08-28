@@ -239,10 +239,20 @@ impl LocalFs {
         // W66/A-L2: computed BEFORE `create_dir_all` so the failure cleanup
         // can remove exactly the dirs we created.
         let created_dirs = created_dir_chain(parent);
-        std::fs::create_dir_all(parent)?;
-        self.ensure_locality(parent)?;
-        let (tmp, f) = alloc_temp_sibling(&path)?;
-        Ok((tmp, f, created_dirs))
+        // W78/r9 L2: the remaining fallible tail (create_dir_all, the second
+        // ensure_locality, alloc_temp_sibling) runs under the cleanup helper,
+        // so ANY post-creation failure removes exactly the dirs we created -
+        // the leak is structurally impossible, including the three exits the
+        // review enumerated (second ensure_locality, alloc exhaustion, and a
+        // partially-creating create_dir_all). The entry-time ensure_locality
+        // and `created_dir_chain` stay outside the closure: they create
+        // nothing.
+        with_created_dirs_cleanup(&created_dirs, || {
+            std::fs::create_dir_all(parent)?;
+            self.ensure_locality(parent)?;
+            alloc_temp_sibling(&path)
+        })
+        .map(|(tmp, f)| (tmp, f, created_dirs))
     }
 
     /// Commit a temp file written by a download to its final path, applying
@@ -816,6 +826,36 @@ fn created_dir_chain(parent: &Path) -> Vec<PathBuf> {
         }
     }
     created
+}
+
+/// Run a fallible post-creation tail; on `Err`, remove the created dirs
+/// bottom-up (best-effort, only while empty) before returning the error
+/// (W78/r9 L2). Used by `tmp_path_for` so no post-creation failure can leak
+/// the dirs it just created.
+fn with_created_dirs_cleanup<T>(
+    created_dirs: &[PathBuf],
+    tail: impl FnOnce() -> Result<T, Error>,
+) -> Result<T, Error> {
+    match tail() {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            remove_created_dirs(created_dirs);
+            Err(e)
+        }
+    }
+}
+
+/// Best-effort bottom-up removal of the dirs a failing operation created
+/// (W66/A-L2, shared by exec's download cleanup and `tmp_path_for`'s own
+/// failure cleanup W78/r9 L2): `remove_dir` refuses a non-empty dir (and a
+/// `NotFound` is the goal state), so only still-empty created dirs are
+/// removed, deepest-first as `created_dir_chain` produced them. Errors are
+/// swallowed: the primary failure is already being reported, and any leftover
+/// is either pre-existing or will be cleaned by the next empty-dir pass.
+pub(crate) fn remove_created_dirs(created: &[PathBuf]) {
+    for d in created {
+        let _ = std::fs::remove_dir(d);
+    }
 }
 
 /// Whether a file name is a reserved vaultsync temp/probe name. The walker
@@ -1679,6 +1719,87 @@ mod tests {
         );
         // the directory (final path) is untouched
         assert!(dir.join("sub/a.md").is_dir());
+    }
+
+    #[test]
+    fn created_dirs_removed_on_tail_failure() {
+        // W78 (r9 L2): the cleanup-on-error helper removes the created-dirs
+        // chain on a failing tail and keeps it on a succeeding tail. Real
+        // temp dirs, helper-level (compile-RED on the helper, the accepted
+        // W52/W61 pattern - a deterministic end-to-end RED for the leak is
+        // not constructible through the public API).
+        let dir = TempDir::new("vaultsync-test");
+        // the chain is computed BEFORE the dirs exist, exactly as tmp_path_for
+        // does (W66/A-L2), so it names precisely the dirs about to be created
+        let parent = dir.join("x/y/z");
+        let chain = created_dir_chain(&parent);
+        assert_eq!(chain.len(), 3, "expected x/y/z, x/y, x: {chain:?}");
+        std::fs::create_dir_all(&parent).unwrap();
+        // a failing tail cleans the chain bottom-up
+        let err = with_created_dirs_cleanup(&chain, || {
+            Err::<(), Error>(Error::Other("tail failed".to_string()))
+        })
+        .unwrap_err();
+        assert!(format!("{err}").contains("tail failed"));
+        assert!(!dir.join("x/y/z").exists(), "chain not cleaned on Err");
+        assert!(!dir.join("x/y").exists(), "middle not cleaned on Err");
+        assert!(!dir.join("x").exists(), "top not cleaned on Err");
+        // a succeeding tail keeps the dirs
+        let keep = TempDir::new("vaultsync-test");
+        let keep_parent = keep.join("x/y/z");
+        let keep_chain = created_dir_chain(&keep_parent);
+        std::fs::create_dir_all(&keep_parent).unwrap();
+        with_created_dirs_cleanup(&keep_chain, || Ok::<(), Error>(())).unwrap();
+        assert!(keep.join("x/y/z").exists(), "dirs removed on Ok");
+    }
+
+    #[test]
+    fn alloc_temp_sibling_all_candidates_taken_errors() {
+        // W78 (r9 L2) companion: the allocator's exhaustion error (all 100
+        // candidates taken) stays a loud, deterministic error. Locked at the
+        // slice level: end-to-end injection through `tmp_path_for` is not
+        // deterministic because the candidate counter is process-global and
+        // shared across test threads (each `temp_sibling_candidates` call
+        // advances it by 100), so the plan's literal pre-plant of "the" 100
+        // candidates can never target the range the allocator will actually
+        // use.
+        let dir = TempDir::new("vaultsync-test");
+        let path = dir.join("a.md");
+        let candidates = temp_sibling_candidates(&path);
+        assert_eq!(candidates.len(), 100);
+        for c in &candidates {
+            std::fs::write(c, "planted").unwrap();
+        }
+        let err = alloc_temp_sibling_from(&candidates).unwrap_err();
+        assert!(
+            format!("{err}").contains("could not allocate a unique temp file"),
+            "unexpected err: {err}"
+        );
+        assert!(!dir.join("a.md").exists(), "planted sibling untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmp_path_for_creation_failure_leaks_no_dirs() {
+        // W78 (r9 L2) smoke through the production API: a post-creation
+        // failure inside `tmp_path_for` (create_dir_all on a read-only vault
+        // root -> PermissionDenied) propagates cleanly and leaks no created
+        // dirs; the root stays intact. (A partial-creation failure is not
+        // deterministically injectable either - see the helper-level RED
+        // test for the structural guarantee.)
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("vaultsync-test");
+        let fs = LocalFs::new(dir.path());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err = fs.tmp_path_for("a/b/c.md").unwrap_err();
+        // restore perms so TempDir drop can remove the tree
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            format!("{err}").contains("io error"),
+            "expected an io error, got: {err}"
+        );
+        assert!(!dir.join("a").exists(), "created dirs leaked on failure");
+        assert!(dir.exists(), "root must be intact");
     }
 
     #[cfg(unix)]

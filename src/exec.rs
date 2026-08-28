@@ -14,8 +14,6 @@
 //!   a per-key error, the run continues, and exit is non-zero at dispatch;
 //! - per-key failures are isolated; the report collects `(key, error)`.
 
-use std::path::PathBuf;
-
 use crate::error::Error;
 use crate::local::LocalFs;
 use crate::plan::{ActionKind, Mode, Plan};
@@ -313,21 +311,9 @@ fn exec_download(
         Ok(()) => Ok(()),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
-            remove_created_dirs(&created_dirs);
+            crate::local::remove_created_dirs(&created_dirs);
             Err(e)
         }
-    }
-}
-
-/// Best-effort bottom-up removal of the dirs a failed download created
-/// (W66/A-L2): `remove_dir` refuses a non-empty dir (and a `NotFound` is the
-/// goal state), so only still-empty dirs we created are removed, deepest-
-/// first as `created_dir_chain` produced them. Errors are swallowed: the
-/// primary failure is already being reported, and any leftover is either
-/// pre-existing or will be cleaned by the next empty-dir pass.
-fn remove_created_dirs(created: &[PathBuf]) {
-    for d in created {
-        let _ = std::fs::remove_dir(d);
     }
 }
 
