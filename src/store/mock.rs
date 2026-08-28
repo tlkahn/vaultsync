@@ -1,4 +1,9 @@
 //! In-memory [`ObjectStore`] implementation for tests and Phase 1 CLI smoke.
+//!
+//! Key-validation latitude (trait N1): the trait lets read/delete paths answer
+//! [`Error::NotFound`] for invalid keys, and this mock exercises that
+//! latitude - `head`/`get_to`/`delete` do not validate. The S3 backend
+//! differs: it validates before any outbound call.
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Write};

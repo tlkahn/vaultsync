@@ -17,14 +17,24 @@ pub struct Entity {
     pub etag: Option<String>,
 }
 
+pub struct Listing {
+    pub entities: Vec<Entity>,  // sorted by key
+    pub warnings: Vec<String>,  // advisory backend notes (e.g. keys dropped while listing)
+}
+
 pub trait ObjectStore {
-    fn list(&self, prefix: &str) -> Result<Vec<Entity>>;          // folders synthesized from prefixes
+    fn list(&self, prefix: &str) -> Result<Listing>;   // folders synthesized from key prefixes
     fn head(&self, key: &str) -> Result<Entity>;
     fn get_to(&self, key: &str, w: &mut dyn Write) -> Result<Entity>;   // streaming
     fn put_from(&self, key: &str, r: &mut dyn Read, size: u64, mtime_ms: Option<u64>) -> Result<Entity>; // streaming
     fn delete(&self, key: &str) -> Result<()>;
 }
 ```
+
+`Listing.warnings` carries advisory notes about the listing (e.g. dropped
+non-empty `*/` keys); the CLI prints them (one `warning: ...` line each),
+and library consumers may inspect or ignore them - warnings never fail the
+listing.
 
 **Locked:** expose **streaming in the trait from day one** (`get_to` /
 `put_from`). Buffered `Vec<u8>` helpers may wrap the streaming API for small
@@ -63,19 +73,19 @@ Practical options (pick in Phase 2 spike, not earlier):
 
 | Trait | S3 API |
 | ----- | ------ |
-| list | `ListObjectsV2` paginated; synthesize folder prefixes from `CommonPrefixes` if delimiter `/` is used, or derive from keys |
+| list | `ListObjectsV2` paginated; folder prefixes derived from keys (no delimiter in the request; `CommonPrefixes` is not used) |
 | head | `HeadObject` |
 | get_to | `GetObject` (stream body into the caller's writer) |
 | put_from | `PutObject` single-PUT via `ByteStream::from_path` (buffered to a disk temp, never a `size`-sized memory buffer); 5 GiB ceiling. Multipart is a post-v1 item. |
+| delete | `DeleteObject` (batch delete later) |
 
 Upload temp buffers live in the OS temp dir as `vaultsync-upload-<pid>-<n>`
 (owner-only `0o600`, `create_new`). Their lifecycle includes a 24h reap
-(W88/r10-L2): each `S3Store` construction best-effort removes
-`vaultsync-upload-*` files older than 24h (a crash/SIGKILL between buffering
-and the post-upload `remove_file` would otherwise leak a full buffered object
-in the shared temp dir). Fresh in-flight buffers and unrelated files are never
-touched.
-| delete | `DeleteObject` (batch delete later) |
+(W88/r10-L2), run **at most once per process, on the first `S3Store::new`**
+(W97): best-effort removal of `vaultsync-upload-*` files older than 24h (a
+crash/SIGKILL between buffering and the post-upload `remove_file` would
+otherwise leak a full buffered object in the shared temp dir). Fresh
+in-flight buffers and unrelated files are never touched.
 
 Delete is **idempotent-friendly** (PR2 A-M3/B-L6): deleting an already-absent
 key may return `Ok` (S3 is idempotent) or `NotFound` (mock / local). Both are

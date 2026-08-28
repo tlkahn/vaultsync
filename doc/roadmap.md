@@ -157,6 +157,10 @@ Record choices here as they are made.
 | 2026-08-28 | PR2-W81 root-canon-cache | The vault root is canonicalized once per `LocalFs` (OnceLock) and threaded through `ensure_locality`, the scoped dir cleanup, and the walk; a mid-run root-symlink swap yields one consistent boundary decision per instance (r8a-1 / r9-N2). |
 | 2026-08-28 | PR2-W82 report-mutex | `RefCell<WalkReport>` -> `Mutex<WalkReport>` so `LocalFs` is Send/Sync ahead of Phase 3 concurrency (r8a-2). |
 | 2026-08-28 | PR2-W83 single-vault-merge-site | The `Cli.vault` merge arm is removed from `resolve_settings` (test-only in production); `resolve_vault_from_config` is the single `--vault`/config merge site; precedence tests retargeted (r9 N1). |
+| 2026-08-28 | PR2-W106 download-size-cap | `exec_download` caps the store's `get_to` stream at the planned remote size (crate-private `CappedWriter`, `WriteZero` past the cap), so a remote object replaced after the plan with a larger body is refused mid-stream before the extra bytes reach disk; `a.remote` is now required on Download rows (r12 M1). |
+| 2026-08-28 | PR2-W107 finalize-temp-guard | `finalize_write` refuses a temp that is no longer a regular file (symlink swap or node replacement) before re-opening it by path, removes the temp, and fails the key with the observed type; the rustdoc drops the false "provably harmless" claim (r12 M2). |
+| 2026-08-28 | PR2-W108 temp-owner-only | Download temp siblings are created owner-only `0600` like upload buffers (W14), via a shared `create_new_owner_only` helper used by both sides so the policy cannot drift again (r12 L1). |
+| 2026-08-28 | PR2-W109 reserved-folder-filter | `partition_reserved_remote_keys` strips one trailing `/` before extracting the final segment, so folder-form keys (`.vaultsync-check-1/`, `a/.name.vaultsync-tmp-1-2/`) are filtered like file keys (r12 L4). |
 
 ## Open decisions
 
