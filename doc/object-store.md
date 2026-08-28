@@ -74,13 +74,24 @@ key may return `Ok` (S3 is idempotent) or `NotFound` (mock / local). Both are
 the achieved goal state; the executor normalizes `NotFound` to success.
 
 Keys under the reserved namespace `.vaultsync-check-*` (used by `check`'s
-connectivity probe) must not be created by user content.
+connectivity probe) must not be created by user content. A crash-leftover
+probe (e.g. a SIGKILL between probe put and delete) is additionally filtered
+out of both walks and plans, so a stray `.vaultsync-check-*` object can never
+Download to disk or re-upload (R4-L4/W42).
+
+Zero-byte marker objects at the exact store prefix (e.g. an S3-console
+"Make Folder" marker that strips to an empty vault-relative key) are ignored;
+objects whose keys end in `/` (some tools write content into `dir/` markers)
+are invisible to sync in v1 (their trailing `/` is not a vault file key).
 
 ### Metadata
 
 - Store client mtime in object metadata key `vaultsync-mtime` (or `mtime`) as decimal ms.
 - Do not require ACL headers beyond bucket defaults.
-- Content-Type: guess from extension with a tiny map, else `application/octet-stream`.
+- Content-Type: v1 sends no explicit Content-Type; objects are stored under
+the SDK default `application/octet-stream`. Extension-based guessing is
+dropped (content type is backend-side only, per the trait note above; there
+is no `content_type` field on `Entity`).
 
 ### Compatibility targets
 

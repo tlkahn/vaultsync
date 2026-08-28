@@ -166,10 +166,13 @@ Uploads are single-PUT, so a single object is limited to 5 GiB; larger files
 need multipart (a post-v1 item).
 
 `--follow-symlinks` + `--delete` is a footgun: with the flag on, a followed
-symlink and its target are two names for the same inode, and deleting a key
-that is a symlink removes that inode (exactly like `rm` on the link path).
-Default mode never plans through symlinks (they are skipped and counted), so
-this only applies when you explicitly opt in.
+symlink and its target are two names for the same inode, and deleting the
+link key unlinks the *link* itself (`remove_file` semantics). The target
+inode keeps its own name, so if the target is a separately-listed key it
+survives under that name - there is no write-through and the link's unlink
+never deletes the target's other names. Default mode never plans through
+symlinks (they are skipped and counted), so this only applies when you
+explicitly opt in.
 
 `--follow-symlinks` is **inventory-only in v1**: the walker follows symlinks
 and lists them, but push/pull plan any followed *file* symlink as
@@ -179,24 +182,38 @@ shows followed-symlink rows as live inventory. Dir-symlink children transfer
 normally; a `pull` write through a symlink destination stays refused (fail
 closed).
 
+**Local deletes re-verify freshness.** A `pull --delete` re-stats a local file
+before removing it (size + mtime within `transfer.mtime_tolerance_ms`); a
+file that changed since the plan is left on disk with a per-key error,
+symmetric to the upload/download freshness guards. `DeleteRemote` (push
+`--delete`) has no head-before-delete re-check: the list-to-delete gap is an
+accepted cross-machine race on the store side.
+
+**One invalid remote key aborts the plan loudly.** A store listing that yields
+an invalid key (escaping, control-character) fails the whole plan; the error
+names the offending key. This is the fail-closed security lock - a hostile or
+buggy backend cannot silently shrink a plan. (The exact-prefix folder-marker
+empty key, which stripped to `""`, is dropped at the source instead, so it
+does not trip this.)
+
 ## Output
 
 ### Human (default)
 
-Phase 1 subset emitted by `format_plan_human`: split delete counts, no
-byte-size column, and the conflict reason is the planner's reason token as
-emitted. Byte sizes / tighter column alignment / hiding `S` rows by default
-are Phase 2+ (formatter growth is out of scope for Phase 1). The JSON block
-below remains the structured contract (`delete_local` / `delete_remote`
-counts already match the formatter).
+Emitted by `format_plan_human`: split delete counts, no byte-size column, and
+the conflict reason is the planner's reason token as emitted. `S` (skip) rows
+are hidden by default; pass `-v` to show them (the stats line still counts
+them). The JSON block below remains the structured contract
+(`delete_local` / `delete_remote` counts already match the formatter).
 
 ```text
 plan: 3 upload, 1 download, 0 delete_local, 0 delete_remote, 2 skip, 1 conflict
 U  notes/a.md
 D  notes/b.md
 *  notes/c.md    conflict_mtime_size
-S  notes/
 ```
+
+(`-v` additionally shows the two skip rows, e.g. `S  notes/`.)
 
 ### JSON (`--json`)
 

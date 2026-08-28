@@ -72,6 +72,10 @@ action a plan - or delete files - against a non-existent store).
   `status` shows them as live inventory rows. Dir-symlink children transfer
   normally; a `pull` write through a symlink destination stays refused (fail
   closed).
+- **Pull overwrite resets permission bits.** A download writes a fresh temp
+  file (`0666 & umask`) and renames it over the destination, so a
+  previously-`0600` local note returns as `0644`. v1 has no permission model;
+  only content and mtime are preserved.
 - **The integration suite skips without `VAULTSYNC_TEST_S3_BUCKET`.** The S3
   tests compile always but skip at runtime with a `[skip]` note when the env
   var is unset, keeping `cargo test` green offline. Set it (plus optional
