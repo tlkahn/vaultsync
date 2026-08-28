@@ -1679,6 +1679,35 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cli_pull_delete_surfaces_cleanup_warning() {
+        // r2-M4 (W93): the dispatch loop must print executor report warnings
+        // to stderr (src/cli.rs:487). Pull --delete with the empty-dir
+        // cleanup failing (parent `a` locked 0o555, mirroring
+        // remove_empty_ancestor_dirs_reports_failures) must surface the
+        // cleanup warning on stderr. Passes on landing (the loop exists);
+        // its teeth are proven by deleting the loop and watching the test
+        // fail. Non-fatal: exit stays 0.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        std::fs::write(dir.join("a/b/gone.md"), "bye").unwrap();
+        let store = MemoryStore::new(); // empty remote: pull --delete plans DeleteLocal
+        // lock the parent `a` (read+traverse, no write) so the file delete
+        // works (write is on `a/b`) but remove_dir(a/b) fails EACCES
+        std::fs::set_permissions(dir.join("a"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let (code, _out, err) = run(Command::pull(dir.path().into(), true), &store);
+        // restore perms so TempDir drop can remove the tree
+        std::fs::set_permissions(dir.join("a"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(code, 0, "cleanup warning is non-fatal: {err}");
+        assert!(
+            err.contains("warning:")
+                && (err.contains("a/b") || err.contains("remove")),
+            "cleanup warning missing from stderr: {err}"
+        );
+    }
+
     #[test]
     fn run_push_executes_uploads_exit_0() {
         let dir = TempDir::new("vaultsync-cli-test");
