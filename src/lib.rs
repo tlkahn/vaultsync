@@ -42,7 +42,11 @@ pub fn build_plan(
     let collided = plan::case_collision_keys(&local_entities, &remote_entities);
     if !collided.is_empty() {
         for a in &mut p.actions {
-            if collided.contains(&a.key) {
+            // W31/N5: skip rows already diagnosed as a *path* collision - the
+            // type collision (file vs folder) is the more precise reason and
+            // folding an exact-case file/folder pair to the same value must
+            // not relabel it `case_collision`.
+            if collided.contains(&a.key) && a.reason != plan::reason::PATH_COLLISION {
                 a.kind = plan::ActionKind::Conflict;
                 a.reason = plan::reason::CASE_COLLISION;
             }
@@ -438,6 +442,46 @@ mod tests {
 
         assert_eq!(p.stats.upload, 1);
     }
+    #[test]
+    fn build_plan_exact_case_file_folder_keeps_path_collision() {
+        // W31/N5: a local file `notes` vs a remote folder `notes/` (identical
+        // case) is a *path* collision; the 4c case-collision override must NOT
+        // relabel it to `case_collision`. Only a true case *variant* (e.g.
+        // `Notes` vs `notes/`) is a case collision.
+        let dir = TempDir::new("vaultsync-lib-test");
+        std::fs::write(dir.join("notes"), "file-notes").unwrap();
+        let local = LocalFs::new(dir.path());
+        let store = StubStore {
+            listed: vec![
+                crate::entity::folder("notes"),
+                crate::entity::file("notes/x", 1, Some(1)),
+            ],
+        };
+        let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default()).unwrap();
+        let file_act = p
+            .actions
+            .iter()
+            .find(|a| a.key == "notes")
+            .expect("notes file");
+        assert_eq!(file_act.kind, ActionKind::Conflict);
+        assert_eq!(
+            file_act.reason, "path_collision",
+            "file row mislabeled: {}",
+            file_act.reason
+        );
+        let folder_act = p
+            .actions
+            .iter()
+            .find(|a| a.key == "notes/")
+            .expect("notes/");
+        assert_eq!(folder_act.kind, ActionKind::Conflict);
+        assert_eq!(
+            folder_act.reason, "path_collision",
+            "folder row mislabeled: {}",
+            folder_act.reason
+        );
+    }
+
     #[test]
     fn build_plan_case_collision_cross_side_conflicts() {
         // 4c: local `Note.md` vs remote `note.md` (different size/mtime) ->
