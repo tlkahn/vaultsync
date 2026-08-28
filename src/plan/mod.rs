@@ -111,6 +111,9 @@ pub(crate) mod reason {
     /// Case-only-collision reason, exported so `build_plan` and tests share the
     /// one constant (A-L6/B-nit-1, W17).
     pub const CASE_COLLISION: &str = "case_collision";
+    /// R4-M1/W38: a row from a followed *file* symlink, overridden to Skip in
+    /// mutating modes (--follow-symlinks is inventory-only in v1).
+    pub const FOLLOWED_SYMLINK: &str = "followed_symlink";
 }
 
 /// Classify one local/remote pair into a delta.

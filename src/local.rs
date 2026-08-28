@@ -48,6 +48,12 @@ pub struct WalkReport {
     /// Reserved vaultsync temp siblings (`.*.vaultsync-tmp-*`) skipped
     /// (W23/M1: a crash leftover is never surfaced as a real key).
     pub skipped_temp_files: u32,
+    /// Keys of followed *file* symlinks (R4-M1/W38). The planner uses this to
+    /// mark such rows `Skip(followed_symlink)` in mutating modes: the walker
+    /// follows them (inventory), but transfers refuse to open a symlink, so
+    /// Push/Pull must not plan them. `--follow-symlinks` is inventory-only in
+    /// v1. Dir-symlink children are NOT listed here - they transfer fine.
+    pub followed_files: std::collections::BTreeSet<String>,
     /// Human warnings (e.g. a followed symlink escaping the vault root).
     pub warnings: Vec<String>,
 }
@@ -661,6 +667,12 @@ fn handle_followed_symlink(
             return Ok(());
         }
         let key = path_to_key(rel)?;
+        // R4-M1/W38: record that this file key came from a followed *file*
+        // symlink. Transfers refuse to open a symlink, so the planner marks
+        // these rows Skip(followed_symlink) in mutating modes; `--follow-
+        // symlinks` is inventory-only in v1. Dir-symlink children are NOT
+        // recorded here (they transfer fine).
+        report.followed_files.insert(key.clone());
         if let Some(e) = file_entity(path, &key)? {
             out.push(e);
         }
@@ -1412,6 +1424,35 @@ mod tests {
         assert!(removed >= 3, "removed {removed}");
     }
     // --- Phase 2 Slice 9: symlink policy ---
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_follow_records_followed_file_keys() {
+        // R4-M1/W38: the walker reports exactly which file keys came from a
+        // followed *file* symlink. `--follow-symlinks` is inventory-only in v1:
+        // the planner needs this set to Skip those rows in mutating modes.
+        // Dir-symlink children and regular files are NOT in the set.
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::write(dir.join("real.md"), "r").unwrap();
+        std::fs::create_dir_all(dir.join("realdir")).unwrap();
+        std::fs::write(dir.join("realdir/child.md"), "c").unwrap();
+        std::os::unix::fs::symlink("real.md", dir.join("link.md")).unwrap();
+        std::os::unix::fs::symlink("realdir", dir.join("linkdir")).unwrap();
+        let fs = LocalFs::with_follow(dir.path(), true);
+        let (ents, report) = fs.list_report().unwrap();
+        let keys: Vec<String> = ents.iter().map(|e| e.key.clone()).collect();
+        assert!(keys.iter().any(|k| k == "link.md"), "followed file listed");
+        assert!(
+            keys.iter().any(|k| k == "linkdir/child.md"),
+            "dir child listed"
+        );
+        assert_eq!(
+            report.followed_files,
+            std::collections::BTreeSet::from(["link.md".to_string()]),
+            "followed-file set wrong: {:?}",
+            report.followed_files
+        );
+    }
 
     #[cfg(unix)]
     #[test]

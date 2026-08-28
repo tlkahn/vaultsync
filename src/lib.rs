@@ -30,7 +30,7 @@ pub fn build_plan(
     mode: Mode,
     opts: &PlanOpts,
 ) -> Result<Plan, Error> {
-    let local_entities = local.list()?;
+    let (local_entities, walk_report) = local.list_report()?;
     let remote_entities = store.list("")?;
     // R4-M2: drop a remote empty key (the exact-prefix folder marker stripped
     // to `""`) before validation. W34 removes it at the S3 backend source, but
@@ -57,6 +57,25 @@ pub fn build_plan(
             if collided.contains(&a.key) && a.reason != plan::reason::PATH_COLLISION {
                 a.kind = plan::ActionKind::Conflict;
                 a.reason = plan::reason::CASE_COLLISION;
+            }
+        }
+        p.stats = compute_stats(&p.actions);
+    }
+    // R4-M1/W38: --follow-symlinks is inventory-only in v1. In mutating
+    // modes, a row whose key came from a followed *file* symlink is overridden
+    // to Skip(followed_symlink) - the executor refuses to open a symlink, so
+    // Push/Pull must never plan a transfer for it. Status keeps the rows
+    // (inventory visible). Dir-symlink children are unaffected - they transfer
+    // fine. DeleteLocal rows are unchanged (remove_file unlinks the link).
+    if mode != Mode::Status && !walk_report.followed_files.is_empty() {
+        for a in &mut p.actions {
+            if matches!(
+                a.kind,
+                plan::ActionKind::Upload | plan::ActionKind::Download
+            ) && walk_report.followed_files.contains(&a.key)
+            {
+                a.kind = plan::ActionKind::Skip;
+                a.reason = plan::reason::FOLLOWED_SYMLINK;
             }
         }
         p.stats = compute_stats(&p.actions);
@@ -261,6 +280,89 @@ mod tests {
         fn delete(&self, key: &str) -> Result<(), Error> {
             Err(Error::NotFound(key.to_string()))
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_plan_push_skips_followed_symlink_files() {
+        // R4-M1/W38: push plans local_only rows for the vault above; the
+        // followed *file* symlink `link.md` must become Skip(followed_symlink)
+        // (transfers refuse to open a symlink), while `real.md` is a normal
+        // Upload and the dir-symlink child `linkdir/child.md` is a normal
+        // Upload (it transfers fine).
+        let dir = TempDir::new("vaultsync-lib-test");
+        std::fs::write(dir.join("real.md"), "r").unwrap();
+        std::fs::create_dir_all(dir.join("realdir")).unwrap();
+        std::fs::write(dir.join("realdir/child.md"), "c").unwrap();
+        std::os::unix::fs::symlink("real.md", dir.join("link.md")).unwrap();
+        std::os::unix::fs::symlink("realdir", dir.join("linkdir")).unwrap();
+        let local = LocalFs::with_follow(dir.path(), true);
+        let store = MemoryStore::new();
+        let p = build_plan(&local, &store, Mode::Push, &PlanOpts::default()).unwrap();
+        let link = p.actions.iter().find(|a| a.key == "link.md").unwrap();
+        assert_eq!(link.kind, ActionKind::Skip, "{:?}", link);
+        assert_eq!(link.reason, "followed_symlink");
+        let real = p.actions.iter().find(|a| a.key == "real.md").unwrap();
+        assert_eq!(real.kind, ActionKind::Upload, "{:?}", real);
+        let child = p
+            .actions
+            .iter()
+            .find(|a| a.key == "linkdir/child.md")
+            .unwrap();
+        assert_eq!(child.kind, ActionKind::Upload, "dir child must transfer");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_plan_pull_skips_followed_symlink_downloads() {
+        // R4-M1/W38: pull with a remote `link.md` newer than the followed
+        // local entity must plan Skip(followed_symlink), NOT a Download (the
+        // pull write through a symlink stays fail-closed in the executor).
+        let dir = TempDir::new("vaultsync-lib-test");
+        std::fs::write(dir.join("real.md"), "r").unwrap();
+        std::os::unix::fs::symlink("real.md", dir.join("link.md")).unwrap();
+        // pin the followed target's mtime so the remote is strictly newer
+        let base = 1_700_000_000_000u64;
+        {
+            let f = std::fs::File::open(dir.join("real.md")).unwrap();
+            let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis(base);
+            f.set_times(std::fs::FileTimes::new().set_modified(t))
+                .unwrap();
+        }
+        let local = LocalFs::with_follow(dir.path(), true);
+        let store = MemoryStore::new();
+        // remote link.md much newer than the target's (remote_newer -> Download)
+        put_str(&store, "link.md", "remote-new", base + 1_000_000);
+        put_str(&store, "real.md", "r", 1);
+        let p = build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let link = p
+            .actions
+            .iter()
+            .find(|a| a.key == "link.md")
+            .expect("link.md action");
+        assert_eq!(link.kind, ActionKind::Skip, "{:?}", link);
+        assert_eq!(link.reason, "followed_symlink");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_plan_status_keeps_followed_symlink_rows() {
+        // R4-M1/W38: --follow-symlinks is inventory-only in v1 - Status mode
+        // leaves followed-symlink rows un-overridden so inventory stays
+        // visible (here an Upload, since the remote lacks it).
+        let dir = TempDir::new("vaultsync-lib-test");
+        std::fs::write(dir.join("real.md"), "r").unwrap();
+        std::os::unix::fs::symlink("real.md", dir.join("link.md")).unwrap();
+        let local = LocalFs::with_follow(dir.path(), true);
+        let store = MemoryStore::new();
+        let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default()).unwrap();
+        let link = p.actions.iter().find(|a| a.key == "link.md").unwrap();
+        assert_eq!(
+            link.kind,
+            ActionKind::Upload,
+            "status must keep inventory row: {:?}",
+            link
+        );
     }
 
     #[test]

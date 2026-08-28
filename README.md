@@ -66,6 +66,12 @@ action a plan - or delete files - against a non-existent store).
   parsed but not yet applied: `push`/`pull`/`check` refuse loudly on a
   non-empty `[ignore].patterns` (`status` warns), and an explicitly-set
   `[transfer].concurrency` warns on every run until the pool exists.
+- **`--follow-symlinks` is inventory-only in v1.** The walker follows
+  symlinks and lists them, but push/pull plan any followed *file* symlink as
+  `Skip(followed_symlink)` (transfers refuse to open a symlink); only
+  `status` shows them as live inventory rows. Dir-symlink children transfer
+  normally; a `pull` write through a symlink destination stays refused (fail
+  closed).
 - **The integration suite skips without `VAULTSYNC_TEST_S3_BUCKET`.** The S3
   tests compile always but skip at runtime with a `[skip]` note when the env
   var is unset, keeping `cargo test` green offline. Set it (plus optional

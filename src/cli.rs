@@ -415,7 +415,7 @@ fn print_walk_warnings(local: &crate::local::LocalFs, follow: bool, err: &mut dy
     if rep.skipped_symlinks > 0 && !follow {
         let _ = writeln!(
             err,
-            "warning: skipped {} symlink(s); use --follow-symlinks to include",
+            "warning: skipped {} symlink(s); use --follow-symlinks to list them (status only; transfers skip followed symlinks in v1)",
             rep.skipped_symlinks
         );
     }
@@ -1163,6 +1163,29 @@ mod tests {
         fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
             self.inner.delete(key)
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walker_hint_does_not_promise_transfer_inclusion() {
+        // R4-M1/W38: the skipped-symlink hint must not promise that
+        // `--follow-symlinks` will include symlinks in transfers - follow is
+        // inventory-only in v1 (push/pull Skip followed file symlinks). The
+        // old text said "...to include".
+        let dir = TempDir::new("vaultsync-cli-test");
+        let outside = TempDir::new("vaultsync-cli-outside");
+        std::fs::write(outside.join("secret.txt"), "s").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), dir.join("link.txt")).unwrap();
+        let (code, _, err) = run(Command::status(dir.path().into()), &MemoryStore::new());
+        assert_eq!(code, 0);
+        assert!(
+            !err.contains("to include"),
+            "hint promises transfer inclusion: {err}"
+        );
+        assert!(
+            err.contains("followed symlinks") || err.contains("status only"),
+            "hint does not state inventory-only: {err}"
+        );
     }
 
     #[test]

@@ -171,6 +171,14 @@ that is a symlink removes that inode (exactly like `rm` on the link path).
 Default mode never plans through symlinks (they are skipped and counted), so
 this only applies when you explicitly opt in.
 
+`--follow-symlinks` is **inventory-only in v1**: the walker follows symlinks
+and lists them, but push/pull plan any followed *file* symlink as
+`Skip(followed_symlink)` (the executor refuses to open a symlink), so a vault
+containing a followed file symlink no longer fails a transfer. Only `status`
+shows followed-symlink rows as live inventory. Dir-symlink children transfer
+normally; a `pull` write through a symlink destination stays refused (fail
+closed).
+
 ## Output
 
 ### Human (default)

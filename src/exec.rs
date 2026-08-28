@@ -378,6 +378,35 @@ mod tests {
         assert_eq!(rep.executed, 1, "{:?}", rep);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn exec_push_followed_symlink_run_succeeds() {
+        // R4-M1/W38: pushing a vault containing a followed *file* symlink must
+        // succeed with no failed keys - the symlink row is planned Skip
+        // (followed_symlink) and never transferred - while the real file and
+        // the dir-symlink child upload normally.
+        let dir = TempDir::new("vaultsync-exec");
+        std::fs::write(dir.join("real.md"), "r").unwrap();
+        std::fs::create_dir_all(dir.join("realdir")).unwrap();
+        std::fs::write(dir.join("realdir/child.md"), "c").unwrap();
+        std::os::unix::fs::symlink("real.md", dir.join("link.md")).unwrap();
+        std::os::unix::fs::symlink("realdir", dir.join("linkdir")).unwrap();
+        let local = LocalFs::with_follow(dir.path(), true);
+        let store = MemoryStore::new();
+        let opts = PlanOpts::default();
+        let plan = crate::build_plan(&local, &store, Mode::Push, &opts).unwrap();
+        let link = plan.actions.iter().find(|a| a.key == "link.md").unwrap();
+        assert_eq!(link.kind, ActionKind::Skip, "link.md must be planned skip");
+        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Push, &opts);
+        assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep.failed);
+        assert!(
+            matches!(store.head("link.md").unwrap_err(), Error::NotFound(_)),
+            "followed symlink must not be uploaded"
+        );
+        assert!(store.head("real.md").is_ok(), "real.md uploaded");
+        assert!(store.head("linkdir/child.md").is_ok(), "dir child uploaded");
+    }
+
     #[test]
     fn exec_download_writes_file_and_mtime() {
         let dir = TempDir::new("vaultsync-exec");
