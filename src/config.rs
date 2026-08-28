@@ -215,11 +215,25 @@ fn resolve_store(store: Option<&StoreConfig>, env: &EnvSnapshot) -> Result<Store
             // (env/shared config/profile) decides (W7/B-M2; env-over-config
             // precedence locked by resolve_settings_env_overrides_config_region).
             let region = env.aws_region.clone().or_else(|| s.region.clone());
+            // W58/A nit: reject a configured prefix with an empty path
+            // segment ("a//b", "/a") loudly before normalize_prefix - such a
+            // prefix would produce keys `ensure_valid_key` rejects. A single
+            // trailing empty segment ("a/") is the normalized form and is
+            // allowed.
+            let prefix = s.prefix.as_deref().unwrap_or("");
+            let segments: Vec<&str> = prefix.split('/').collect();
+            for (i, seg) in segments.iter().enumerate() {
+                if seg.is_empty() && i + 1 != segments.len() {
+                    return Err(Error::Other(format!(
+                        "store.prefix contains an empty path segment: {prefix:?}"
+                    )));
+                }
+            }
             Ok(StoreSettings {
                 bucket,
                 region,
                 endpoint: s.endpoint.clone(),
-                prefix: normalize_prefix(s.prefix.as_deref().unwrap_or("")),
+                prefix: normalize_prefix(prefix),
                 path_style: s.path_style.unwrap_or(false),
             })
         }
@@ -447,6 +461,26 @@ mtime_tolerance_ms = 1000
             msg.contains("vault_rooot"),
             "unknown key not named in: {msg}"
         );
+    }
+
+    #[test]
+    fn config_prefix_with_empty_segment_rejected() {
+        // W58 (A nit): a `[store].prefix` containing an empty path segment
+        // ("a//b", "/a") is silently normalized today ("a//b/" - a prefix
+        // that would produce keys `ensure_valid_key` rejects). Reject it
+        // loudly at resolution, matching the key validator's taste. A
+        // trailing slash ("a/") is the normalized form and stays fine.
+        for bad in ["a//b", "/a"] {
+            let text = format!("[store]\nbucket = \"b\"\nprefix = \"{bad}\"\n");
+            let cfg = parse_config_str(&text).unwrap();
+            let err = settings(&cfg).unwrap_err();
+            let msg = format!("{err}");
+            assert!(msg.contains("prefix"), "prefix {bad:?}: {msg}");
+        }
+        // trailing slash is the normalized form - still accepted
+        let text = "[store]\nbucket = \"b\"\nprefix = \"a/\"\n";
+        let cfg = parse_config_str(text).unwrap();
+        assert_eq!(settings(&cfg).unwrap().store.prefix, "a/");
     }
 
     #[test]
