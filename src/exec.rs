@@ -101,7 +101,13 @@ pub fn execute_plan(
                 rep.executed += 1;
                 deleted_local = true;
             }
-            Err(Error::NotFound(_)) => rep.executed += 1,
+            Err(Error::NotFound(_)) => {
+                // W32: the goal state (file absent) is achieved, so count a
+                // no-op delete as reaching it and keep the empty-dir cleanup
+                // pass active.
+                rep.executed += 1;
+                deleted_local = true;
+            }
             Err(e) => fail(&mut rep, &a.key, e),
         }
     }
@@ -190,6 +196,12 @@ fn exec_download(
     // W13/B-L4: pull destination-freshness guard (symmetric to upload R3.3).
     // A destination that changed since the plan is NOT overwritten - the
     // user's newer edits survive; a vanished destination is recreated.
+    //
+    // N3: this is a check-then-act stat (std has no `renameat2(NOREPLACE)`/
+    // fd-exchange), so a writer that lands between the stat and the rename is
+    // still silently overwritten - documented limitation; the upload half (R3.3)
+    // re-checks the OPENED descriptor on the same fd, which this download path
+    // cannot (it renames a separate temp file).
     if let Some(planned) = &a.local {
         let freshness =
             local.destination_freshness(&a.key, planned.size, planned.mtime_ms, tolerance_ms);
@@ -400,6 +412,41 @@ mod tests {
             store.head("gone.md").unwrap_err(),
             Error::NotFound(_)
         ));
+    }
+
+    #[test]
+    fn exec_pull_delete_noop_still_cleans_empty_dirs() {
+        // W32: a pull --delete where the planned local deletes are already
+        // gone (NotFound) still achieves the goal state and still triggers the
+        // empty-dir cleanup pass for now-empty parents.
+        let dir = TempDir::new("vaultsync-exec");
+        std::fs::create_dir_all(dir.join("n/sub")).unwrap();
+        std::fs::write(dir.join("n/gone.md"), "x").unwrap();
+        std::fs::write(dir.join("n/sub/x.md"), "y").unwrap();
+        let store = MemoryStore::new();
+        let local = LocalFs::new(dir.path());
+        let opts = PlanOpts {
+            delete: true,
+            ..Default::default()
+        };
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts).unwrap();
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| { a.key == "n/gone.md" && a.kind == ActionKind::DeleteLocal })
+        );
+        // the files vanish before execution (pre-cleaned by another process)
+        std::fs::remove_file(dir.join("n/gone.md")).unwrap();
+        std::fs::remove_file(dir.join("n/sub/x.md")).unwrap();
+        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &opts);
+        assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
+        // both `sub` and `n` are now empty -> removed bottom-up even though
+        // every delete was a NotFound no-op
+        assert!(
+            !dir.join("n").exists(),
+            "empty n not cleaned after no-op deletes"
+        );
+        assert!(dir.exists());
     }
 
     #[test]

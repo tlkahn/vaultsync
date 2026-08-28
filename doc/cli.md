@@ -18,10 +18,6 @@ vaultsync [global flags] <command> [command flags]
 | `-y, --yes` | skip confirmation for destructive flags |
 | `--concurrency <n>` | transfer workers |
 
-Phase 1 note: the current hand-rolled parser accepts `--vault` / `--delete`
-only **after** the subcommand; the pre-command global-flag order shown above
-is the Phase 2 parser target (clap migration, N3).
-
 ## Commands
 
 ### `vaultsync status`
@@ -64,7 +60,8 @@ vaultsync push --dry-run
 
 ### `vaultsync check`
 
-Connectivity probe: head bucket or write/read/delete a tiny temp object under prefix then remove it.
+Connectivity probe: put/get/delete a tiny probe object under the prefix (no
+head-bucket fallback, by design).
 
 ```text
 vaultsync check

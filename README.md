@@ -40,7 +40,8 @@ cargo run -- pull --config <cfg>        # download remote-newer
 cargo run -- check --config <cfg>       # connectivity probe (put/get/delete)
 ```
 
-Without `--config`, `status` runs against an in-memory mock store (useful for
+With no `[store].bucket` after config resolution (including an auto-discovered
+`./.vaultsync.toml`), `status` runs against an in-memory mock store (useful for
 status/dry-run against a local dir); `push`/`pull`/`check` refuse loudly until
 a `[store]` section with a `bucket` is configured (they must never silently
 action a plan - or delete files - against a non-existent store).
