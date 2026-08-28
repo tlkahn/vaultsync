@@ -395,6 +395,60 @@ impl LocalFs {
         }
     }
 
+    /// Delete a single file only if it still matches the plan (R4-L1/W39,
+    /// symmetric to upload R3.3 / download W13): a `pull --delete` must not
+    /// remove a file on the plan's say-so alone. Re-stats the path (no-follow)
+    /// and refuses when it vanished (`NotFound`), became a symlink or a
+    /// non-regular file, or drifted in size / mtime beyond `tolerance_ms`.
+    pub fn delete_file_guarded(
+        &self,
+        key: &str,
+        expected_size: u64,
+        expected_mtime_ms: Option<u64>,
+        tolerance_ms: u64,
+    ) -> Result<(), Error> {
+        let path = key_to_local_path(&self.root, key)?;
+        let smd = match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::NotFound(key.to_string()));
+            }
+            Err(e) => return Err(e.into()),
+            Ok(md) => md,
+        };
+        // Never unlink a symlink the walk listed as a file (or a node the walk
+        // could not have produced): no-follow, fail closed.
+        if smd.file_type().is_symlink() {
+            return Err(Error::Other(format!(
+                "refusing to delete a symlink (was planned as a file): {}",
+                path.display()
+            )));
+        }
+        if !smd.is_file() {
+            return Err(Error::Other(format!(
+                "refusing to delete a non-regular file: {}",
+                path.display()
+            )));
+        }
+        if smd.len() != expected_size {
+            return Err(Error::Other(format!(
+                "local file changed since plan for {key}; not deleting"
+            )));
+        }
+        if let Some(expect_ms) = expected_mtime_ms {
+            if let Ok(mt) = smd.modified() {
+                if let Some(actual_ms) = system_time_to_ms(mt) {
+                    if actual_ms.abs_diff(expect_ms) > tolerance_ms {
+                        return Err(Error::Other(format!(
+                            "local file changed since plan for {key}; not deleting"
+                        )));
+                    }
+                }
+            }
+        }
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
     /// Remove now-empty directories bottom-up (R2.1 option a): children-first,
     /// stop at any non-empty dir, never remove the vault root. Returns how
     /// many directories were removed. Only touches dirs that are currently

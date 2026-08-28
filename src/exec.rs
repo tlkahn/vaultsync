@@ -96,7 +96,28 @@ pub fn execute_plan(
         .iter()
         .filter(|a| a.kind == ActionKind::DeleteLocal)
     {
-        match local.delete_file(&a.key) {
+        // R4-L1/W39: a `pull --delete` re-verifies local freshness before
+        // removing the file (symmetric to upload R3.3 / download W13). The
+        // planned local entity is the truth the walk recorded; `a.local` is
+        // always `Some` for DeleteLocal - a missing one is a per-key error,
+        // never an unguarded delete.
+        let Some(planned_local) = &a.local else {
+            fail(
+                &mut rep,
+                &a.key,
+                Error::Other(format!(
+                    "delete-local planned without local entity: {}",
+                    a.key
+                )),
+            );
+            continue;
+        };
+        match local.delete_file_guarded(
+            &a.key,
+            planned_local.size,
+            planned_local.mtime_ms,
+            opts.mtime_tolerance_ms,
+        ) {
             Ok(()) => {
                 rep.executed += 1;
                 deleted_local = true;
@@ -104,7 +125,8 @@ pub fn execute_plan(
             Err(Error::NotFound(_)) => {
                 // W32: the goal state (file absent) is achieved, so count a
                 // no-op delete as reaching it and keep the empty-dir cleanup
-                // pass active.
+                // pass active. (The guarded delete reports NotFound before any
+                // freshness check, matching the old delete_file contract.)
                 rep.executed += 1;
                 deleted_local = true;
             }
@@ -476,6 +498,64 @@ mod tests {
             "empty n not cleaned after no-op deletes"
         );
         assert!(dir.exists());
+    }
+
+    #[test]
+    fn exec_delete_local_refuses_drifted_file() {
+        // R4-L1/W39: `pull --delete` must re-verify local freshness before
+        // removing a file (symmetric to upload R3.3 / download W13). A file
+        // that changed size between plan and execute must fail the key with a
+        // "changed since plan" message and SURVIVE - not be silently deleted
+        // on the plan's say-so alone.
+        let dir = TempDir::new("vaultsync-exec");
+        std::fs::write(dir.join("gone.md"), "abc").unwrap();
+        let local = LocalFs::new(dir.path());
+        let store = MemoryStore::new();
+        let opts = PlanOpts {
+            delete: true,
+            ..Default::default()
+        };
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts).unwrap();
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| a.key == "gone.md" && a.kind == ActionKind::DeleteLocal)
+        );
+        // user edits the file after planning (size drift)
+        std::fs::write(dir.join("gone.md"), "abcdefghij").unwrap();
+        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &opts);
+        assert!(
+            rep.failed.iter().any(|fl| fl.key == "gone.md"),
+            "gone.md not failed: {:?}",
+            rep.failed
+        );
+        assert!(
+            rep.failed
+                .iter()
+                .any(|fl| fl.message.contains("changed since plan")),
+            "no changed-since-plan message: {:?}",
+            rep.failed
+        );
+        // the user's edited file survives with its new content
+        assert_eq!(std::fs::read(dir.join("gone.md")).unwrap(), b"abcdefghij");
+    }
+
+    #[test]
+    fn exec_delete_local_removes_unchanged_file() {
+        // R4-L1/W39: the guard must NOT regress the normal path - an unchanged
+        // file deletes cleanly and the empty-dir cleanup still runs.
+        let dir = TempDir::new("vaultsync-exec");
+        std::fs::write(dir.join("gone.md"), "bye").unwrap();
+        let local = LocalFs::new(dir.path());
+        let store = MemoryStore::new();
+        let opts = PlanOpts {
+            delete: true,
+            ..Default::default()
+        };
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts).unwrap();
+        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &opts);
+        assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
+        assert!(!dir.join("gone.md").exists());
     }
 
     #[test]
