@@ -95,9 +95,18 @@ pub fn check_store(store: &dyn ObjectStore) -> Result<(), Error> {
     Ok(())
 }
 
-/// The vault-relative probe key used by `check`.
+/// The vault-relative probe key used by `check`. Predictable names (pid-only)
+/// could clobber a user object; a per-process counter + sub-second nano
+/// component makes each probe key unique (W11/A-M7). The `.vaultsync-check-`
+/// prefix is documented as reserved (object-store.md, W19).
 pub fn probe_key() -> String {
-    format!(".vaultsync-check-{}", std::process::id())
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    format!(".vaultsync-check-{}-{}-{}", std::process::id(), n, nanos)
 }
 
 /// Format a plan as human-readable text (Phase 1 subset of [cli.md]).
@@ -465,6 +474,19 @@ mod tests {
         let k = probe_key();
         assert!(k.starts_with(".vaultsync-check-"));
         assert!(crate::entity::ensure_valid_key(&k).is_ok(), "invalid probe key {k:?}");
+    }
+
+    #[test]
+    fn probe_key_unique_and_valid() {
+        // W11/A-M7: consecutive probe keys differ (not pid-only, so they cannot
+        // clobber a user object), keep the reserved prefix, and stay valid.
+        let a = probe_key();
+        let b = probe_key();
+        assert_ne!(a, b, "probe keys must be unique");
+        for k in [&a, &b] {
+            assert!(k.starts_with(".vaultsync-check-"), "key {k:?}");
+            assert!(crate::entity::ensure_valid_key(k).is_ok(), "invalid probe key {k:?}");
+        }
     }
 
     #[test]
