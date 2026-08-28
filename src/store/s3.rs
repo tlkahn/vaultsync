@@ -307,11 +307,22 @@ fn classify_error(timeout: bool, status: Option<u16>, msg: &str) -> Error {
     match status {
         Some(404) => Error::NotFound(msg.to_string()),
         Some(401) | Some(403) => Error::Unauthorized(msg.to_string()),
+        // W65/A-L1: 408 (request timeout) is a transient retryable provider
+        // signal, classified with the timeout family.
+        Some(408) => Error::Timeout(msg.to_string()),
         // W9/A-M5/B-M4: 5xx and 429 (throttle) are transient provider
         // unavailability, not generic Other.
         Some(s) if s >= 500 || s == 429 => Error::Unavailable(msg.to_string()),
         _ => Error::Other(msg.to_string()),
     }
+}
+
+/// Classify a mid-body stream failure (W65/A-L1): a `try_next` error after a
+/// successful response header is transport-level by construction - the bytes
+/// stopped flowing, not a request rejection - so it is transient in the Phase
+/// 3 retry sense and must never surface as a generic `Other`.
+fn classify_body_err(msg: &str) -> Error {
+    Error::Unavailable(format!("get: connection lost mid-body: {msg}"))
 }
 
 /// True when the SDK error is a dispatch (connect/timeout) failure.
@@ -449,7 +460,7 @@ impl ObjectStore for S3Store {
             while let Some(chunk) = body
                 .try_next()
                 .await
-                .map_err(|e| Error::Other(format!("get: {e}")))?
+                .map_err(|e| classify_body_err(&format!("{e}")))?
             {
                 w.write_all(&chunk).map_err(Error::Io)?;
                 written += chunk.len() as u64;
@@ -818,6 +829,12 @@ mod tests {
             classify_error(false, Some(429), "x"),
             Error::Unavailable(_)
         ));
+        // W65/A-L1: 408 (request timeout) is a transient retryable provider
+        // signal, classified with the timeout family.
+        assert!(matches!(
+            classify_error(false, Some(408), "x"),
+            Error::Timeout(_)
+        ));
         assert!(matches!(
             classify_error(false, Some(599), "x"),
             Error::Unavailable(_)
@@ -827,6 +844,17 @@ mod tests {
             Error::Other(_)
         ));
         assert!(matches!(classify_error(false, None, "x"), Error::Other(_)));
+    }
+
+    #[test]
+    fn get_body_error_is_unavailable() {
+        // W65/A-L1: a mid-body stream failure happens after a successful
+        // response header, so it is transport-level by construction and
+        // transient in the Phase 3 retry sense - never a generic Other (the
+        // old mapping hid the transient nature from a retrying caller).
+        let e = classify_body_err("connection reset by peer");
+        assert!(matches!(e, Error::Unavailable(_)), "got {e:?}");
+        assert!(format!("{e}").contains("mid-body"));
     }
 
     #[test]
