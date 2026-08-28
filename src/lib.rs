@@ -437,6 +437,29 @@ mod tests {
 
 
     #[test]
+    fn build_plan_case_collision_file_vs_folder() {
+        // W4/A-H3: local file `Notes` vs remote folder `notes/` (case variant)
+        // -> both rows Conflict `case_collision` (was missed because the fold
+        // kept the trailing slash `notes/`).
+        let dir = TempDir::new("vaultsync-lib-test");
+        std::fs::write(dir.join("Notes"), "local").unwrap();
+        let local = LocalFs::new(dir.path());
+        let store = StubStore {
+            listed: vec![
+                crate::entity::folder("notes"),
+                crate::entity::file("notes/x", 1, Some(1)),
+            ],
+        };
+        let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default()).unwrap();
+        let notes = p.actions.iter().find(|a| a.key == "Notes").expect("Notes");
+        let notes_folder = p.actions.iter().find(|a| a.key == "notes/").expect("notes/");
+        assert_eq!(notes.kind, ActionKind::Conflict);
+        assert_eq!(notes.reason, "case_collision");
+        assert_eq!(notes_folder.kind, ActionKind::Conflict);
+        assert_eq!(notes_folder.reason, "case_collision");
+    }
+
+    #[test]
     fn check_probe_key_under_prefix() {
         // The probe key is a valid vault-relative key under a dot-prefix.
         let k = probe_key();

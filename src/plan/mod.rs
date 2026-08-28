@@ -340,14 +340,14 @@ pub fn case_collision_keys(
     let mut fold_map: HashMap<String, (BTreeSet<String>, BTreeSet<String>)> = HashMap::new();
     for e in local {
         fold_map
-            .entry(e.key.to_lowercase())
+            .entry(fold_key(&e.key))
             .or_default()
             .0
             .insert(e.key.clone());
     }
     for e in remote {
         fold_map
-            .entry(e.key.to_lowercase())
+            .entry(fold_key(&e.key))
             .or_default()
             .1
             .insert(e.key.clone());
@@ -366,6 +366,14 @@ pub fn case_collision_keys(
         }
     }
     collided
+}
+
+/// Normalized case-fold key for collision detection (A-H3): lowercase the
+/// key with a single trailing `/` stripped, so a file `Notes` and a folder
+/// `notes/` (case variant) fold to the same value. Keeps file-vs-file and
+/// folder-vs-folder distinctions intact elsewhere (`a` vs `a/` vs `a.md`).
+fn fold_key(key: &str) -> String {
+    key.strip_suffix('/').unwrap_or(key).to_lowercase()
 }
 
 
@@ -1116,6 +1124,36 @@ mod tests {
         let c = case_collision_keys(&local, &remote);
         assert!(c.contains("Note.md"), "c: {c:?}");
         assert!(c.contains("note.md"), "c: {c:?}");
+    }
+
+    #[test]
+    fn case_collision_file_vs_folder_case_variant() {
+        // W4/A-H3: a local file `Notes` and a remote folder `notes/` (+ child)
+        // differ only by case. Folding the full key misses it (`notes` vs
+        // `notes/`); a normalized fold (single trailing `/` stripped) catches
+        // it. Note `notes/x` is NOT flagged: on a case-sensitive FS a file
+        // `Notes` and a folder `notes/` with a child coexist fine (the parent
+        // folder `notes/` itself is the case-collision row).
+        let local = vec![file("Notes", 5, Some(1))];
+        let remote = vec![folder("notes"), file("notes/x", 1, Some(1))];
+        let c = case_collision_keys(&local, &remote);
+        assert!(c.contains("Notes"), "c: {c:?}");
+        assert!(c.contains("notes/"), "c: {c:?}");
+        assert!(!c.contains("notes/x"), "child not a case collision: {c:?}");
+    }
+
+    #[test]
+    fn case_collision_folder_vs_folder_case_variant() {
+        // W4/A-H3 same-side form: `Notes/` and `notes/` folders collide; a
+        // file/folder pair that folds to distinct names (`A/` vs `a.md`) must
+        // NOT collide.
+        let folders = vec![folder("Notes"), folder("notes")];
+        let c = case_collision_keys(&folders, &[]);
+        assert!(c.contains("Notes/"), "c: {c:?}");
+        assert!(c.contains("notes/"), "c: {c:?}");
+
+        let no = vec![folder("A"), file("a.md", 1, Some(1))];
+        assert!(case_collision_keys(&no, &[]).is_empty(), "folded distinct: {:?}", no);
     }
 
     #[test]
