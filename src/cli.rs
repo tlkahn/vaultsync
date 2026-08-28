@@ -14,7 +14,7 @@
 
 use std::ffi::OsString;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::builder::ArgAction;
 use clap::{Args, CommandFactory, Parser, Subcommand};
@@ -376,7 +376,51 @@ fn dispatch_plan_stub(
     }
 }
 
-/// Entry point used by `main`: args from env, mock store, real stdout/stderr.
+/// The `--vault` value clap reports when the user did not pass it (its
+/// default). Used as the "unset" sentinel so a config `vault_root` can win
+/// when no explicit `--vault` was given. Known limitation: an explicit
+/// `--vault .` is indistinguishable from the default (documented; Phase 3
+/// config polish may refine).
+const VAULT_UNSET: &str = ".";
+
+/// The explicit `--config` path carried by a command, if any.
+fn cmd_config_path(cmd: &Command) -> Option<&Path> {
+    match cmd {
+        Command::Status { config, .. }
+        | Command::Push { config, .. }
+        | Command::Pull { config, .. }
+        | Command::Check { config, .. } => config.as_deref(),
+        Command::Version | Command::Help => None,
+    }
+}
+
+/// Replace `Command.vault` with the resolved config vault root when the clap
+/// `--vault` was left at its unset sentinel (see [`VAULT_UNSET`]).
+fn resolve_vault_from_config(cmd: Command, settings: &crate::config::Settings) -> Command {
+    let want = settings.vault_root.clone();
+    if want == PathBuf::from(VAULT_UNSET) {
+        return cmd;
+    }
+    match cmd {
+        Command::Status { vault, json, config, verbose } if vault == PathBuf::from(VAULT_UNSET) => {
+            Command::Status { vault: want, json, config, verbose }
+        }
+        Command::Push { vault, delete, dry_run, force_local, force_remote, json, config, verbose }
+            if vault == PathBuf::from(VAULT_UNSET) =>
+        {
+            Command::Push { vault: want, delete, dry_run, force_local, force_remote, json, config, verbose }
+        }
+        Command::Pull { vault, delete, dry_run, force_local, force_remote, json, config, verbose }
+            if vault == PathBuf::from(VAULT_UNSET) =>
+        {
+            Command::Pull { vault: want, delete, dry_run, force_local, force_remote, json, config, verbose }
+        }
+        other => other,
+    }
+}
+
+/// Entry point used by `main`: args from env, config load, mock store, real
+/// stdout/stderr. (The store becomes config-driven in Slice 6/7; still mock.)
 pub fn run_from_env() -> i32 {
     let args: Vec<OsString> = std::env::args_os().collect();
     let args = match os_args_to_strings(args) {
@@ -388,18 +432,52 @@ pub fn run_from_env() -> i32 {
             return 1;
         }
     };
-    let store = MemoryStore::new();
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
     let mut out = stdout.lock();
     let mut err = stderr.lock();
-    match parse_args(&args) {
-        Ok(cmd) => run_with_io(cmd, &store, &mut out, &mut err),
+
+    let cmd = match parse_args(&args) {
+        Ok(c) => c,
         Err(msg) => {
             let _ = writeln!(err, "{msg}");
-            1
+            return 1;
         }
+    };
+
+    // help/version need no config and must not fail on a bad config file.
+    if matches!(cmd, Command::Help | Command::Version) {
+        return run_with_io(cmd, &MemoryStore::new(), &mut out, &mut err);
     }
+
+    // Load + resolve config, then merge the config vault_root into the command.
+    let explicit = cmd_config_path(&cmd).map(Path::to_path_buf);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from(VAULT_UNSET));
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let search = crate::config::default_search_paths(&cwd, home.as_deref());
+    let settings = {
+        let cfg = match crate::config::load_config(explicit.as_deref(), &search) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = writeln!(err, "error: {e}");
+                return 1;
+            }
+        };
+        let envsnap = crate::config::EnvSnapshot {
+            aws_region: std::env::var("AWS_REGION").ok(),
+        };
+        match crate::config::resolve_settings(&cfg, &crate::config::Cli::default(), &envsnap) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = writeln!(err, "error: {e}");
+                return 1;
+            }
+        }
+    };
+    let cmd = resolve_vault_from_config(cmd, &settings);
+
+    let store = MemoryStore::new();
+    run_with_io(cmd, &store, &mut out, &mut err)
 }
 
 #[cfg(test)]
