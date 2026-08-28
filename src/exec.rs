@@ -258,6 +258,53 @@ fn check_destination(
     Ok(())
 }
 
+/// Bounds the bytes a store's `get_to` may write into a download temp at the
+/// planned size (W106/M1): a remote object replaced between `list` and `get`
+/// (or a misbehaving S3-compatible endpoint) with a larger body is refused
+/// mid-stream, before the extra bytes reach disk. `write` past `remaining`
+/// errors with `WriteZero` naming the key and the planned size; the
+/// executor's post-stream on-disk truth-check (A-H1/B-L3) is kept as
+/// belt-and-braces and now also catches a store that ignores the writer
+/// error shape. Executor-internal: no `ObjectStore` trait change.
+struct CappedWriter<'a> {
+    inner: &'a mut dyn std::io::Write,
+    remaining: u64,
+    key: &'a str,
+    planned: u64,
+}
+
+impl<'a> CappedWriter<'a> {
+    fn new(inner: &'a mut dyn std::io::Write, key: &'a str, planned: u64) -> Self {
+        CappedWriter {
+            inner,
+            remaining: planned,
+            key,
+            planned,
+        }
+    }
+}
+
+impl std::io::Write for CappedWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                format!(
+                    "download body for {} exceeds the planned size {}",
+                    self.key, self.planned
+                ),
+            ));
+        }
+        let n = buf.len().min(self.remaining as usize);
+        let written = self.inner.write(&buf[..n])?;
+        self.remaining -= written as u64;
+        Ok(written)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Download one key into an atomic temp + rename, applying the remote mtime
 /// from the `get_to` metadata (which carries the client `vaultsync-mtime`, not
 /// the list's LastModified).
@@ -267,6 +314,12 @@ fn exec_download(
     a: &crate::plan::Action,
     tolerance_ms: u64,
 ) -> Result<(), Error> {
+    // W106/M1: a Download row must carry the remote entity the plan recorded
+    // - the mid-stream cap's planned-size bound is derived from it (fail
+    // closed like exec_upload does for `a.local`).
+    let remote_ent = a.remote.as_ref().ok_or_else(|| {
+        Error::Other(format!("download planned without remote entity: {}", a.key))
+    })?;
     // W68/A-L4: pre-download destination checks - fail fast before the
     // (potentially multi-hundred-MB) body streams. The post-body check below
     // stays: it owns the plan-to-rename race window (N3). Pure earlier-fail
@@ -281,14 +334,23 @@ fn exec_download(
     // the bottom-up pass reaches them.
     let result = (|| -> Result<(), Error> {
         let remote_mtime = {
-            let remote = store.get_to(&a.key, &mut f)?;
+            // W106/M1: cap the stream at the planned size (the upload side
+            // has the symmetric bound - open_verified size + put_from reads
+            // exactly `size`; the download side had none). A remote object
+            // replaced between `list` and `get` with a larger body is
+            // refused mid-stream, before the extra bytes reach disk.
+            let mut capped = CappedWriter::new(&mut f, &a.key, remote_ent.size);
+            let remote = store.get_to(&a.key, &mut capped)?;
             // A-H1/B-L3: truth-check the bytes actually on disk (not just the
             // backend's declared size or the planned remote entity). A backend
             // that truncates the body while returning a clean EOF is caught
             // here and the key fails closed; the tmp is removed on the error
-            // path below (belt-and-braces over the store-side count in get_to).
+            // path below (belt-and-braces over the store-side count in get_to
+            // and over the W106 cap - a store that ignores the writer error
+            // shape cannot grow the file past the cap, and a short body still
+            // fails here).
             let on_disk = std::fs::metadata(&tmp)?.len();
-            let expected = a.remote.as_ref().map(|r| r.size).unwrap_or(remote.size);
+            let expected = remote_ent.size;
             if on_disk != remote.size || remote.size != expected {
                 return Err(Error::Other(format!(
                     "download size mismatch for {} (expected {expected}, got {on_disk})",
@@ -1154,6 +1216,145 @@ mod tests {
         // other keys still download
         assert!(dir.join("ok.md").exists());
         assert_eq!(rep.executed, 1, "{:?}", rep);
+    }
+
+    /// A store whose `get_to` streams 64 KiB chunks in a loop until the writer
+    /// errors - the W106/M1 oversized-body scenario (a remote object replaced
+    /// between `list` and `get`, or a misbehaving S3-compatible endpoint, with
+    /// a far larger body than the plan recorded). Records how many chunk
+    /// writes were attempted so the test can prove the stream stopped at the
+    /// planned-size cap instead of running to the end of the body.
+    struct OversizedBodyStore {
+        inner: MemoryStore,
+        bad_key: String,
+        writes_attempted: Mutex<u32>,
+    }
+    impl OversizedBodyStore {
+        fn new(inner: MemoryStore, bad_key: &str) -> Self {
+            OversizedBodyStore {
+                inner,
+                bad_key: bad_key.to_string(),
+                writes_attempted: Mutex::new(0),
+            }
+        }
+        fn writes_attempted(&self) -> u32 {
+            *self.writes_attempted.lock().unwrap()
+        }
+    }
+    impl ObjectStore for OversizedBodyStore {
+        fn list(&self, prefix: &str) -> Result<Listing, Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<Entity, Error> {
+            self.inner.head(key)
+        }
+        fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            if key == self.bad_key {
+                // key exists in the inner store (declares the planned size)
+                let _ = self.inner.head(key)?;
+                let chunk = vec![0u8; 64 * 1024];
+                loop {
+                    *self.writes_attempted.lock().unwrap() += 1;
+                    if let Err(e) = w.write_all(&chunk) {
+                        // the capped writer refused the excess bytes
+                        return Err(Error::Io(e));
+                    }
+                }
+            }
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime: Option<u64>,
+        ) -> Result<Entity, Error> {
+            self.inner.put_from(key, r, size, mtime)
+        }
+        fn delete(&self, key: &str) -> Result<(), Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    #[test]
+    fn exec_download_body_beyond_planned_size_fails_early() {
+        // W106/M1: a remote object whose body exceeds the planned size (the
+        // upload side has the symmetric bound - open_verified size + put_from
+        // reads exactly `size`; the download side had none) must be refused
+        // MID-STREAM at the planned-size cap: the extra bytes never reach
+        // disk, the key fails with a message naming the planned size, and the
+        // stream stops at the cap (one chunk write) rather than after the
+        // full body. Fails today: get_to streams the whole body to the temp
+        // before any size check, so the file is written in full.
+        let dir = TempDir::new("vaultsync-exec");
+        let store = MemoryStore::new();
+        put_str(&store, "big.md", "12345", Some(100)); // planned size 5
+        put_str(&store, "ok.md", "fine", Some(200));
+        let wrapper = OversizedBodyStore::new(store, "big.md");
+        let local = LocalFs::new(dir.path());
+        let plan = crate::build_plan(&local, &wrapper, Mode::Pull, &PlanOpts::default())
+            .unwrap()
+            .plan;
+        let rep =
+            crate::exec::execute_plan(&local, &wrapper, &plan, Mode::Pull, &PlanOpts::default());
+        assert!(
+            rep.failed.iter().any(|fl| fl.key == "big.md"),
+            "big.md not failed: {:?}",
+            rep.failed
+        );
+        assert!(
+            rep.failed
+                .iter()
+                .any(|fl| fl.message.contains("exceeds the planned size")),
+            "no planned-size refusal: {:?}",
+            rep.failed
+        );
+        assert!(!dir.join("big.md").exists(), "oversized body finalized");
+        assert_no_tmp_leftovers(dir.path());
+        // the stream stopped at the cap: only one chunk write was attempted
+        assert_eq!(
+            wrapper.writes_attempted(),
+            1,
+            "stream ran past the planned-size cap"
+        );
+        // other keys still download (isolation)
+        assert!(dir.join("ok.md").exists());
+        assert_eq!(rep.executed, 1, "{:?}", rep);
+    }
+
+    #[test]
+    fn exec_download_requires_remote_entity() {
+        // W106/M1: the mid-stream cap is derived from the planned remote
+        // entity's size, so a Download row without one must fail closed
+        // (mirrors the upload guard in exec_upload). Compile-locks the
+        // `a.remote` requirement the cap depends on.
+        let dir = TempDir::new("vaultsync-exec");
+        let local = LocalFs::new(dir.path());
+        let store = MemoryStore::new();
+        let plan = crate::plan::Plan {
+            actions: vec![crate::plan::Action {
+                key: "a.md".to_string(),
+                kind: ActionKind::Download,
+                reason: "remote_only",
+                local: None,
+                remote: None,
+            }],
+            stats: crate::plan::PlanStats::default(),
+        };
+        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+        assert!(
+            rep.failed.iter().any(|fl| {
+                fl.key == "a.md"
+                    && fl
+                        .message
+                        .contains("download planned without remote entity")
+            }),
+            "{:?}",
+            rep.failed
+        );
+        assert_eq!(rep.executed, 0, "{:?}", rep);
+        assert_no_tmp_leftovers(dir.path());
     }
 
     #[test]

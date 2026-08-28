@@ -86,6 +86,9 @@ action a plan - or delete files - against a non-existent store).
   same bytes twice; pull writes both keys). The walk warns on every such
   alias; both copies are still listed and synced (dedup would make the
   surviving key set depend on directory enumeration order).
+- **Downloads are capped at their planned size.** A remote object that grew
+  (or was replaced) after the plan is refused mid-stream: a download that
+  exceeds its planned size errors before the extra bytes are written to disk.
 - **Pull overwrite resets permission bits.** A download writes a fresh temp
   file (`0666 & umask`) and renames it over the destination, so a
   previously-`0600` local note returns as `0644`. v1 has no permission model;

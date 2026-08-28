@@ -208,7 +208,10 @@ swapped in the window between the stat and the unlink is still removed - the
 same residual class as the download note; fd-based delete is a post-v1 item
 (A-L3). After the deletes, the empty-dir post-pass is scoped to the ancestor
 chains of the files deleted this run (deepest-first, never the vault root):
-pre-existing, plan-unrelated empty dirs are kept (W77).
+pre-existing, plan-unrelated empty dirs are kept (W77). Downloads are
+additionally capped mid-stream at the size the plan recorded (W106): a
+remote object that exceeds its planned size is refused before the extra
+bytes are written to disk.
 
 **Planner identity is codepoint-exact (no NFC fold).** APFS folds NFD/NFC (a
 note named in decomposed form appears under its composed name), while S3
