@@ -44,7 +44,7 @@ pub fn build_plan(
         for a in &mut p.actions {
             if collided.contains(&a.key) {
                 a.kind = plan::ActionKind::Conflict;
-                a.reason = "case_collision";
+                a.reason = plan::reason::CASE_COLLISION;
             }
         }
         p.stats = compute_stats(&p.actions);

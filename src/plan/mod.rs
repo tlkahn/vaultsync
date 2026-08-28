@@ -95,7 +95,7 @@ enum Delta {
 }
 
 /// Reason strings stable enough for tests and human output.
-mod reason {
+pub(crate) mod reason {
     pub const EQUAL: &str = "equal";
     pub const LOCAL_ONLY: &str = "local_only";
     pub const REMOTE_ONLY: &str = "remote_only";
@@ -108,6 +108,9 @@ mod reason {
     pub const FOLDER: &str = "folder";
     pub const FORCE_LOCAL: &str = "force_local";
     pub const FORCE_REMOTE: &str = "force_remote";
+    /// Case-only-collision reason, exported so `build_plan` and tests share the
+    /// one constant (A-L6/B-nit-1, W17).
+    pub const CASE_COLLISION: &str = "case_collision";
 }
 
 /// Classify one local/remote pair into a delta.
