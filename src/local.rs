@@ -290,6 +290,20 @@ impl LocalFs {
 
     /// Commit a temp file written by a download to its final path, applying
     /// the remote mtime (atomic rename; temp removed on failure).
+    ///
+    /// Durability level (r10-L3/W89): file bytes synced before the rename
+    /// (W48) + parent dirent synced post-commit on unix (via
+    /// [`LocalFs::commit_temp`]); non-unix has no dir fsync in std and the
+    /// gap is a documented decision, not an accident.
+    ///
+    /// r2-L2 decline rationale (recorded): the temp file is re-opened by
+    /// path here after the executor's writer handle is dropped, deliberately.
+    /// Passing an open handle into `finalize_write` would couple the
+    /// executor's writer lifetime to the locality re-check/rename tail for
+    /// one saved open+close per file, and `finalize_write` also needs the
+    /// path (not just the fd) for the temp-cleanup and rename tails. The
+    /// re-open window is provably harmless (unique temp name, `create_new`
+    /// allocation, owner-only file).
     pub fn finalize_write(
         &self,
         key: &str,
@@ -557,6 +571,11 @@ impl LocalFs {
     /// unguarded API's contract). Leaf-swap residuals are unchanged (the
     /// entry checks already close the walk-to-stat window; the stat-to-
     /// unlink leaf window remains, fd-based delete is post-v1).
+    ///
+    /// Durability level (r10-L3/W89): after a successful `remove_file`, the
+    /// parent directory is fsynced best-effort on unix so the dirent removal
+    /// survives a crash/power loss; non-unix platforms have no dir fsync in
+    /// std and the gap is a documented decision, not an accident.
     fn unlink_local_file(&self, parent: &Path, path: &Path, key: &str) -> Result<(), Error> {
         // W76/r8b M1: fire the test-only pre-unlink hook (if any) so tests
         // can inject the stat-to-unlink race through production APIs.
@@ -568,7 +587,13 @@ impl LocalFs {
                 Err(Error::NotFound(key.to_string()))
             }
             Err(e) => Err(e.into()),
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // r10-L3/W89: the unlink is committed; fsync the parent
+                // best-effort so the dirent update is durable (never surfaced
+                // as an op failure - the goal state is already achieved).
+                let _ = fsync_parent_dir(parent);
+                Ok(())
+            }
         }
     }
 
@@ -688,6 +713,12 @@ impl LocalFs {
     /// atomic rename (W6/M5) and remove the temp sibling on any failure
     /// (W15/A-L2). Keeping both write paths on one helper prevents them from
     /// drifting (W27/M5).
+    ///
+    /// Durability level (r10-L3/W89): the temp file's bytes are synced
+    /// before the rename (W48), and after a successful rename the parent
+    /// directory is fsynced best-effort on unix so the dirent update
+    /// survives a crash/power loss; non-unix platforms have no dir fsync in
+    /// std and the gap is a documented decision, not an accident.
     fn commit_temp(&self, parent: &Path, tmp: &Path, final_path: &Path) -> Result<(), Error> {
         if let Err(e) = self.ensure_locality(parent) {
             let _ = std::fs::remove_file(tmp);
@@ -697,6 +728,11 @@ impl LocalFs {
             let _ = std::fs::remove_file(tmp);
             return Err(e.into());
         }
+        // r10-L3/W89: the rename is committed; fsync the parent best-effort
+        // so the dirent update is durable (never surfaced as an op failure -
+        // the file is already at its final path, and a reported failure would
+        // invite a misleading retry).
+        let _ = fsync_parent_dir(parent);
         Ok(())
     }
 }
@@ -725,6 +761,37 @@ fn run_pre_unlink_hook() {
             f();
         }
     });
+}
+
+// r10-L3/W89: durability counter bumped by [`fsync_parent_dir`] (cfg(test),
+// unix) so tests can assert the seam actually fires on the production
+// commit/delete tails - the W76 pre-unlink-hook pattern, so a future drift
+// (a commit/delete tail that skips the fsync) fails loudly instead of
+// silently skipping.
+#[cfg(all(test, unix))]
+thread_local! {
+    static FSYNC_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// fsync a directory so a rename/unlink's dirent update is durable
+/// (r10-L3/W89). Callers invoke it best-effort AFTER the rename/unlink
+/// already succeeded: the operation is committed, so an fsync failure is
+/// never surfaced as an op failure (that would invite a misleading retry of
+/// an already-done rename/unlink). Std-only on unix (`File::open(parent)` +
+/// `sync_all`); a documented no-op on non-unix (see the `commit_temp` /
+/// `unlink_local_file` doc comments for the durability level statement).
+fn fsync_parent_dir(parent: &Path) -> std::io::Result<()> {
+    #[cfg(all(test, unix))]
+    FSYNC_COUNT.with(|c| c.set(c.get() + 1));
+    #[cfg(unix)]
+    {
+        std::fs::File::open(parent)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        Ok(())
+    }
 }
 
 /// Install a pre-unlink hook for the current test thread; the returned guard
@@ -1793,6 +1860,43 @@ mod tests {
         assert!(
             !outside.join("a.md").exists(),
             "renamed through the swapped parent into outside"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fsync_parent_dir_ok_on_real_dir() {
+        // r10-L3 (W89): the durability seam itself must succeed on a real
+        // directory (File::open + sync_all on the dir). RED: the helper does
+        // not exist (compile failure).
+        let dir = TempDir::new("vaultsync-test");
+        fsync_parent_dir(dir.path()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_and_delete_fsync_parent_dir() {
+        // r10-L3 (W89) durability lock: after `finalize_write` (rename) and
+        // after `delete_file_guarded` (unlink), the containing directory must
+        // have been fsynced - a crash/power loss after a "successful" pull
+        // could otherwise lose the dirent update (file bytes are synced
+        // pre-rename, W48, but the dirent is not). The counter lives on the
+        // fsync seam itself (the W76 pre-unlink-hook pattern), so a future
+        // drift - a commit/delete tail that skips the fsync - fails this test
+        // loudly instead of silently skipping it. RED: FSYNC_COUNT /
+        // fsync_parent_dir unknown (compile failure).
+        let dir = TempDir::new("vaultsync-test");
+        let fs = LocalFs::new(dir.path());
+        // finalize_write path: temp sibling + rename commit
+        let (tmp, mut f) = alloc_temp_sibling(&dir.join("a.md")).unwrap();
+        std::io::Write::write_all(&mut f, b"x").unwrap();
+        fs.finalize_write("a.md", &tmp, None).unwrap();
+        // delete_file_guarded path: guarded unlink
+        fs.delete_file_guarded("a.md", 1, None, 1000).unwrap();
+        let count = FSYNC_COUNT.with(|c| c.get());
+        assert!(
+            count >= 2,
+            "expected >= 2 parent-dir fsyncs (commit + unlink), got {count}"
         );
     }
 
