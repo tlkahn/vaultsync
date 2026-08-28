@@ -306,17 +306,29 @@ impl ObjectStore for S3Store {
             let meta = resp.metadata();
             let meta_val = meta.and_then(|m| m.get(MTIME_KEY).map(String::as_str));
             let last = resp.last_modified().and_then(dt_millis);
+            let content_len = resp.content_length();
+            let size = content_len.unwrap_or(0) as u64;
             let mtime = decode_mtime(meta_val, last);
             let etag = resp.e_tag().map(|s| s.to_string());
-            let size = resp.content_length().unwrap_or(0) as u64;
+            // A-H1/B-L3: count bytes actually written while streaming. A
+            // clean-EOF truncated body with a correct Content-Length must be
+            // rejected, not silently finalized (fail closed). Only enforced
+            // when Content-Length is reported.
+            let mut written: u64 = 0;
             let mut body = resp.body;
             while let Some(chunk) = body
                 .try_next()
                 .await
-                .map_err(|e| Error::Other(format!("get: {e:?}")))?
+                .map_err(|e| Error::Other(format!("get: {e}")))?
             {
                 w.write_all(&chunk)
                     .map_err(|e| Error::Io(e))?;
+                written += chunk.len() as u64;
+            }
+            if content_len.is_some() && written != size {
+                return Err(Error::Other(format!(
+                    "get: truncated body for {rel} (expected {size}, got {written})"
+                )));
             }
             Ok::<Entity, Error>(Entity {
                 key: rel,

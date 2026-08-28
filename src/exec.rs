@@ -110,15 +110,18 @@ fn exec_download(local: &LocalFs, store: &dyn ObjectStore, a: &crate::plan::Acti
             let mut f = std::fs::File::create(&tmp)?;
             let remote = store.get_to(&a.key, &mut f)?;
             f.sync_all()?;
-            // Truth-check the downloaded size against the planned remote entity
-            // (a vanished/changed object mid-run should not silently truncate).
-            if let Some(planned) = &a.remote {
-                if planned.size != remote.size {
-                    return Err(Error::Other(format!(
-                        "download size mismatch for {} (expected {}, got {})",
-                        a.key, planned.size, remote.size
-                    )));
-                }
+            // A-H1/B-L3: truth-check the bytes actually on disk (not just the
+            // backend's declared size or the planned remote entity). A backend
+            // that truncates the body while returning a clean EOF is caught
+            // here and the key fails closed; the tmp is removed on the error
+            // path below (belt-and-braces over the store-side count in get_to).
+            let on_disk = std::fs::metadata(&tmp)?.len();
+            let expected = a.remote.as_ref().map(|r| r.size).unwrap_or(remote.size);
+            if on_disk != remote.size || remote.size != expected {
+                return Err(Error::Other(format!(
+                    "download size mismatch for {} (expected {expected}, got {on_disk})",
+                    a.key
+                )));
             }
             remote.mtime_ms
         };
@@ -414,6 +417,85 @@ mod tests {
         // the stable key still uploads (isolation).
         assert!(store.head("ok.md").is_ok());
         assert_eq!(rep.executed, 1, "only ok.md executed");
+    }
+
+    /// A store whose `get_to` writes fewer bytes than the entity's declared
+    /// size (clean EOF, correct header) - the A-H1/B-L3 short-body scenario.
+    struct ShortBodyStore {
+        inner: MemoryStore,
+        bad_key: String,
+    }
+    impl ObjectStore for ShortBodyStore {
+        fn list(&self, prefix: &str) -> Result<Vec<Entity>, Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<Entity, Error> {
+            self.inner.head(key)
+        }
+        fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            if key == self.bad_key {
+                let mut buf = Vec::new();
+                let ent = self.inner.get_to(key, &mut buf)?;
+                let n = (buf.len() / 2).max(1);
+                w.write_all(&buf[..n]).map_err(Error::Io)?;
+                // declare the FULL size (clean EOF, header size unchanged)
+                return Ok(Entity {
+                    size: buf.len() as u64,
+                    ..ent
+                });
+            }
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime: Option<u64>,
+        ) -> Result<Entity, Error> {
+            self.inner.put_from(key, r, size, mtime)
+        }
+        fn delete(&self, key: &str) -> Result<(), Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    #[test]
+    fn exec_download_short_body_fails_key() {
+        // A-H1/B-L3: a clean-EOF truncated download must fail the key, leave no
+        // file at the final path, leave no temp sibling, and not block other
+        // keys. Today (only the header size checked) the truncated file is
+        // finalized as success.
+        let dir = TempDir::new("vaultsync-exec");
+        let store = MemoryStore::new();
+        put_str(&store, "bad.md", "full-body-bytes-here", Some(100));
+        put_str(&store, "ok.md", "fine", Some(200));
+        let wrapper = ShortBodyStore {
+            inner: store,
+            bad_key: "bad.md".to_string(),
+        };
+        let local = LocalFs::new(dir.path());
+        let plan = crate::build_plan(&local, &wrapper, Mode::Pull, &PlanOpts::default()).unwrap();
+        let rep =
+            crate::exec::execute_plan(&local, &wrapper, &plan, Mode::Pull, &PlanOpts::default());
+        assert!(
+            rep.failed.iter().any(|fl| fl.key == "bad.md"),
+            "bad.md not failed: {:?}",
+            rep.failed
+        );
+        assert!(!dir.join("bad.md").exists(), "truncated file finalized");
+        let leftover: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                !e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                    && e.file_name().to_string_lossy().contains("vaultsync-tmp")
+            })
+            .collect();
+        assert!(leftover.is_empty(), "temp siblings leaked: {leftover:?}");
+        // other keys still download
+        assert!(dir.join("ok.md").exists());
+        assert_eq!(rep.executed, 1, "{:?}", rep);
     }
 
     #[test]
