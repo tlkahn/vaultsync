@@ -90,10 +90,15 @@ where
 
 /// [`with_store`] with a non-default `[transfer].concurrency` (issue 20 cycle
 /// 9: integration coverage for the parallel pool against real S3).
+///
+/// TEMP [17] (issue #17 Phase 0, removed before merge): phase-timing logs to
+/// stderr, labeled `[17]`, so the live paginate diagnosis can attribute wall
+/// clock to body list / cleanup list / cleanup deletes without guessing.
 fn with_store_conc<F>(name: &str, concurrency: u32, f: F)
 where
     F: FnOnce(&S3Store) -> Result<(), String>,
 {
+    let t_total = std::time::Instant::now();
     let bucket = match bucket_or_skip(
         std::env::var("VAULTSYNC_TEST_S3_BUCKET").ok(),
         require_mode(),
@@ -116,6 +121,10 @@ where
         .unwrap_or(false);
     let base = std::env::var("VAULTSYNC_TEST_S3_PREFIX").unwrap_or_default();
     let prefix = format!("{base}vaultsync-itest-{}-{name}/", unique_num());
+    eprintln!(
+        "[17] {name}: entry concurrency={concurrency} prefix={prefix} bucket={bucket} region={region} endpoint={:?} path_style={path_style}",
+        endpoint
+    );
 
     let settings = StoreSettings {
         bucket: bucket.clone(),
@@ -132,8 +141,18 @@ where
             panic!("{name}: failed to build store against {bucket}: {e}");
         }
     };
+    eprintln!(
+        "[17] {name}: store_ready_ms={}",
+        t_total.elapsed().as_millis()
+    );
 
+    let t_body = std::time::Instant::now();
     let result = f(&store);
+    eprintln!(
+        "[17] {name}: body_ms={} body_ok={}",
+        t_body.elapsed().as_millis(),
+        result.is_ok()
+    );
 
     // Cleanup: list + delete everything (files only; folders are views).
     // L12 (W104): a failed cleanup must be reported on stderr, never silently
@@ -141,24 +160,50 @@ where
     // re-encounters them under a fresh unique prefix, but the bucket slowly
     // fills). Reporting never fails the test outcome; the harness already
     // eprintln!s its skip path, so this matches the file's convention.
+    let t_clean = std::time::Instant::now();
     match store.list("") {
         Ok(listing) => {
+            eprintln!(
+                "[17] {name}: cleanup_list_ms={} entities={} files={} folders={}",
+                t_clean.elapsed().as_millis(),
+                listing.entities.len(),
+                listing.entities.iter().filter(|e| !e.is_folder()).count(),
+                listing.entities.iter().filter(|e| e.is_folder()).count()
+            );
+            let t_del = std::time::Instant::now();
+            let mut deleted = 0usize;
+            let mut delete_errs = 0usize;
             for e in listing.entities {
                 if e.is_folder() {
                     continue;
                 }
-                if let Err(err) = store.delete(&e.key) {
-                    eprintln!("cleanup: failed to delete {}: {err}", e.key);
+                match store.delete(&e.key) {
+                    Ok(()) => deleted += 1,
+                    Err(err) => {
+                        delete_errs += 1;
+                        eprintln!("cleanup: failed to delete {}: {err}", e.key);
+                    }
                 }
             }
+            eprintln!(
+                "[17] {name}: cleanup_delete_ms={} deleted={deleted} delete_errs={delete_errs}",
+                t_del.elapsed().as_millis()
+            );
         }
-        Err(err) => eprintln!("cleanup: failed to list for cleanup: {err}"),
+        Err(err) => {
+            eprintln!("cleanup: failed to list for cleanup: {err}");
+            eprintln!(
+                "[17] {name}: cleanup_list_err_ms={}",
+                t_clean.elapsed().as_millis()
+            );
+        }
     }
 
     if let Err(e) = result {
         panic!("{name} failed: {e}");
     }
     eprintln!("[ok] {}", name);
+    eprintln!("[17] {name}: total_ms={}", t_total.elapsed().as_millis());
 }
 
 #[test]
@@ -196,6 +241,11 @@ fn s3_integ_list_paginates() {
     // Seed >1000 keys (S3 pages at 1000) concurrently, confirm list returns all.
     let n = 1050usize;
     with_store("paginate", |s| {
+        // TEMP [17] (issue #17 Phase 0, removed before merge): finer-grain
+        // seed/list timings so the live diagnosis can separate seed cost from
+        // the enriched-list head cost.
+        let t_seed = std::time::Instant::now();
+        eprintln!("[17] paginate: seed_start");
         std::thread::scope(|scope| {
             for t in 0..16 {
                 scope.spawn(move || {
@@ -205,9 +255,22 @@ fn s3_integ_list_paginates() {
                 });
             }
         });
-        let ents = s.list("").map_err(|e| format!("{e}"))?.entities;
+        eprintln!(
+            "[17] paginate: seed_ms={} seeded={n}",
+            t_seed.elapsed().as_millis()
+        );
+        let t_list = std::time::Instant::now();
+        eprintln!("[17] paginate: list_start");
+        let listing = s.list("").map_err(|e| format!("{e}"))?;
         // files + synthesized folder views
-        let files: Vec<_> = ents.iter().filter(|e| !e.is_folder()).collect();
+        let files: Vec<_> = listing.entities.iter().filter(|e| !e.is_folder()).collect();
+        let folders = listing.entities.len() - files.len();
+        eprintln!(
+            "[17] paginate: list_ms={} files={} folders={folders} warnings={:?}",
+            t_list.elapsed().as_millis(),
+            files.len(),
+            listing.warnings
+        );
         assert_eq!(files.len(), n, "all paged objects returned");
         Ok(())
     });
