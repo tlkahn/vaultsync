@@ -130,10 +130,6 @@ fn delete_keys_bounded(store: &S3Store, keys: &[String], concurrency: u32) -> (u
 
 /// [`with_store`] with a non-default `[transfer].concurrency` (issue 20 cycle
 /// 9: integration coverage for the parallel pool against real S3).
-///
-/// TEMP [17] (issue #17 Phase 0, removed before merge): phase-timing logs to
-/// stderr, labeled `[17]`, so the live paginate diagnosis can attribute wall
-/// clock to body list / cleanup list / cleanup deletes without guessing.
 fn with_store_conc<F>(name: &str, concurrency: u32, f: F)
 where
     F: FnOnce(&S3Store) -> Result<(), String>,
@@ -161,10 +157,6 @@ where
         .unwrap_or(false);
     let base = std::env::var("VAULTSYNC_TEST_S3_PREFIX").unwrap_or_default();
     let prefix = format!("{base}vaultsync-itest-{}-{name}/", unique_num());
-    eprintln!(
-        "[17] {name}: entry concurrency={concurrency} prefix={prefix} bucket={bucket} region={region} endpoint={:?} path_style={path_style}",
-        endpoint
-    );
 
     let settings = StoreSettings {
         bucket: bucket.clone(),
@@ -181,18 +173,8 @@ where
             panic!("{name}: failed to build store against {bucket}: {e}");
         }
     };
-    eprintln!(
-        "[17] {name}: store_ready_ms={}",
-        t_total.elapsed().as_millis()
-    );
 
-    let t_body = std::time::Instant::now();
     let result = f(&store);
-    eprintln!(
-        "[17] {name}: body_ms={} body_ok={}",
-        t_body.elapsed().as_millis(),
-        result.is_ok()
-    );
 
     // Cleanup: list keys + delete everything (W153, I17-cleanup-list: the
     // cleanup must NOT re-run the enriched list - that is a second N-head
@@ -202,38 +184,25 @@ where
     // re-encounters them under a fresh unique prefix, but the bucket slowly
     // fills). Reporting never fails the test outcome; the harness already
     // eprintln!s its skip path, so this matches the file's convention.
-    let t_clean = std::time::Instant::now();
+    // W154 / I17-cleanup-delete: fan out deletes under store concurrency
+    // (Phase 0 row C: sequential cleanup deletes ~393s for 1050 keys).
     match store.list_object_keys("") {
         Ok(keys) => {
-            eprintln!(
-                "[17] {name}: cleanup_list_ms={} keys={}",
-                t_clean.elapsed().as_millis(),
-                keys.len()
-            );
-            let t_del = std::time::Instant::now();
-            // W154 / I17-cleanup-delete: Phase 0 row C showed sequential
-            // cleanup deletes at ~393s for 1050 keys - fan out under the
-            // store concurrency so deletes drop toward O((N/K) x RTT).
             let (deleted, delete_errs) = delete_keys_bounded(&store, &keys, concurrency);
-            eprintln!(
-                "[17] {name}: cleanup_delete_ms={} deleted={deleted} delete_errs={delete_errs}",
-                t_del.elapsed().as_millis()
-            );
+            if delete_errs > 0 {
+                eprintln!(
+                    "cleanup: deleted {deleted}/{} keys ({delete_errs} errors)",
+                    keys.len()
+                );
+            }
         }
-        Err(err) => {
-            eprintln!("cleanup: failed to list for cleanup: {err}");
-            eprintln!(
-                "[17] {name}: cleanup_list_err_ms={}",
-                t_clean.elapsed().as_millis()
-            );
-        }
+        Err(err) => eprintln!("cleanup: failed to list for cleanup: {err}"),
     }
 
     if let Err(e) = result {
         panic!("{name} failed: {e}");
     }
-    eprintln!("[ok] {}", name);
-    eprintln!("[17] {name}: total_ms={}", t_total.elapsed().as_millis());
+    eprintln!("[ok] {name} {}ms", t_total.elapsed().as_millis());
 }
 
 #[test]
@@ -269,19 +238,12 @@ fn s3_integ_put_get_head_delete_roundtrip() {
 #[test]
 fn s3_integ_list_paginates() {
     // Seed >1000 keys (S3 pages at 1000) concurrently, confirm list returns all.
+    // Issue #17 (I17-conc): run through `with_store_conc` at K = 32, NOT
+    // `with_store` (hardcoded concurrency 1) - live proof of I20-heads at the
+    // scale that motivated it. Harness cleanup uses unenriched list_object_keys
+    // + parallel deletes so the full test stays under the CI budget.
     let n = 1050usize;
-    // Issue #17 (I17-conc): run the body through `with_store_conc` at K = 32,
-    // NOT `with_store` (hardcoded concurrency 1). This is the live proof of
-    // I20-heads: the enriched-list head fan-out (enrich_with_head_mtimes +
-    // S3Store concurrency) must bring the 1050-head pass from ~O(N x RTT)
-    // down to ~O((N/K) x RTT). Phase 0 row A measured the conc=1 baseline
-    // stalling past ~380s in the body list alone; row B is this run.
     with_store_conc("paginate", 32, |s| {
-        // TEMP [17] (issue #17 Phase 0, removed before merge): finer-grain
-        // seed/list timings so the live diagnosis can separate seed cost from
-        // the enriched-list head cost.
-        let t_seed = std::time::Instant::now();
-        eprintln!("[17] paginate: seed_start");
         std::thread::scope(|scope| {
             for t in 0..16 {
                 scope.spawn(move || {
@@ -291,22 +253,9 @@ fn s3_integ_list_paginates() {
                 });
             }
         });
-        eprintln!(
-            "[17] paginate: seed_ms={} seeded={n}",
-            t_seed.elapsed().as_millis()
-        );
-        let t_list = std::time::Instant::now();
-        eprintln!("[17] paginate: list_start");
-        let listing = s.list("").map_err(|e| format!("{e}"))?;
+        let ents = s.list("").map_err(|e| format!("{e}"))?.entities;
         // files + synthesized folder views
-        let files: Vec<_> = listing.entities.iter().filter(|e| !e.is_folder()).collect();
-        let folders = listing.entities.len() - files.len();
-        eprintln!(
-            "[17] paginate: list_ms={} files={} folders={folders} warnings={:?}",
-            t_list.elapsed().as_millis(),
-            files.len(),
-            listing.warnings
-        );
+        let files: Vec<_> = ents.iter().filter(|e| !e.is_folder()).collect();
         assert_eq!(files.len(), n, "all paged objects returned");
         Ok(())
     });

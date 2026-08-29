@@ -5,8 +5,8 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    # Nightly full integration suite (off-hour UTC); the PR-gate integration
-    # job excludes the paginate test until #17 lands.
+    # Nightly full integration suite (off-hour UTC). Single job covers
+    # push/PR/schedule - the I6-trigger split retired with #17.
     - cron: "17 5 * * *"
 
 concurrency:
@@ -15,7 +15,7 @@ concurrency:
 
 # Least privilege: jobs default to `contents: read` (covers actions/checkout
 # and rust-cache - the cache API is not repo contents write). Only the
-# `integration*` jobs add `id-token: write` (job-level) for OIDC -> IAM role
+# `integration` job adds `id-token: write` (job-level) for OIDC -> IAM role
 # auth to the dedicated test bucket (I6-creds); no job comments on PRs or
 # writes checks.
 permissions:
@@ -58,9 +58,8 @@ jobs:
         run: rustup show
       - uses: Swatinem/rust-cache@v2
       # Lib + bin unit tests only: the tests/ S3 integration suite runs in
-      # the dedicated `integration` jobs below (issue #6); the paginate test
-      # is excluded from the PR gate until issue #17 is fixed. Compilation
-      # of the suite is still covered by the clippy job's --all-targets.
+      # the dedicated `integration` job below (issue #6). Compilation of
+      # the suite is still covered by the clippy job's --all-targets.
       - run: cargo test --locked --lib --bins
 
   msrv:
@@ -79,17 +78,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked
       # lib + bin unit tests only; the S3 integration suite runs in the
-      # dedicated `integration` jobs (issue #6)
+      # dedicated `integration` job (issue #6)
       - run: cargo test --locked --lib --bins
 
   integration:
-    name: integration (S3, PR gate)
-    # PRs + pushes to main only; the nightly cron run is the separate job
-    # below (I6-trigger).
-    if: github.event_name != 'schedule'
+    name: integration (S3)
+    # Single job on push/PR/schedule (I6-trigger / I17-ci): the #17
+    # paginate skip that forced the PR-gate vs nightly split is retired.
     runs-on: ubuntu-latest
-    # Bounds a stuck run (the I15 per-object-head cost makes the suite
-    # network-latency-sensitive, issue #17); revisit once #17 lands.
+    # Hang guard; live suite (incl. s3_integ_list_paginates at conc 32 with
+    # unenriched/parallel cleanup) is ~1 min on us-west-1 after #17.
     timeout-minutes: 20
     permissions:
       contents: read
@@ -112,36 +110,7 @@ jobs:
         with:
           role-to-assume: ${{ vars.VAULTSYNC_CI_ROLE_ARN }}
           aws-region: ${{ vars.VAULTSYNC_TEST_S3_REGION }}
-      # s3_integ_list_paginates excluded until #17 lands (it seeds 1050
-      # objects and pays the I15 per-object-head cost ~2100x, 15+ min live);
+      # Full suite including s3_integ_list_paginates (issue #17 close-out:
+      # with_store_conc(32) + unenriched cleanup list + parallel deletes).
       # --nocapture keeps the [ok]/[skip]/cleanup stderr notes in the log.
-      - run: >-
-          cargo test --locked --test s3_integration --
-          --skip s3_integ_list_paginates --nocapture
-
-  integration-nightly:
-    name: integration (S3, nightly full)
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: read
-      id-token: write
-    env:
-      VAULTSYNC_TEST_S3_BUCKET: ${{ vars.VAULTSYNC_TEST_S3_BUCKET }}
-      VAULTSYNC_TEST_S3_REGION: ${{ vars.VAULTSYNC_TEST_S3_REGION }}
-      VAULTSYNC_TEST_S3_PREFIX: ci/
-      VAULTSYNC_TEST_S3_REQUIRE: "1"
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install pinned toolchain
-        run: rustup show
-      - uses: Swatinem/rust-cache@v2
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.VAULTSYNC_CI_ROLE_ARN }}
-          aws-region: ${{ vars.VAULTSYNC_TEST_S3_REGION }}
-      # Full suite including s3_integ_list_paginates. May be red while #17
-      # is open (the paginate test can hit the 20-min timeout); it does not
-      # gate PRs - it is the regression net and the bucket-leak tripwire.
       - run: cargo test --locked --test s3_integration -- --nocapture
