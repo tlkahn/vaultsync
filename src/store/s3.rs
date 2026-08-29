@@ -746,6 +746,85 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_block_on_completes() {
+        // W48 probe (issue 20, cycle 2): 8 threads concurrently `block_on`
+        // futures on ONE current-thread runtime, each future `tokio::spawn`ing
+        // a chain of timer awaits. All 8 must complete with correct results -
+        // the failure mode ruled out is the current-thread core dropping or
+        // mis-scheduling tasks when `block_on` is entered concurrently. If
+        // this or `concurrent_block_on_overlaps` fails, switch to
+        // `new_multi_thread` (I20-runtime branch) and re-add tokio's
+        // `rt-multi-thread` feature.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let results: Vec<i32> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let rt = &rt;
+                    s.spawn(move || {
+                        rt.block_on(async move {
+                            let v = tokio::spawn(async move {
+                                let mut acc = 0;
+                                for _ in 0..3 {
+                                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                                    acc += 1;
+                                }
+                                acc
+                            })
+                            .await
+                            .unwrap();
+                            v + i
+                        })
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for (i, r) in results.iter().enumerate() {
+            assert_eq!(
+                *r,
+                i as i32 + 3,
+                "thread {i} must produce its own correct result (got {r})"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_block_on_overlaps() {
+        // W48 probe (issue 20, cycle 2): two threads `block_on` a 400ms timer
+        // each on ONE current-thread runtime. Wall-clock well under 800ms
+        // proves real overlap; serialized `block_on` on the single core would
+        // take >= 800ms. Explicitly a probe, not a regression pin: >2x margin
+        // both directions (pass < 600ms, fail >= 800ms).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let start = std::time::Instant::now();
+        std::thread::scope(|s| {
+            let h1 = s.spawn(|| {
+                rt.block_on(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await
+                })
+            });
+            let h2 = s.spawn(|| {
+                rt.block_on(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await
+                })
+            });
+            h1.join().unwrap();
+            h2.join().unwrap();
+        });
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(600),
+            "two 400ms sleeps must overlap on the current-thread runtime (took {elapsed:?}); the core is serializing concurrent block_on calls - switch to new_multi_thread (I20-runtime)"
+        );
+    }
+
+    #[test]
     fn reap_stale_upload_temps_removes_old_leftovers() {
         // r10-L2 (W88): a crash/SIGKILL between buffering and remove_file
         // leaks a full buffered object in the shared temp dir; no cross-run
