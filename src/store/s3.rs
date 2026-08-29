@@ -1188,6 +1188,19 @@ mod tests {
     }
 
     #[test]
+    fn retry_config_from_settings_max_attempts_1_disables() {
+        // I8-layer pin (PR21-r1 L3): `max_attempts = 1` ("disables retries",
+        // matching `RetryConfig::disabled()` == `standard().with_max_attempts(1)`)
+        // locked end-to-end at the pure seam - still offline.
+        let rc = build_retry_config(&RetrySettings {
+            max_attempts: 1,
+            ..RetrySettings::default()
+        });
+        assert_eq!(rc.max_attempts(), 1);
+        assert!(!rc.has_retry(), "max_attempts = 1 must disable retries");
+    }
+
+    #[test]
     fn error_new_variants_display() {
         use crate::error::Error;
         assert!(format!("{}", Error::Unauthorized("u".into())).contains("credentials"));
