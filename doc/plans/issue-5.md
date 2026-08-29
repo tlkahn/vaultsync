@@ -78,7 +78,10 @@ Explicitly **out of scope** (dependent issues that build on this one):
   the `stable` default. Same version today, so no behavior change; the
   per-commit gate (`cargo test --offline` + clippy + fmt) is unchanged.
 
-- `.github/workflows/ci.yml` (single workflow, four jobs):
+- `.github/workflows/ci.yml` (single workflow, four jobs). As-designed
+  snapshot; the shipped workflow differs (MSRV 1.95, `cargo test --locked
+  --lib --bins` per the execution record above) - see
+  `.github/workflows/ci.yml` for current truth:
 
   ```yaml
   name: CI
