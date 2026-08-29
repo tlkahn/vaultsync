@@ -51,18 +51,6 @@ pub struct ExecFailure {
 /// unchanged and now execute concurrently inside the pool (R3.3, W13/W22,
 /// W62/W119, W39). Report assembly happens after each pass in plan order, so
 /// `failed` stays deterministic regardless of completion order.
-/// Apply a plan. `Mode::Status` plans never mutate anything (belt and braces).
-/// `opts` carries the resolved `mtime_tolerance_ms` used for the upload-side
-/// re-verification (W2, PR2 A-H2/B-M1) and, later, the pull destination
-/// freshness guard (W13).
-///
-/// I20: `concurrency` bounds how many keys each pass runs in flight (workers =
-/// `min(concurrency, items)`); `concurrency <= 1` runs the sequential loop on
-/// the caller's thread (I20-one). The four passes still run strictly in order
-/// (downloads, uploads, DeleteRemote, DeleteLocal); per-key guards are
-/// unchanged and now execute concurrently inside the pool (R3.3, W13/W22,
-/// W62/W119, W39). Report assembly happens after each pass in plan order, so
-/// `failed` stays deterministic regardless of completion order.
 ///
 /// I27-api: `execute_plan` is the thin wrapper that runs with `&NoProgress` -
 /// library callers keep today's exact signature and see zero progress output.

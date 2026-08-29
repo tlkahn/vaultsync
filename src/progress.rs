@@ -1,9 +1,9 @@
 //! Progress event feed + rendering (issue 27, I27-home).
 //!
 //! This module owns the event model, the `Progress` trait + `NoProgress`
-//! default sink, and (later cycles) the pure `ProgressLine` state machine
-//! and the TTY/non-TTY renderers. `exec` emits events, `cli` renders;
-//! neither depends on the other's rendering. Std-only (I27-deps).
+//! default sink, the pure `ProgressLine` state machine, and the TTY/non-TTY
+//! renderers. `exec` emits events, `cli` renders; neither depends on the
+//! other's rendering. Std-only (I27-deps).
 
 use std::sync::Mutex;
 
