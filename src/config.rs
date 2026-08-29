@@ -221,7 +221,7 @@ pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings,
         .as_ref()
         .map(|i| i.patterns.clone())
         .unwrap_or_default();
-    let retry = resolve_retry(cfg.transfer.as_ref());
+    let retry = resolve_retry(cfg.transfer.as_ref())?;
     let concurrency_explicitly_set = cfg.transfer.as_ref().and_then(|t| t.concurrency).is_some();
     Ok(Settings {
         vault_root,
@@ -234,24 +234,38 @@ pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings,
     })
 }
 
-/// Resolve `[transfer.retry]` (I8): each absent field falls back to the AWS
-/// SDK standard-mode default (per-field, not all-or-nothing); an absent
-/// section resolves to the full default. Validation of the resolved values
-/// (max_attempts >= 1, base <= max) happens here for cycle-3, keep the shape
-/// now.
-fn resolve_retry(transfer: Option<&TransferConfig>) -> RetrySettings {
+/// Resolve + validate `[transfer.retry]` (I8): each absent field falls back
+/// to the AWS SDK standard-mode default (per-field, not all-or-nothing); an
+/// absent section resolves to the full default. Validation is loud (W56
+/// ethos) and names the offending config key(s): `max_attempts >= 1` (1
+/// deliberately disables retries, matching `RetryConfig::disabled()`) and
+/// `base_delay_ms <= max_delay_ms`.
+fn resolve_retry(transfer: Option<&TransferConfig>) -> Result<RetrySettings, Error> {
     let r = transfer.and_then(|t| t.retry.as_ref());
-    RetrySettings {
-        max_attempts: r
-            .and_then(|r| r.max_attempts)
-            .unwrap_or(DEFAULT_RETRY_MAX_ATTEMPTS),
-        base_delay_ms: r
-            .and_then(|r| r.base_delay_ms)
-            .unwrap_or(DEFAULT_RETRY_BASE_DELAY_MS),
-        max_delay_ms: r
-            .and_then(|r| r.max_delay_ms)
-            .unwrap_or(DEFAULT_RETRY_MAX_DELAY_MS),
+    let max_attempts = r
+        .and_then(|r| r.max_attempts)
+        .unwrap_or(DEFAULT_RETRY_MAX_ATTEMPTS);
+    let base_delay_ms = r
+        .and_then(|r| r.base_delay_ms)
+        .unwrap_or(DEFAULT_RETRY_BASE_DELAY_MS);
+    let max_delay_ms = r
+        .and_then(|r| r.max_delay_ms)
+        .unwrap_or(DEFAULT_RETRY_MAX_DELAY_MS);
+    if max_attempts == 0 {
+        return Err(Error::Other(format!(
+            "transfer.retry.max_attempts must be >= 1 (1 disables retries), got {max_attempts}"
+        )));
     }
+    if base_delay_ms > max_delay_ms {
+        return Err(Error::Other(format!(
+            "transfer.retry.base_delay_ms ({base_delay_ms}) must not exceed transfer.retry.max_delay_ms ({max_delay_ms})"
+        )));
+    }
+    Ok(RetrySettings {
+        max_attempts,
+        base_delay_ms,
+        max_delay_ms,
+    })
 }
 
 /// W69/W86 policy: an empty or whitespace-only value is treated as unset
@@ -469,6 +483,47 @@ max_delay_ms = 4000
         assert_eq!(s.retry.max_attempts, 7);
         assert_eq!(s.retry.base_delay_ms, 50);
         assert_eq!(s.retry.max_delay_ms, 5000);
+    }
+
+    #[test]
+    fn resolve_settings_retry_rejects_zero_max_attempts() {
+        // I8-validation (W56 loud-config ethos): max_attempts = 0 is invalid
+        // (the SDK requires >= 1; 1 disables retries, 0 is meaningless). Reject
+        // with an error naming the config key. RED: resolves with no error.
+        let text = "[transfer.retry]\nmax_attempts = 0\n";
+        let cfg = parse_config_str(text).unwrap();
+        let err = settings(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transfer.retry.max_attempts"),
+            "must name transfer.retry.max_attempts: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_settings_retry_allows_max_attempts_1() {
+        // I8-config: max_attempts = 1 is valid and deliberately disables
+        // retries (matches `RetryConfig::disabled()` semantics) - must not be
+        // rejected with the zero rule.
+        let text = "[transfer.retry]\nmax_attempts = 1\n";
+        let cfg = parse_config_str(text).unwrap();
+        let s = settings(&cfg).unwrap();
+        assert_eq!(s.retry.max_attempts, 1);
+    }
+
+    #[test]
+    fn resolve_settings_retry_rejects_base_above_max() {
+        // I8-validation (W56): base_delay_ms > max_delay_ms is self-
+        // contradictory; reject with an error naming both keys.
+        let text = "[transfer.retry]\nbase_delay_ms = 5000\nmax_delay_ms = 1000\n";
+        let cfg = parse_config_str(text).unwrap();
+        let err = settings(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transfer.retry.base_delay_ms")
+                && msg.contains("transfer.retry.max_delay_ms"),
+            "must name both keys: {msg}"
+        );
     }
 
     #[test]
