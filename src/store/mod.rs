@@ -90,15 +90,21 @@ pub trait ObjectStore {
 /// Enrich a listing's object entities with per-object `head()` results so
 /// plans compare client mtimes, not upload times (issue #15, I15-approach).
 ///
+/// Each object entity is replaced by a coherent head snapshot: `mtime_ms`,
+/// `etag`, and `size` all come from the same `head()` result. Taking `size`
+/// from head (not the raw list) aligns the W106 `CappedWriter` cap and the
+/// head-before-delete size check with the mtime identity the planner just
+/// trusted, and retires the stale-list-size chimera (a list-era size with a
+/// head-era mtime). The residual race shrinks to "object changed between
+/// enrich-head and get/delete-head", which the executor already handles.
+///
 /// Folder views are skipped (not objects; `head` on a folder key is NotFound
 /// by contract - see the `ObjectStore::list` doc). A `NotFound` head drops the
 /// row (a genuine concurrent-delete race; planning against a vanished object
 /// would be worse). Any *other* head error fails the whole listing (I15-errors,
 /// fail-closed - never plan against a knowingly-degraded remote view, matching
 /// the W61 ethos and `pull --delete` safety). Entity order (sorted) and
-/// `warnings` are preserved verbatim; only `mtime_ms` and `etag` are
-/// overridden from the head result (`size` stays as listed - a mid-list
-/// rewrite race is out of scope, and `plan()` tolerates either value).
+/// `warnings` are preserved verbatim.
 pub(crate) fn enrich_with_head_mtimes<S: ObjectStore + ?Sized>(
     store: &S,
     listing: Listing,
@@ -114,6 +120,7 @@ pub(crate) fn enrich_with_head_mtimes<S: ObjectStore + ?Sized>(
                 let mut e = e;
                 e.mtime_ms = h.mtime_ms;
                 e.etag = h.etag;
+                e.size = h.size;
                 entities.push(e);
             }
             Err(Error::NotFound(_)) => {
@@ -161,6 +168,29 @@ mod tests {
                 .all(|e| e.is_folder() || e.mtime_ms == Some(9_999_999))
         );
         (store, listing)
+    }
+
+    #[test]
+    fn enrich_corrects_stale_listing_size_with_head_size() {
+        let (store, mut listing) = degraded_listing();
+        // Corrupt one file entity's listed `size` far from the real value.
+        // The enrichment must replace it with the head's size (a coherent
+        // head snapshot: size + mtime + etag from the same HeadObject), so
+        // the W106 CappedWriter cap and the head-before-delete size check key
+        // off the same identity the planner just trusted.
+        let a = listing
+            .entities
+            .iter_mut()
+            .find(|e| e.key == "a.md")
+            .unwrap();
+        a.size = 9_999;
+        let enriched = enrich_with_head_mtimes(&store, listing).unwrap();
+        let a = enriched.entities.iter().find(|e| e.key == "a.md").unwrap();
+        assert_eq!(a.size, store.head("a.md").unwrap().size);
+        assert_eq!(
+            a.size, 1,
+            "mock true size is 1; stale listed size must be corrected"
+        );
     }
 
     #[test]

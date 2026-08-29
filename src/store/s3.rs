@@ -11,8 +11,9 @@
 //! mtime: stored as user metadata `vaultsync-mtime` (decimal ms) on put.
 //! `head` and `get_to` prefer the metadata, falling back to `LastModified`.
 //! `list` (ListObjectsV2) cannot return user metadata, so it enriches each
-//! listed object's mtime (and etag) via a per-object HeadObject (W113/I15,
-//! `enrich_with_head_mtimes`) - which reads `vaultsync-mtime` - so list-driven
+//! listed object's metadata (mtime, etag, size) via a per-object HeadObject
+//! (W113/I15, `enrich_with_head_mtimes`) - which reads `vaultsync-mtime` - so
+//! list-driven
 //! plans compare client mtimes, not upload `LastModified`.
 //!
 //! Cost (accepted, I15): a list-driven plan costs 1+ ListObjectsV2 page
