@@ -12,6 +12,14 @@ use crate::error::Error;
 pub mod mock;
 pub mod s3;
 
+/// Bounded retry policy for transient head errors inside listing enrichment
+/// (W117, R2-3). `HEAD_MAX_ATTEMPTS` is 1 initial attempt + 2 retries;
+/// backoff is a small fixed sleep (`[100ms, 300ms]`) before each retry, so
+/// the worst added latency per key on the failing path is 400ms. This is a
+/// stopgap; the Phase 3 request pool owns full retry/backoff/jitter.
+const HEAD_MAX_ATTEMPTS: usize = 3;
+const HEAD_BACKOFF_MS: [u64; 2] = [100, 300];
+
 /// A listing result: the entities plus advisory warnings the backend wants
 /// surfaced (e.g. keys dropped while listing). A struct, not a tuple, so
 /// Phase 3 fields extend without another signature break. The CLI prints
@@ -121,7 +129,7 @@ pub(crate) fn enrich_with_head_mtimes<S: ObjectStore + ?Sized>(
             entities.push(e);
             continue;
         }
-        match store.head(&e.key) {
+        match head_with_retry(store, &e.key) {
             Ok(h) => {
                 let mut e = e;
                 e.mtime_ms = h.mtime_ms;
@@ -154,6 +162,29 @@ pub(crate) fn enrich_with_head_mtimes<S: ObjectStore + ?Sized>(
         warnings.push(msg);
     }
     Ok(Listing { entities, warnings })
+}
+
+/// Head a key with a bounded stopgap retry on transient store errors.
+///
+/// `Unavailable` and `Timeout` (throttling / transient service blips) are
+/// retried up to `HEAD_MAX_ATTEMPTS` with a small fixed backoff ([100ms,
+/// 300ms]); all other errors (`NotFound` drop, `Unauthorized`, `Other`) keep
+/// their single-attempt semantics. This stays private (no new API surface);
+/// it is a stopgap - the Phase 3 request pool owns full retry/backoff/jitter.
+fn head_with_retry<S: ObjectStore + ?Sized>(store: &S, key: &str) -> Result<Entity, Error> {
+    let mut attempt = 1;
+    loop {
+        match store.head(key) {
+            Ok(h) => return Ok(h),
+            Err(Error::Unavailable(_)) | Err(Error::Timeout(_)) if attempt < HEAD_MAX_ATTEMPTS => {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    HEAD_BACKOFF_MS[attempt - 1],
+                ));
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -286,12 +317,22 @@ mod tests {
     }
 
     /// Store whose `head` fails with a non-NotFound error (throttling class).
-    struct HeadFailStore;
+    struct HeadFailStore {
+        calls: std::cell::Cell<usize>,
+    }
+    impl HeadFailStore {
+        fn new() -> Self {
+            Self {
+                calls: std::cell::Cell::new(0),
+            }
+        }
+    }
     impl ObjectStore for HeadFailStore {
         fn list(&self, _prefix: &str) -> Result<Listing, Error> {
             Ok(Listing::default())
         }
         fn head(&self, _key: &str) -> Result<Entity, Error> {
+            self.calls.set(self.calls.get() + 1);
             Err(Error::Unavailable("throttled".to_string()))
         }
         fn get_to(&self, _key: &str, _w: &mut dyn std::io::Write) -> Result<Entity, Error> {
@@ -311,13 +352,135 @@ mod tests {
         }
     }
 
+    /// Which transient/nontransient error a flaky head stub answers with.
+    #[derive(Clone, Copy)]
+    enum FlakyKind {
+        Unavailable,
+        Timeout,
+        Unauthorized,
+    }
+
+    /// Store whose `head` fails the first `fail_first` calls with `kind`,
+    /// then answers from `inner`. Counts total head calls.
+    struct FlakyHeadStore {
+        inner: MemoryStore,
+        fail_first: usize,
+        kind: FlakyKind,
+        calls: std::cell::Cell<usize>,
+    }
+    impl FlakyHeadStore {
+        fn new(inner: MemoryStore, fail_first: usize, kind: FlakyKind) -> Self {
+            Self {
+                inner,
+                fail_first,
+                kind,
+                calls: std::cell::Cell::new(0),
+            }
+        }
+        fn err(&self) -> Error {
+            match self.kind {
+                FlakyKind::Unavailable => Error::Unavailable("throttled".to_string()),
+                FlakyKind::Timeout => Error::Timeout("timed out".to_string()),
+                FlakyKind::Unauthorized => Error::Unauthorized("denied".to_string()),
+            }
+        }
+    }
+    impl ObjectStore for FlakyHeadStore {
+        fn list(&self, _prefix: &str) -> Result<Listing, Error> {
+            self.inner.list("")
+        }
+        fn head(&self, key: &str) -> Result<Entity, Error> {
+            let n = self.calls.get();
+            self.calls.set(n + 1);
+            if n < self.fail_first {
+                return Err(self.err());
+            }
+            self.inner.head(key)
+        }
+        fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime_ms: Option<u64>,
+        ) -> Result<Entity, Error> {
+            self.inner.put_from(key, r, size, mtime_ms)
+        }
+        fn delete(&self, key: &str) -> Result<(), Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    #[test]
+    fn enrich_retries_transient_head_errors() {
+        // Unavailable: first 2 heads fail, third succeeds; enrich succeeds
+        // and the stub saw exactly 3 head calls.
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"a".to_vec());
+        store.put_from("a.md", &mut c, 1, Some(100)).unwrap();
+        let flaky = FlakyHeadStore::new(store, 2, FlakyKind::Unavailable);
+        let listing = Listing {
+            entities: vec![file("a.md", 9_999, Some(9_999_999))],
+            warnings: Vec::new(),
+        };
+        let enriched = enrich_with_head_mtimes(&flaky, listing).unwrap();
+        let a = enriched.entities.iter().find(|e| e.key == "a.md").unwrap();
+        assert_eq!(a.mtime_ms, Some(100));
+        assert_eq!(a.size, 1);
+        assert_eq!(flaky.calls.get(), 3);
+
+        // Timeout: first failure also retried (single attempt test).
+        let store2 = MemoryStore::new();
+        let mut c2 = std::io::Cursor::new(b"a".to_vec());
+        store2.put_from("a.md", &mut c2, 1, Some(100)).unwrap();
+        let flaky2 = FlakyHeadStore::new(store2, 1, FlakyKind::Timeout);
+        let listing2 = Listing {
+            entities: vec![file("a.md", 1, None)],
+            warnings: Vec::new(),
+        };
+        let enriched2 = enrich_with_head_mtimes(&flaky2, listing2).unwrap();
+        assert_eq!(enriched2.entities.len(), 1);
+        assert_eq!(flaky2.calls.get(), 2);
+    }
+
+    #[test]
+    fn enrich_retry_is_bounded_and_fail_closed() {
+        // Always-Unavailable store: fail-closed after exactly HEAD_MAX_ATTEMPTS
+        // head calls (bound pinned; full retry does not loop forever).
+        let store = HeadFailStore::new();
+        let listing = Listing {
+            entities: vec![file("a.md", 1, Some(9_999_999))],
+            warnings: Vec::new(),
+        };
+        let err = enrich_with_head_mtimes(&store, listing).unwrap_err();
+        assert!(matches!(err, Error::Unavailable(_)));
+        assert_eq!(store.calls.get(), HEAD_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn enrich_does_not_retry_nontransient_errors() {
+        // Unauthorized is nontransient: fail-closed after exactly 1 head call.
+        let store = MemoryStore::new();
+        let flaky = FlakyHeadStore::new(store, 1, FlakyKind::Unauthorized);
+        let listing = Listing {
+            entities: vec![file("a.md", 1, None)],
+            warnings: Vec::new(),
+        };
+        let err = enrich_with_head_mtimes(&flaky, listing).unwrap_err();
+        assert!(matches!(err, Error::Unauthorized(_)));
+        assert_eq!(flaky.calls.get(), 1);
+    }
+
     #[test]
     fn enrich_fails_closed_on_head_error() {
         let listing = Listing {
             entities: vec![file("a.md", 1, Some(9_999_999))],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&HeadFailStore, listing).unwrap_err();
+        let err = enrich_with_head_mtimes(&HeadFailStore::new(), listing).unwrap_err();
         assert!(
             matches!(err, Error::Unavailable(_)),
             "non-NotFound head error must fail the listing, got {err:?}"
