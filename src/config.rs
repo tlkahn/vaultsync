@@ -67,6 +67,23 @@ pub struct TransferConfig {
     pub concurrency: Option<u32>,
     #[serde(default)]
     pub mtime_tolerance_ms: Option<u64>,
+    #[serde(default)]
+    pub retry: Option<RetryConfig>,
+}
+
+/// `[transfer.retry]` section (I8). All fields optional; absent section (or
+/// absent field) resolves to the AWS SDK standard-mode defaults at
+/// [`resolve_settings`] time (3 / 1000 / 20000). Unknown keys are rejected
+/// loudly (W56) via `deny_unknown_fields`, matching the sibling sections.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetryConfig {
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+    #[serde(default)]
+    pub base_delay_ms: Option<u64>,
+    #[serde(default)]
+    pub max_delay_ms: Option<u64>,
 }
 
 /// Fully resolved runtime settings (config + CLI + env merged).
@@ -309,6 +326,11 @@ patterns = [".git/", ".trash/", ".DS_Store"]
 [transfer]
 concurrency = 4
 mtime_tolerance_ms = 1000
+
+[transfer.retry]
+max_attempts = 5
+base_delay_ms = 250
+max_delay_ms = 4000
 "#;
         let cfg = parse_config_str(text).unwrap();
         assert_eq!(
@@ -326,6 +348,46 @@ mtime_tolerance_ms = 1000
         let t = cfg.transfer.unwrap();
         assert_eq!(t.concurrency, Some(4));
         assert_eq!(t.mtime_tolerance_ms, Some(1000));
+        let retry = t.retry.unwrap();
+        assert_eq!(retry.max_attempts, Some(5));
+        assert_eq!(retry.base_delay_ms, Some(250));
+        assert_eq!(retry.max_delay_ms, Some(4000));
+    }
+
+    #[test]
+    fn config_parse_retry_section() {
+        // I8-config: `[transfer.retry]` parses into the three optional fields
+        // on `FileConfig.transfer.retry` (defaults applied later at
+        // resolution). RED: `TransferConfig` has no `retry` field yet
+        // (compile failure).
+        let text = r#"
+[transfer.retry]
+max_attempts = 5
+base_delay_ms = 250
+max_delay_ms = 4000
+"#;
+        let cfg = parse_config_str(text).unwrap();
+        let t = cfg.transfer.unwrap();
+        assert_eq!(t.concurrency, None, "concurrency stays unset");
+        let retry = t.retry.unwrap();
+        assert_eq!(retry.max_attempts, Some(5));
+        assert_eq!(retry.base_delay_ms, Some(250));
+        assert_eq!(retry.max_delay_ms, Some(4000));
+    }
+
+    #[test]
+    fn config_unknown_retry_key_rejected() {
+        // W56 (B nit): an unknown key inside `[transfer.retry]` (here a
+        // `max_attemps` typo, missing the second `t`) is a loud parse error
+        // naming the key, matching `config_unknown_transfer_key_rejected`.
+        // RED: `RetryConfig` does not exist yet (compile failure).
+        let text = "[transfer.retry]\nmax_attemps = 3\n";
+        let err = parse_config_str(text).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("max_attemps"),
+            "unknown retry key not named in: {msg}"
+        );
     }
 
     #[test]
