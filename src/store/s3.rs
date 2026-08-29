@@ -543,7 +543,8 @@ impl ObjectStore for S3Store {
         // `vaultsync-mtime`) so list-driven plans compare client mtimes, not
         // upload times. Folder views are skipped; a NotFound head drops the
         // row (surfaced as a bounded warning); transient errors are retried
-        // (W117); any other head error fails the listing (I15-errors).
+        // by the SDK `RetryConfig` (I8, supersedes the retired W117 stopgap);
+        // any other head error fails the listing (I15-errors).
         enrich_with_head_mtimes(self, Listing { entities, warnings })
     }
 
