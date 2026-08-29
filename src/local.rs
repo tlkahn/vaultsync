@@ -35,6 +35,17 @@ pub struct LocalFs {
     /// Canonicalized vault root, computed once per instance on first use and
     /// cached (W81/r8a-1 + r9-N2). See [`LocalFs::root_canonical`].
     root_canon: std::sync::OnceLock<PathBuf>,
+    /// I20-r1/F3: serializes the create-alloc tail of [`LocalFs::tmp_path_for`]
+    /// against created-dir cleanup ([`LocalFs::cleanup_created_dirs`], the
+    /// executor's download failure path) so pooled workers cannot remove a
+    /// shared ancestor in the window between one worker's
+    /// `create_dir_all(parent)` and its `alloc_temp_sibling` (dir still empty
+    /// -> removal succeeds -> the alloc fails `NotFound`; spurious per-key
+    /// failure, self-healing next run). Restores the sequential in-process
+    /// guarantee; external actors had the same exposure pre-I20, so this is
+    /// strictly no worse than the old contract. Leaf lock: never held across
+    /// store/IO calls beyond the fs tail it serializes.
+    dir_create_lock: std::sync::Mutex<()>,
 }
 
 /// Pull destination state relative to the plan (W13/B-L4).
@@ -80,6 +91,7 @@ impl LocalFs {
             follow_symlinks: false,
             report: std::sync::Mutex::new(WalkReport::default()),
             root_canon: std::sync::OnceLock::new(),
+            dir_create_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -91,6 +103,7 @@ impl LocalFs {
             follow_symlinks,
             report: std::sync::Mutex::new(WalkReport::default()),
             root_canon: std::sync::OnceLock::new(),
+            dir_create_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -280,6 +293,17 @@ impl LocalFs {
         // partially-creating create_dir_all). The entry-time ensure_locality
         // and `created_dir_chain` stay outside the closure: they create
         // nothing.
+        // I20-r1/F3: hold `dir_create_lock` across the create-alloc-and-
+        // cleanup tail (both the closure AND its internal W78 cleanup), so a
+        // pooled worker's [`LocalFs::cleanup_created_dirs`] cannot remove a
+        // shared ancestor in the window between `create_dir_all(parent)` and
+        // `alloc_temp_sibling` (dir still empty -> removal succeeds -> the
+        // alloc fails `NotFound`; spurious per-key failure). Restores the
+        // sequential in-process guarantee; external actors had the same
+        // exposure pre-I20, so this is strictly no worse than the old
+        // contract. No nesting: the guard drops when `tmp_path_for` returns;
+        // exec's cleanup wrapper locks separately afterwards.
+        let _guard = self.dir_create_lock.lock().unwrap();
         with_created_dirs_cleanup(&created_dirs, || {
             std::fs::create_dir_all(parent)?;
             self.ensure_locality(parent)?;
@@ -755,6 +779,21 @@ impl LocalFs {
         // invite a misleading retry).
         let _ = fsync_parent_dir(parent);
         Ok(())
+    }
+
+    /// I20-r1/F3: lock-protected created-dir cleanup for the executor's
+    /// download failure path. Delegates to the free [`remove_created_dirs`]
+    /// under the same `dir_create_lock` that [`LocalFs::tmp_path_for`] holds
+    /// across its create-alloc-and-cleanup tail, so pooled workers cannot
+    /// interleave a removal into another worker's create-alloc window
+    /// (restores the sequential guarantee in-process). No lock nesting:
+    /// `tmp_path_for` locks/releases internally; exec calls this wrapper only
+    /// after `tmp_path_for` returned. The free `remove_created_dirs` stays for
+    /// `local.rs` internal use (the W78 cleanup inside
+    /// `with_created_dirs_cleanup`, which runs under the same guard).
+    pub(crate) fn cleanup_created_dirs(&self, created: &[PathBuf]) {
+        let _guard = self.dir_create_lock.lock().unwrap();
+        remove_created_dirs(created);
     }
 }
 
