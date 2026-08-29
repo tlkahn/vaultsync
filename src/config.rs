@@ -16,8 +16,10 @@ pub const DEFAULT_CONCURRENCY: u32 = 4;
 
 /// AWS SDK standard-mode retry defaults (I8-config): the resolved policy when
 /// `[transfer.retry]` is absent or a field is unset mirrors the SDK's own
-/// `RetryConfig::standard()` (3 attempts / 1s initial / 20s max), so a
-/// default run is a no-op change vs the pre-I8 SDK behavior.
+/// `RetryConfig::standard()` numbers (3 attempts / 1s initial / 20s max);
+/// absent/unset fields resolve to those values. This does not make a default
+/// run a no-op vs pre-I8 flight: ambient AWS retry env/profile is replaced at
+/// client build on purpose (I8-retry-config-owned).
 pub const DEFAULT_RETRY_MAX_ATTEMPTS: u32 = 3;
 pub const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 1000;
 pub const DEFAULT_RETRY_MAX_DELAY_MS: u64 = 20000;

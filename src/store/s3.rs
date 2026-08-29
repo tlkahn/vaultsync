@@ -55,9 +55,10 @@ const MAX_SINGLE_PUT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 /// Map resolved `[transfer.retry]` settings (millis) onto an SDK standard-
 /// mode [`RetryConfig`](aws_sdk_s3::config::retry::RetryConfig), which owns
 /// retry/backoff/jitter for every S3 op (I8-layer). `RetrySettings::default()`
-/// maps to the SDK's own `RetryConfig::standard()` (3 / 1s / 20s), so a
-/// default-config run is a no-op change in flight. Pure builder + getters,
-/// hence unit-testable offline.
+/// maps field-for-field onto the SDK's own `RetryConfig::standard()`
+/// (3 / 1s / 20s); the client-build replace still discards ambient AWS retry
+/// config (I8-retry-config-owned). Pure builder + getters, hence
+/// unit-testable offline.
 pub(crate) fn build_retry_config(retry: &RetrySettings) -> aws_sdk_s3::config::retry::RetryConfig {
     aws_sdk_s3::config::retry::RetryConfig::standard()
         .with_max_attempts(retry.max_attempts)
@@ -99,10 +100,11 @@ impl S3Store {
             let sdk = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
             let mut b =
                 aws_sdk_s3::config::Builder::from(&sdk).force_path_style(settings.path_style);
-            // I8-layer: the SDK's standard-mode RetryConfig owns retry/backoff/
-            // jitter for ALL S3 ops (lists, heads, gets, puts, deletes) per the
-            // resolved `[transfer.retry]` policy. A default config equals the
-            // SDK's own default, so pre-I8 flight behavior is unchanged.
+            // I8-layer: SDK standard-mode RetryConfig owns retry/backoff/jitter
+            // for ALL S3 ops (lists, heads, gets, puts, deletes) per the resolved
+            // `[transfer.retry]` policy. Default settings match
+            // RetryConfig::standard() field-for-field; ambient AWS env/profile
+            // retry knobs are replaced here on purpose (I8-retry-config-owned).
             b = b.retry_config(build_retry_config(retry));
             // W7/B-M2: only override the region when explicitly configured;
             // `None` leaves the AWS default chain (env, shared config,
@@ -1178,8 +1180,9 @@ mod tests {
     #[test]
     fn retry_config_from_settings_default_is_sdk_standard() {
         // I8-config pin: the default RetrySettings maps to the SDK's own
-        // `RetryConfig::standard()` on all three knobs - so a default
-        // config run is a no-op change in flight.
+        // `RetryConfig::standard()` on all three knobs - so default settings
+        // match `RetryConfig::standard()` field-for-field (ambient AWS retry
+        // env/profile still replaced at client build - I8-retry-config-owned).
         let ours = build_retry_config(&crate::config::RetrySettings::default());
         let std = aws_sdk_s3::config::retry::RetryConfig::standard();
         assert_eq!(ours.max_attempts(), std.max_attempts());
