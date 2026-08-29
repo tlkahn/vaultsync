@@ -17,6 +17,7 @@
 use crate::error::Error;
 use crate::local::LocalFs;
 use crate::plan::{ActionKind, Mode, Plan};
+use crate::progress::{NoProgress, PassKind, Progress, ProgressEvent};
 use crate::store::ObjectStore;
 
 /// Outcome of an execution run.
@@ -50,6 +51,21 @@ pub struct ExecFailure {
 /// unchanged and now execute concurrently inside the pool (R3.3, W13/W22,
 /// W62/W119, W39). Report assembly happens after each pass in plan order, so
 /// `failed` stays deterministic regardless of completion order.
+/// Apply a plan. `Mode::Status` plans never mutate anything (belt and braces).
+/// `opts` carries the resolved `mtime_tolerance_ms` used for the upload-side
+/// re-verification (W2, PR2 A-H2/B-M1) and, later, the pull destination
+/// freshness guard (W13).
+///
+/// I20: `concurrency` bounds how many keys each pass runs in flight (workers =
+/// `min(concurrency, items)`); `concurrency <= 1` runs the sequential loop on
+/// the caller's thread (I20-one). The four passes still run strictly in order
+/// (downloads, uploads, DeleteRemote, DeleteLocal); per-key guards are
+/// unchanged and now execute concurrently inside the pool (R3.3, W13/W22,
+/// W62/W119, W39). Report assembly happens after each pass in plan order, so
+/// `failed` stays deterministic regardless of completion order.
+///
+/// I27-api: `execute_plan` is the thin wrapper that runs with `&NoProgress` -
+/// library callers keep today's exact signature and see zero progress output.
 pub fn execute_plan(
     local: &LocalFs,
     store: &dyn ObjectStore,
@@ -58,162 +74,75 @@ pub fn execute_plan(
     opts: &crate::plan::PlanOpts,
     concurrency: u32,
 ) -> ExecReport {
+    execute_plan_with_progress(local, store, plan, mode, opts, concurrency, &NoProgress)
+}
+
+/// The event-emitting form of [`execute_plan`] (I27-api): every completed key
+/// fires a `KeyDone`; each non-empty pass brackets its items with
+/// `PassStart`/`PassEnd`; a terminal `RunEnd` follows the final pass and the
+/// empty-dir post-pass. Emission is completion-driven inside the pool closure
+/// (I27-events), so `KeyDone` order may interleave under `concurrency > 1`;
+/// `ExecReport` assembly stays plan-ordered and unchanged. `Mode::Status`
+/// stays silent (no events at all).
+pub fn execute_plan_with_progress(
+    local: &LocalFs,
+    store: &dyn ObjectStore,
+    plan: &Plan,
+    mode: Mode,
+    opts: &crate::plan::PlanOpts,
+    concurrency: u32,
+    progress: &dyn Progress,
+) -> ExecReport {
     let mut rep = ExecReport::default();
     if mode == Mode::Status {
         return rep;
     }
 
-    // Pass 1: downloads (pull). I20: fan out through the bounded pool; the
-    // report is assembled in plan order after the pass joins.
-    let downloads: Vec<&crate::plan::Action> = plan
-        .actions
-        .iter()
-        .filter(|a| a.kind == ActionKind::Download)
-        .collect();
-    let results = crate::pool::run_bounded(concurrency, &downloads, |a| {
-        exec_download(local, store, a, opts.mtime_tolerance_ms)
-    });
-    for (a, r) in downloads.iter().zip(results) {
-        match r {
-            Ok(()) => rep.executed += 1,
-            Err(e) => fail(&mut rep, &a.key, e),
-        }
-    }
-
-    // Pass 2: uploads (push), fanned out through the bounded pool (I20).
-    let uploads: Vec<&crate::plan::Action> = plan
-        .actions
-        .iter()
-        .filter(|a| a.kind == ActionKind::Upload)
-        .collect();
-    let results = crate::pool::run_bounded(concurrency, &uploads, |a| {
-        exec_upload(local, store, a, opts.mtime_tolerance_ms)
-    });
-    for (a, r) in uploads.iter().zip(results) {
-        match r {
-            Ok(()) => rep.executed += 1,
-            Err(e) => fail(&mut rep, &a.key, e),
-        }
-    }
-
-    // Pass 3: destination-side deletes, after successful transfers. W10
-    // (A-M3/B-L6): delete is idempotent-friendly across backends - deleting an
-    // already-gone key achieves the goal state, so NotFound is normalized to a
-    // success here (S3 delete is idempotent; LocalFs.delete_file still reports
-    // NotFound for a missing key, and the executor absorbs it).
-    //
-    // W62/A-M2: head-before-delete. The list-time entity alone is stale
-    // authority for a delete (the local side got `delete_file_guarded` for
-    // exactly this race class). Re-verify the remote object immediately
-    // before unlinking it: a NotFound means the goal state (absent) is
-    // already achieved (counts as success, matching W10); a size or mtime
-    // drift (beyond the tolerance) means the object changed since the plan -
-    // the key fails and the new remote content survives. Post-W113 the
-    // planned entity's `mtime_ms` IS the head/`vaultsync-mtime` value (the
-    // R-c list-skew rationale is retired; no in-tree backend systematically
-    // false-fails). The residual race is a same-size replacement whose mtime
-    // is within tolerance between plan and delete.
-    let delete_remote: Vec<&crate::plan::Action> = plan
-        .actions
-        .iter()
-        .filter(|a| a.kind == ActionKind::DeleteRemote)
-        .collect();
-    let results = crate::pool::run_bounded(concurrency, &delete_remote, |a| {
-        let Some(planned_remote) = &a.remote else {
-            return Err(Error::Other(format!(
-                "delete-remote planned without remote entity: {}",
-                a.key
-            )));
-        };
-        match store.head(&a.key) {
-            Ok(cur) => {
-                if cur.size != planned_remote.size {
-                    return Err(Error::Other(format!(
-                        "remote changed since plan for {}; not deleting",
-                        a.key
-                    )));
-                }
-                // W119/R1-M2: post-W113 the planned `mtime_ms` IS the head/
-                // `vaultsync-mtime` value (the old R-c list-skew rationale is
-                // retired), so a same-size replacement whose mtime drifted
-                // beyond the tolerance between plan and delete is refused too;
-                // the residual race is only a same-size replacement within
-                // tolerance. Refuse only when both sides carry an mtime.
-                if let (Some(planned_m), Some(cur_m)) = (planned_remote.mtime_ms, cur.mtime_ms)
-                    && planned_m.abs_diff(cur_m) > opts.mtime_tolerance_ms
-                {
-                    return Err(Error::Other(format!(
-                        "remote changed since plan for {}; not deleting",
-                        a.key
-                    )));
-                }
-            }
-            Err(Error::NotFound(_)) => {
-                // goal state already achieved (W10 idempotent-delete arm)
-                return Ok(());
-            }
-            Err(e) => return Err(e),
-        }
-        match store.delete(&a.key) {
-            Ok(()) => Ok(()),
-            // W10: head is best-effort; a delete-time NotFound still means
-            // the goal state was reached.
-            Err(Error::NotFound(_)) => Ok(()),
-            Err(e) => Err(e),
-        }
-    });
-    for (a, r) in delete_remote.iter().zip(results) {
-        match r {
-            Ok(()) => rep.executed += 1,
-            Err(e) => fail(&mut rep, &a.key, e),
-        }
-    }
     let mut deleted_keys: Vec<String> = Vec::new();
-    // Pass 4: local deletes, fanned out through the bounded pool (I20).
-    let delete_local: Vec<&crate::plan::Action> = plan
-        .actions
-        .iter()
-        .filter(|a| a.kind == ActionKind::DeleteLocal)
-        .collect();
-    let results = crate::pool::run_bounded(concurrency, &delete_local, |a| {
-        // R4-L1/W39: a `pull --delete` re-verifies local freshness before
-        // removing the file (symmetric to upload R3.3 / download W13). The
-        // planned local entity is the truth the walk recorded; `a.local` is
-        // always `Some` for DeleteLocal - a missing one is a per-key error,
-        // never an unguarded delete.
-        let Some(planned_local) = &a.local else {
-            return Err(Error::Other(format!(
-                "delete-local planned without local entity: {}",
-                a.key
-            )));
-        };
-        match local.delete_file_guarded(
-            &a.key,
-            planned_local.size,
-            planned_local.mtime_ms,
-            opts.mtime_tolerance_ms,
-        ) {
-            Ok(()) => Ok(()),
-            Err(Error::NotFound(_)) => {
-                // W32: the goal state (file absent) is achieved, so count a
-                // no-op delete as reaching it and keep the empty-dir cleanup
-                // pass active for this key's ancestor chain. (The guarded
-                // delete reports NotFound before any freshness check,
-                // matching the old delete_file contract.)
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    });
-    for (a, r) in delete_local.iter().zip(results) {
-        match r {
-            Ok(()) => {
-                rep.executed += 1;
-                deleted_keys.push(a.key.clone());
-            }
-            Err(e) => fail(&mut rep, &a.key, e),
-        }
-    }
+    let mut fold = FoldState {
+        rep: &mut rep,
+        deleted_keys: &mut deleted_keys,
+    };
+    // The four passes run strictly in order (downloads, uploads,
+    // DeleteRemote, DeleteLocal); each emits its own bracketed event stream
+    // through the shared sink. Passes with zero items emit nothing
+    // (I27-render).
+    run_pass(
+        plan,
+        ActionKind::Download,
+        PassKind::Download,
+        concurrency,
+        progress,
+        |a| exec_download(local, store, a, opts.mtime_tolerance_ms),
+        &mut fold,
+    );
+    run_pass(
+        plan,
+        ActionKind::Upload,
+        PassKind::Upload,
+        concurrency,
+        progress,
+        |a| exec_upload(local, store, a, opts.mtime_tolerance_ms),
+        &mut fold,
+    );
+    run_pass(
+        plan,
+        ActionKind::DeleteRemote,
+        PassKind::DeleteRemote,
+        concurrency,
+        progress,
+        |a| exec_delete_remote(store, a, opts),
+        &mut fold,
+    );
+    run_pass(
+        plan,
+        ActionKind::DeleteLocal,
+        PassKind::DeleteLocal,
+        concurrency,
+        progress,
+        |a| exec_delete_local(local, a, opts),
+        &mut fold,
+    );
     // R2.1 option (a), scoped (W77/r9 M1): after local deletes, clean the
     // now-empty ancestor chains of the files deleted this run (both the Ok
     // and the W32 NotFound goal-state arms - the goal state is "file
@@ -231,7 +160,181 @@ pub fn execute_plan(
         }
     }
 
+    progress.event(ProgressEvent::RunEnd {
+        executed: rep.executed,
+        failed: rep.failed.len() as u32,
+    });
     rep
+}
+
+/// Mutable per-run fold state threaded through the four passes (bundled so
+/// `run_pass` stays under clippy's 7-argument limit, W18/B-L9).
+struct FoldState<'a> {
+    rep: &'a mut ExecReport,
+    deleted_keys: &'a mut Vec<String>,
+}
+
+/// One executor pass with event emission (I27 cycle 2 refactor): filters the
+/// plan's actions of `kind`, emits `PassStart` (skipped entirely for empty
+/// passes), runs the bounded pool with a completion-driven `KeyDone` per item,
+/// folds the per-item results into `fold.rep` in plan order (unchanged
+/// semantics), then emits `PassEnd`.
+fn run_pass<F>(
+    plan: &Plan,
+    kind: ActionKind,
+    pass: PassKind,
+    concurrency: u32,
+    progress: &dyn Progress,
+    exec_item: F,
+    fold: &mut FoldState<'_>,
+) where
+    F: Fn(&crate::plan::Action) -> Result<(), Error> + Sync,
+{
+    let items: Vec<&crate::plan::Action> = plan.actions.iter().filter(|a| a.kind == kind).collect();
+    if items.is_empty() {
+        return;
+    }
+    let total_bytes: u64 = items.iter().map(|a| planned_bytes(a)).sum();
+    progress.event(ProgressEvent::PassStart {
+        kind: pass,
+        total_keys: items.len() as u32,
+        total_bytes,
+    });
+    let results = crate::pool::run_bounded(concurrency, &items, |a| {
+        let r = exec_item(a);
+        progress.event(ProgressEvent::KeyDone {
+            kind: pass,
+            key: a.key.clone(),
+            bytes: planned_bytes(a),
+            ok: r.is_ok(),
+        });
+        r
+    });
+    for (a, r) in items.iter().zip(results) {
+        match r {
+            Ok(()) => {
+                fold.rep.executed += 1;
+                if pass == PassKind::DeleteLocal {
+                    fold.deleted_keys.push(a.key.clone());
+                }
+            }
+            Err(e) => fail(fold.rep, &a.key, e),
+        }
+    }
+    progress.event(ProgressEvent::PassEnd { kind: pass });
+}
+
+/// The planned byte size an action contributes to progress (I27-bytes):
+/// Upload/Download use the source-side entity size; deletes contribute 0 but
+/// still advance key counts.
+fn planned_bytes(a: &crate::plan::Action) -> u64 {
+    match a.kind {
+        ActionKind::Upload => a.local.as_ref().map(|e| e.size).unwrap_or(0),
+        ActionKind::Download => a.remote.as_ref().map(|e| e.size).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Pass 3 per-item body (extracted from the inline pool closure, W10
+/// A-M3/B-L6): delete is idempotent-friendly across backends - deleting an
+/// already-gone key achieves the goal state, so NotFound is normalized to a
+/// success here (S3 delete is idempotent; LocalFs.delete_file still reports
+/// NotFound for a missing key, and the executor absorbs it).
+///
+/// W62/A-M2: head-before-delete. The list-time entity alone is stale
+/// authority for a delete (the local side got `delete_file_guarded` for
+/// exactly this race class). Re-verify the remote object immediately
+/// before unlinking it: a NotFound means the goal state (absent) is
+/// already achieved (counts as success, matching W10); a size or mtime
+/// drift (beyond the tolerance) means the object changed since the plan -
+/// the key fails and the new remote content survives. Post-W113 the
+/// planned entity's `mtime_ms` IS the head/`vaultsync-mtime` value (the
+/// R-c list-skew rationale is retired; no in-tree backend systematically
+/// false-fails). The residual race is a same-size replacement whose mtime
+/// is within tolerance between plan and delete.
+fn exec_delete_remote(
+    store: &dyn ObjectStore,
+    a: &crate::plan::Action,
+    opts: &crate::plan::PlanOpts,
+) -> Result<(), Error> {
+    let Some(planned_remote) = &a.remote else {
+        return Err(Error::Other(format!(
+            "delete-remote planned without remote entity: {}",
+            a.key
+        )));
+    };
+    match store.head(&a.key) {
+        Ok(cur) => {
+            if cur.size != planned_remote.size {
+                return Err(Error::Other(format!(
+                    "remote changed since plan for {}; not deleting",
+                    a.key
+                )));
+            }
+            // W119/R1-M2: post-W113 the planned `mtime_ms` IS the head/
+            // `vaultsync-mtime` value (the old R-c list-skew rationale is
+            // retired), so a same-size replacement whose mtime drifted
+            // beyond the tolerance between plan and delete is refused too;
+            // the residual race is only a same-size replacement within
+            // tolerance. Refuse only when both sides carry an mtime.
+            if let (Some(planned_m), Some(cur_m)) = (planned_remote.mtime_ms, cur.mtime_ms)
+                && planned_m.abs_diff(cur_m) > opts.mtime_tolerance_ms
+            {
+                return Err(Error::Other(format!(
+                    "remote changed since plan for {}; not deleting",
+                    a.key
+                )));
+            }
+        }
+        Err(Error::NotFound(_)) => {
+            // goal state already achieved (W10 idempotent-delete arm)
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    }
+    match store.delete(&a.key) {
+        Ok(()) => Ok(()),
+        // W10: head is best-effort; a delete-time NotFound still means
+        // the goal state was reached.
+        Err(Error::NotFound(_)) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Pass 4 per-item body (extracted from the inline pool closure,
+/// R4-L1/W39): a `pull --delete` re-verifies local freshness before
+/// removing the file (symmetric to upload R3.3 / download W13). The
+/// planned local entity is the truth the walk recorded; `a.local` is
+/// always `Some` for DeleteLocal - a missing one is a per-key error,
+/// never an unguarded delete.
+fn exec_delete_local(
+    local: &LocalFs,
+    a: &crate::plan::Action,
+    opts: &crate::plan::PlanOpts,
+) -> Result<(), Error> {
+    let Some(planned_local) = &a.local else {
+        return Err(Error::Other(format!(
+            "delete-local planned without local entity: {}",
+            a.key
+        )));
+    };
+    match local.delete_file_guarded(
+        &a.key,
+        planned_local.size,
+        planned_local.mtime_ms,
+        opts.mtime_tolerance_ms,
+    ) {
+        Ok(()) => Ok(()),
+        Err(Error::NotFound(_)) => {
+            // W32: the goal state (file absent) is achieved, so count a
+            // no-op delete as reaching it and keep the empty-dir cleanup
+            // pass active for this key's ancestor chain. (The guarded
+            // delete reports NotFound before any freshness check,
+            // matching the old delete_file contract.)
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn fail(rep: &mut ExecReport, key: &str, e: Error) {
@@ -2427,5 +2530,484 @@ mod tests {
         assert!(!dir.join("b.md").exists());
         assert!(store.head("b.md").is_ok());
         assert!(dir.join("a.md").exists());
+    }
+
+    /// I27 test double: records every event into a `Mutex<Vec<ProgressEvent>>`
+    /// (thread-safe for pool-driven emission, I27-thread).
+    #[derive(Default)]
+    struct RecordingProgress {
+        events: Mutex<Vec<ProgressEvent>>,
+    }
+    impl RecordingProgress {
+        fn new() -> Self {
+            RecordingProgress {
+                events: Mutex::new(Vec::new()),
+            }
+        }
+        fn events(&self) -> Vec<ProgressEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+    impl Progress for RecordingProgress {
+        fn event(&self, ev: ProgressEvent) {
+            self.events.lock().unwrap().push(ev);
+        }
+    }
+
+    /// Store wrapper that fails `put_from` for poisoned keys (I27 cycle 2:
+    /// per-key failure events).
+    struct FailPutStore {
+        inner: MemoryStore,
+        poison: std::sync::Mutex<std::collections::HashSet<String>>,
+    }
+    impl FailPutStore {
+        fn new() -> Self {
+            FailPutStore {
+                inner: MemoryStore::new(),
+                poison: std::sync::Mutex::new(std::collections::HashSet::new()),
+            }
+        }
+        fn poison(&self, key: &str) {
+            self.poison.lock().unwrap().insert(key.to_string());
+        }
+    }
+    impl ObjectStore for FailPutStore {
+        fn list(&self, prefix: &str) -> Result<Listing, Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<Entity, Error> {
+            self.inner.head(key)
+        }
+        fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime: Option<u64>,
+        ) -> Result<Entity, Error> {
+            if self.poison.lock().unwrap().contains(key) {
+                return Err(Error::Other(format!("poisoned:{key}")));
+            }
+            self.inner.put_from(key, r, size, mtime)
+        }
+        fn delete(&self, key: &str) -> Result<(), Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// Store wrapper that shuffles `put_from` completion order via a
+    /// key-hash sleep (I27 cycle 3 adversarial store, same pattern as
+    /// `ShuffleStore` but on the upload side).
+    struct PutShuffleStore {
+        inner: MemoryStore,
+    }
+    impl PutShuffleStore {
+        fn new() -> Self {
+            PutShuffleStore {
+                inner: MemoryStore::new(),
+            }
+        }
+        fn sleep_for(&self, key: &str) {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            use std::hash::{Hash as _, Hasher as _};
+            key.hash(&mut h);
+            std::thread::sleep(std::time::Duration::from_micros(h.finish() % 3000));
+        }
+    }
+    impl ObjectStore for PutShuffleStore {
+        fn list(&self, prefix: &str) -> Result<Listing, Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<Entity, Error> {
+            self.inner.head(key)
+        }
+        fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime: Option<u64>,
+        ) -> Result<Entity, Error> {
+            self.sleep_for(key);
+            self.inner.put_from(key, r, size, mtime)
+        }
+        fn delete(&self, key: &str) -> Result<(), Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    #[test]
+    fn execute_plan_with_progress_events_complete_under_concurrency() {
+        // I27 cycle 3: at concurrency 4 on an adversarial (hash-sleep) store,
+        // exactly one PassStart, exactly 16 KeyDones with 16 distinct keys,
+        // exactly one PassEnd, and the terminal RunEnd - regardless of
+        // completion interleaving (I27-events: no cross-key order asserted).
+        let dir = TempDir::new("vaultsync-exec");
+        let store = PutShuffleStore::new();
+        for i in 0..16 {
+            std::fs::write(dir.join(format!("k{i:02}.md")), format!("body-{i:02}")).unwrap();
+        }
+        let local = LocalFs::new(dir.path());
+        let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default())
+            .unwrap()
+            .plan;
+        let prog = RecordingProgress::new();
+        let rep = execute_plan_with_progress(
+            &local,
+            &store,
+            &plan,
+            Mode::Push,
+            &PlanOpts::default(),
+            4,
+            &prog,
+        );
+        assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
+        assert_eq!(rep.executed, 16);
+        let evs = prog.events();
+        assert_eq!(evs.len(), 1 + 16 + 1 + 1, "{:?}", evs);
+        assert_eq!(
+            evs[0],
+            ProgressEvent::PassStart {
+                kind: PassKind::Upload,
+                total_keys: 16,
+                total_bytes: 16 * 7,
+            }
+        );
+        let mut keys: Vec<String> = evs[1..17]
+            .iter()
+            .map(|ev| match ev {
+                ProgressEvent::KeyDone { key, ok, .. } => {
+                    assert!(*ok, "all uploads must succeed: {ev:?}");
+                    key.clone()
+                }
+                _ => panic!("expected KeyDone: {ev:?}"),
+            })
+            .collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), 16, "16 distinct keys");
+        assert_eq!(
+            evs[17],
+            ProgressEvent::PassEnd {
+                kind: PassKind::Upload
+            }
+        );
+        assert_eq!(
+            evs[18],
+            ProgressEvent::RunEnd {
+                executed: 16,
+                failed: 0
+            }
+        );
+    }
+
+    #[test]
+    fn execute_plan_with_progress_key_done_bytes_match_plan() {
+        // I27 cycle 3: the sum of KeyDone bytes equals the PassStart
+        // total_bytes for a mixed-size plan (I27-bytes accounting).
+        let dir = TempDir::new("vaultsync-exec");
+        let store = MemoryStore::new();
+        std::fs::write(dir.join("tiny.md"), "x").unwrap(); // 1 byte
+        std::fs::write(dir.join("mid.md"), "z".repeat(50)).unwrap(); // 50
+        std::fs::write(dir.join("big.md"), "y".repeat(1000)).unwrap(); // 1000
+        let local = LocalFs::new(dir.path());
+        let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default())
+            .unwrap()
+            .plan;
+        let prog = RecordingProgress::new();
+        execute_plan_with_progress(
+            &local,
+            &store,
+            &plan,
+            Mode::Push,
+            &PlanOpts::default(),
+            4,
+            &prog,
+        );
+        let evs = prog.events();
+        let total = match &evs[0] {
+            ProgressEvent::PassStart { total_bytes, .. } => *total_bytes,
+            e => panic!("expected PassStart first: {e:?}"),
+        };
+        let sum: u64 = evs
+            .iter()
+            .filter_map(|ev| match ev {
+                ProgressEvent::KeyDone { bytes, .. } => Some(*bytes),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(sum, total, "KeyDone bytes must sum to PassStart total");
+        assert_eq!(total, 1 + 50 + 1000);
+    }
+
+    #[test]
+    fn execute_plan_wrapper_matches_with_progress_report() {
+        // I27 cycle 4: the wrapper must behave byte-for-byte like the
+        // with-progress form fed `&NoProgress` - identical ExecReports and
+        // identical on-disk results (I20 determinism shape, reused: shuffled
+        // store, poisoned keys, concurrency 8).
+        let store = ShuffleStore::new();
+        for i in 0..24 {
+            put_str(
+                &store.inner,
+                &format!("k{i:02}.md"),
+                &format!("x{i}"),
+                Some(5000 + i),
+            );
+        }
+        store.poison("k03.md");
+        store.poison("k17.md");
+        let opts = PlanOpts::default();
+        let dir1 = TempDir::new("vaultsync-exec");
+        let plan = crate::build_plan(&LocalFs::new(dir1.path()), &store, Mode::Pull, &opts)
+            .unwrap()
+            .plan;
+        let dir2 = TempDir::new("vaultsync-exec");
+        let rep_wrapper = execute_plan(
+            &LocalFs::new(dir2.path()),
+            &store,
+            &plan,
+            Mode::Pull,
+            &opts,
+            8,
+        );
+        let dir3 = TempDir::new("vaultsync-exec");
+        let rep_progress = execute_plan_with_progress(
+            &LocalFs::new(dir3.path()),
+            &store,
+            &plan,
+            Mode::Pull,
+            &opts,
+            8,
+            &NoProgress,
+        );
+        assert_eq!(
+            rep_wrapper, rep_progress,
+            "wrapper report must equal the NoProgress form"
+        );
+        assert_eq!(
+            rep_wrapper.failed.len(),
+            2,
+            "both poisoned keys must fail: {:?}",
+            rep_wrapper.failed
+        );
+        // identical on-disk results (poisoned keys absent in both dirs)
+        for i in 0..24 {
+            let a = std::fs::read(dir2.path().join(format!("k{i:02}.md"))).unwrap_or_default();
+            let b = std::fs::read(dir3.path().join(format!("k{i:02}.md"))).unwrap_or_default();
+            assert_eq!(a, b, "k{i:02}.md");
+        }
+    }
+
+    #[test]
+    fn execute_plan_wrapper_emits_no_events() {
+        // I27 cycle 4: two pins that the wrapper runs with NoProgress.
+        // (a) Compile-time: the public signature keeps today's exact 6-arg
+        // shape - no progress parameter. A function-pointer coercion fails
+        // to compile if it ever grows one.
+        let _: fn(&LocalFs, &dyn ObjectStore, &Plan, Mode, &PlanOpts, u32) -> ExecReport =
+            execute_plan;
+        // (b) Behavioral: a failing run through the wrapper yields the same
+        // report as the with-progress form fed `&NoProgress` (the no-op
+        // sink, so no events are observable by construction).
+        let dir = TempDir::new("vaultsync-exec");
+        std::fs::write(dir.join("ok.md"), "ok").unwrap();
+        std::fs::write(dir.join("bad.md"), "bad").unwrap();
+        let local = LocalFs::new(dir.path());
+        let store = FailPutStore::new();
+        store.poison("bad.md");
+        let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default())
+            .unwrap()
+            .plan;
+        let rep_wrapper = execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default(), 1);
+        let rep_progress = execute_plan_with_progress(
+            &local,
+            &store,
+            &plan,
+            Mode::Push,
+            &PlanOpts::default(),
+            1,
+            &NoProgress,
+        );
+        assert_eq!(rep_wrapper, rep_progress);
+        assert_eq!(rep_wrapper.failed.len(), 1, "{:?}", rep_wrapper);
+    }
+
+    #[test]
+    fn execute_plan_with_progress_emits_pass_and_key_events_push() {
+        // I27 cycle 2: a 3-upload push at concurrency 1 emits exactly
+        // PassStart(Upload, 3 keys, sum of planned bytes) then three KeyDone
+        // (one per key; set semantics, never cross-key order) then
+        // PassEnd(Upload) then RunEnd { 3, 0 }.
+        let dir = TempDir::new("vaultsync-exec");
+        std::fs::write(dir.join("a.md"), "aaaaa").unwrap(); // 5 bytes
+        std::fs::write(dir.join("b.md"), "bbbbbbbbb").unwrap(); // 9 bytes
+        std::fs::write(dir.join("c.md"), "cc").unwrap(); // 2 bytes
+        let local = LocalFs::new(dir.path());
+        let store = MemoryStore::new();
+        let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default())
+            .unwrap()
+            .plan;
+        let prog = RecordingProgress::new();
+        let rep = execute_plan_with_progress(
+            &local,
+            &store,
+            &plan,
+            Mode::Push,
+            &PlanOpts::default(),
+            1,
+            &prog,
+        );
+        assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
+        let evs = prog.events();
+        assert_eq!(evs.len(), 6, "{:?}", evs);
+        assert_eq!(
+            evs[0],
+            ProgressEvent::PassStart {
+                kind: PassKind::Upload,
+                total_keys: 3,
+                total_bytes: 16,
+            }
+        );
+        let mut pairs: Vec<(String, u64, bool)> = evs[1..4]
+            .iter()
+            .map(|ev| match ev {
+                ProgressEvent::KeyDone { key, bytes, ok, .. } => (key.clone(), *bytes, *ok),
+                _ => panic!("expected KeyDone: {ev:?}"),
+            })
+            .collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("a.md".to_string(), 5, true),
+                ("b.md".to_string(), 9, true),
+                ("c.md".to_string(), 2, true),
+            ]
+        );
+        assert_eq!(
+            evs[4],
+            ProgressEvent::PassEnd {
+                kind: PassKind::Upload
+            }
+        );
+        assert_eq!(
+            evs[5],
+            ProgressEvent::RunEnd {
+                executed: 3,
+                failed: 0
+            }
+        );
+    }
+
+    #[test]
+    fn execute_plan_with_progress_emits_failure_event_and_run_end_counts() {
+        // I27 cycle 2: a failing key's KeyDone carries ok: false and RunEnd
+        // matches the ExecReport (executed 1 / failed 1).
+        let dir = TempDir::new("vaultsync-exec");
+        std::fs::write(dir.join("ok.md"), "ok").unwrap();
+        std::fs::write(dir.join("bad.md"), "bad").unwrap();
+        let local = LocalFs::new(dir.path());
+        let store = FailPutStore::new();
+        store.poison("bad.md");
+        let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default())
+            .unwrap()
+            .plan;
+        let prog = RecordingProgress::new();
+        let rep = execute_plan_with_progress(
+            &local,
+            &store,
+            &plan,
+            Mode::Push,
+            &PlanOpts::default(),
+            1,
+            &prog,
+        );
+        assert_eq!(rep.executed, 1, "{:?}", rep);
+        assert_eq!(rep.failed.len(), 1, "{:?}", rep);
+        let evs = prog.events();
+        for key in ["ok.md", "bad.md"] {
+            let done = evs
+                .iter()
+                .find(|ev| matches!(ev, ProgressEvent::KeyDone { key: k, .. } if k == key))
+                .unwrap_or_else(|| panic!("no KeyDone for {key}: {evs:?}"));
+            match done {
+                ProgressEvent::KeyDone { ok, .. } => assert_eq!(*ok, key == "ok.md"),
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!(
+            evs.last(),
+            Some(&ProgressEvent::RunEnd {
+                executed: 1,
+                failed: 1
+            })
+        );
+    }
+
+    #[test]
+    fn execute_plan_with_progress_skips_empty_passes() {
+        // I27 cycle 2 / I27-render: zero-item passes emit no PassStart/PassEnd
+        // (a pure-download pull plan has no Upload pass events), but the
+        // download pass and the final RunEnd still fire.
+        let dir = TempDir::new("vaultsync-exec");
+        let store = MemoryStore::new();
+        put_str(&store, "r.md", "remote", Some(100));
+        let local = LocalFs::new(dir.path());
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
+            .unwrap()
+            .plan;
+        assert!(plan.actions.iter().all(|a| a.kind == ActionKind::Download));
+        let prog = RecordingProgress::new();
+        let rep = execute_plan_with_progress(
+            &local,
+            &store,
+            &plan,
+            Mode::Pull,
+            &PlanOpts::default(),
+            1,
+            &prog,
+        );
+        assert_eq!(rep.executed, 1, "{:?}", rep);
+        let evs = prog.events();
+        assert!(
+            !evs.iter().any(|ev| matches!(
+                ev,
+                ProgressEvent::PassStart {
+                    kind: PassKind::Upload,
+                    ..
+                }
+            )),
+            "no Upload PassStart: {evs:?}"
+        );
+        assert!(
+            !evs.iter().any(|ev| matches!(
+                ev,
+                ProgressEvent::PassEnd {
+                    kind: PassKind::Upload
+                }
+            )),
+            "no Upload PassEnd: {evs:?}"
+        );
+        assert!(evs.iter().any(|ev| matches!(
+            ev,
+            ProgressEvent::PassStart {
+                kind: PassKind::Download,
+                ..
+            }
+        )));
+        assert_eq!(
+            evs.last(),
+            Some(&ProgressEvent::RunEnd {
+                executed: 1,
+                failed: 0
+            })
+        );
     }
 }

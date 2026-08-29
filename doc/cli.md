@@ -57,6 +57,26 @@ vaultsync push --force-local
 vaultsync push --dry-run         # plan only, no mutations (push/pull only, not a global flag)
 ```
 
+### Progress output (push/pull)
+
+Push and pull render a live progress bar on stderr while the executor runs
+(issue 27), e.g. one `\r`-refreshed line per active pass:
+
+```text
+Uploading  notes/foo.md  847/1204  [=========>--------]  70%  12.4 MiB/s  ETA 0:01:12
+```
+
+- **stderr only, TTY only.** The bar appears only when stderr is a terminal
+  (`std::io::stderr().is_terminal()`); piped or redirected stderr stays quiet.
+  stdout is never touched: it carries the plan text (and the `--json` stream
+  later, Phase 3).
+- Passes with nothing to do render nothing; each pass ends with a newline.
+- `status`, `check`, `--dry-run` and `--json` never render progress.
+- Rate is cumulative (`bytes / elapsed`); ETA is `remaining / rate` - no
+  sliding window, so a mixed-size vault shows a jittery ETA (accepted v1).
+- There is no `--progress=` flag yet; the mode seam (`Auto`/`Off`/`Always`)
+  is the extension point for one.
+
 ### `vaultsync check`
 
 Connectivity probe: put/get/delete a tiny probe object under the prefix (no

@@ -10,6 +10,7 @@ pub mod exec;
 pub mod local;
 pub mod plan;
 pub(crate) mod pool;
+pub mod progress;
 pub mod store;
 
 use std::path::Path;
