@@ -37,23 +37,26 @@ Tracked on GitHub: #14 (tracking issue) with sub-issues #3-#13 in priority tiers
    the profile)
 3. Concurrency limits + retries with backoff on transient S3 errors
    (`[transfer].concurrency` parses but is inert with a warning, W28/M6;
-   `LocalFs` is already Send/Sync, W82; transfers stay sequential)
+   `LocalFs` is already Send/Sync, W82; transfers stay sequential).
+   List-enrichment heads are the request pool's primary consumer: every
+   list-driven plan is currently 1+ ListObjectsV2 pages + N sequential heads
+   (~N x RTT), with only the W117 bounded retry (3 attempts, [100ms, 300ms]
+   fixed backoff) as a stopgap - the "retries with backoff" item is newly
+   load-bearing post-I15 (R2-3) and owns full backoff/jitter/concurrency
 4. Lock file to prevent concurrent runs on same vault
 5. JSON schema stability for `--json` (parses today; dispatch rejects with
    "not implemented (Phase 3)" + exit 1)
 6. Integration test optional gate in CI
-7. Head-on-list (or HEAD-sample on size-equal candidates) so list-driven plans
-   see client mtimes instead of upload `LastModified` (PR2 A-M1 follow-up)
-8. CI: pin the toolchain and verify MSRV 1.85 (A-L9; `rust-version = "1.85"`
+7. CI: pin the toolchain and verify MSRV 1.85 (A-L9; `rust-version = "1.85"`
    is already pinned in Cargo.toml, Slice 10 - what remains is the CI
    workflow); set `VAULTSYNC_TEST_S3_BUCKET` in CI so the env-gated suite
    genuinely runs, and consider `#[ignore]` + `--ignored` or a CI sentinel so
    a silent skip cannot look green (B-L7 hardening)
-9. Consider anchoring a relative `vault_root` to the config file's directory
+8. Consider anchoring a relative `vault_root` to the config file's directory
    instead of the cwd (PR2 B-L10) - breaking-change review
-10. Cloudflare R2 endpoint matrix row (still pending; the path-style toggle
-    test exercises both flavors there, PR2 A-M8/W12)
-11. Walker depth: recursion is unbounded; add a depth cap or iterative walk
+9. Cloudflare R2 endpoint matrix row (still pending; the path-style toggle
+   test exercises both flavors there, PR2 A-M8/W12)
+10. Walker depth: recursion is unbounded; add a depth cap or iterative walk
     before executor-era deep trees (re-deferred from the Phase 2 checklist,
     L3)
 
@@ -176,6 +179,12 @@ Record choices here as they are made.
 | 2026-08-28 | PR2-W107 finalize-temp-guard | `finalize_write` refuses a temp that is no longer a regular file (symlink swap or node replacement) before re-opening it by path, removes the temp, and fails the key with the observed type; the rustdoc drops the false "provably harmless" claim (r12 M2). |
 | 2026-08-28 | PR2-W108 temp-owner-only | Download temp siblings are created owner-only `0600` like upload buffers (W14), via a shared `create_new_owner_only` helper used by both sides so the policy cannot drift again (r12 L1). |
 | 2026-08-29 | I15-head-on-list | Issue #15 fix (W111-W113): `list` now enriches each listed object entity's `mtime`/`etag` via a per-object `HeadObject` (`enrich_with_head_mtimes`), so list-driven plans compare client mtimes instead of upload `LastModified`. I15-approach chose **Option 1** (per-object head in `list`, preserving exact-mtime restoration and the stateless design) over **Option 2** (a local state cache - cuts against statelessness) and **Option 3** (converges without a head, but sacrifices exact-mtime restoration, a verified feature). I15-errors: fail-closed - a `NotFound` head drops the row (concurrent-delete race), any other head error fails the listing (W61 ethos, `pull --delete` safety). I15-concurrency: sequential heads for now; bounded concurrency / batching deferred to Phase 3's request-pool work. Supersedes PR2-defer-head-on-list. Accepted cost: 1+ ListObjectsV2 page requests plus N HeadObject requests (N = remote objects under the prefix) per list-driven plan. |
+| 2026-08-29 | P3-scope refresh | Phase 3 re-audited after 5e0526a: multipart moved to post-v1 (the `put_from` error, cli.md, and object-store.md already lock it post-v1; the W80 client-side ceiling rejection is the v1 behavior); ignore/concurrency items annotated as parsed-but-inert (W25/M3, W28/M6); MSRV item scoped down to the CI workflow (`rust-version` already pinned); walker depth cap added - the Phase 2 checklist re-deferral had no Phase 3 home. |
+| 2026-08-29 | I15-r1-size-from-head | W115: `enrich_with_head_mtimes` now takes `size` (plus `mtime_ms` and `etag`) from the same `HeadObject`, so the planned entity is one coherent head snapshot - aligning the W106 `CappedWriter` cap and the W62 head-before-delete size check with the mtime identity the planner just trusted; residual race shrinks to the enrich-head -> get/delete-head window. |
+| 2026-08-29 | I15-r1-notfound-warning | W116: a listed key that vanishes before its head is surfaced (not hidden) as one bounded `Listing.warnings` entry (5 names + "and N more"), matching the W70/W79 surface-don't-hide ethos. |
+| 2026-08-29 | I15-r1-head-retry | W117: `Unavailable`/`Timeout` heads are retried up to 3 attempts ([100ms, 300ms] fixed backoff) before failing closed; a stopgap - full backoff/jitter/concurrency stays Phase 3 item 3's request pool. |
+| 2026-08-29 | I15-r1-reserved-prefilter | W118: `S3Store::list` partitions reserved-namespace leftovers (`.vaultsync-check-*` / `.*.vaultsync-tmp-*`) out before any head - no wasted requests and no fail-closed scope creep over junk keys; `build_plan`'s partition stays as a second-line guard for other backends (single `reserved_drops_warning` source of truth). |
+| 2026-08-29 | I15-r1-delete-mtime-arm | W119: `DeleteRemote` freshness also refuses a same-size replacement whose mtime drifted beyond the tolerance between plan and delete (post-W113 the planned mtime is the head/`vaultsync-mtime`, retiring the R-c list-skew rationale); residual race is a same-size, within-tolerance replacement. |
 | 2026-08-28 | PR2-W109 reserved-folder-filter | `partition_reserved_remote_keys` strips one trailing `/` before extracting the final segment, so folder-form keys (`.vaultsync-check-1/`, `a/.name.vaultsync-tmp-1-2/`) are filtered like file keys (r12 L4). |
 
 ## Open decisions

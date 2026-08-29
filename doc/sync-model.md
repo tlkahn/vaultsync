@@ -107,7 +107,7 @@ Object stores do not preserve client mtime as a first-class writable field on al
 
 v1 S3 policy:
 
-1. On `put`, write user metadata `mtime` (milliseconds since epoch, decimal string) when permitted by the API.
+1. On `put`, write user metadata `vaultsync-mtime` (milliseconds since epoch, decimal string) when permitted by the API.
 2. On `list`/`head`, prefer metadata mtime; else `LastModified`.
 3. After `download`, apply mtime to local file when the platform allows.
 

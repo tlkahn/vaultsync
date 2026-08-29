@@ -132,7 +132,9 @@ impl S3Store {
                     let Some(rel) = strip_prefix(&self.prefix, full) else {
                         continue;
                     };
-                    // LastModified is the only mtime source in a listing.
+                    // LastModified is the only mtime source in a raw listing;
+                    // `enrich_with_head_mtimes` overwrites mtime/etag/size for
+                    // object entities before `list` returns (W113/I15).
                     let last = obj.last_modified().and_then(dt_millis);
                     out.push((
                         rel.to_string(),
