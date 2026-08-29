@@ -41,6 +41,7 @@ use crate::config::StoreSettings;
 use crate::entity::Entity;
 use crate::error::Error;
 use crate::store::{Listing, ObjectStore, enrich_with_head_mtimes};
+use crate::{partition_reserved_remote_keys, reserved_drops_warning};
 
 /// User-metadata key for the client-visible mtime (decimal ms).
 const MTIME_KEY: &str = "vaultsync-mtime";
@@ -501,13 +502,25 @@ impl ObjectStore for S3Store {
         // the `Listing.warnings` channel (same text as before, minus the CLI
         // "warning: " prefix) so the CLI layer prints it; library code must
         // not write to process stderr.
-        let warnings = dropped_folder_warnings(dropped_nonempty);
+        let mut warnings = dropped_folder_warnings(dropped_nonempty);
+        // W118/R2-2: partition reserved-namespace leftovers
+        // (`.vaultsync-check-*` / `.name.vaultsync-tmp-*`) out of the listing
+        // *before* any head is issued - no wasted requests and no fail-closed
+        // scope creep (a transient head error on a junk key must not abort
+        // the run). The shared `reserved_drops_warning` is appended here once;
+        // `build_plan`'s partition stays as a second-line guard for other
+        // backends and no longer fires for S3.
+        let (entities, reserved_dropped) = partition_reserved_remote_keys(entities);
+        if !reserved_dropped.is_empty() {
+            warnings.push(reserved_drops_warning(&reserved_dropped));
+        }
         // W113/I15: ListObjectsV2 cannot return user metadata, so the
         // converted entities carry upload `LastModified` mtimes; enrich each
-        // object's mtime/etag via a per-object HeadObject (`head` reads
+        // object's mtime/etag/size via a per-object HeadObject (`head` reads
         // `vaultsync-mtime`) so list-driven plans compare client mtimes, not
         // upload times. Folder views are skipped; a NotFound head drops the
-        // row; any other head error fails the listing (I15-errors).
+        // row (surfaced as a bounded warning); transient errors are retried
+        // (W117); any other head error fails the listing (I15-errors).
         enrich_with_head_mtimes(self, Listing { entities, warnings })
     }
 
