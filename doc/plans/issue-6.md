@@ -44,6 +44,30 @@ cleanup in `with_store`. Crate is edition 2024 (`std::env::set_var` is
   repo variables, the PR verification (step 7), the sentinel break-test on
   the PR (step 8), and the first nightly observation (step 9).
 
+Update (PR #19 execution):
+
+- **AWS setup done** (root creds): bucket `vaultsync-itest-695018654605`
+  (us-west-1, public access blocked), lifecycle rule `expire-ci-itest-leaks`
+  (7 days on `ci/vaultsync-itest-`), OIDC provider, role
+  `vaultsync-itest-ci`; repo variables set.
+- **OIDC trust-policy fix:** first run failed `AssumeRoleWithWebIdentity`.
+  A temporary debug step decoded the actual JWT: GitHub now emits
+  `sub = repo:tlkahn@335719/vaultsync@1348364460:pull_request` (new
+  owner@id/repo@id format), which `repo:tlkahn/vaultsync:*` never matches.
+  Trust policy now StringLike-matches BOTH the legacy and the ID-pinned new
+  format (the new one is rename-proof). Debug commit reverted.
+- **PR gate green:** all 9 S3 tests + the sentinel unit test ran for real
+  via OIDC (log shows `[ok]` lines; 0.74s of tests - the runner is close to
+  us-west-1; 1m55s end-to-end cold, 26s warm).
+- **Sentinel break-test (step 8):** a commit blanking
+  `VAULTSYNC_TEST_S3_BUCKET` turned the job red in 35s as required - but via
+  an opaque "failed to construct request", not the sentinel: an empty repo
+  variable expands to `""`, and `std::env::var` returns `Ok("")`, so the
+  sentinel never fired. Hardened: `bucket_or_skip` treats
+  empty/whitespace-only as missing (unit test gains the arms); break-test
+  commit reverted; follow-up run green.
+- **Remaining:** merge, then the first nightly observation (step 9).
+
 ---
 
 ## Scope (from the issue spec)
