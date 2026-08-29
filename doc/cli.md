@@ -16,7 +16,7 @@ vaultsync [global flags] <command> [command flags]
 | `-v, --verbose` | repeatable debug noise on stderr |
 | `--json` | machine-readable stdout (**Phase 3**: parses, but dispatch rejects it as not implemented) |
 | `-y, --yes` | skip confirmation for destructive flags (**Phase 3**: rejected as unknown today) |
-| `--concurrency <n>` | transfer workers (**Phase 3**: rejected as unknown today) |
+| `--concurrency <n>` | transfer workers (config-only: no CLI flag; set `[transfer].concurrency`, live since issue 20) |
 
 ## Commands
 
@@ -94,7 +94,7 @@ region = "us-west-2"
 # ]
 
 [transfer]
-# concurrency = 4   # Phase 3 (parallel transfers are not yet applied); an explicit copy of the default is silent
+# concurrency = 4   # live (issue 20): bounds transfer passes AND list-enrichment heads; 1 = sequential; >= 1
 mtime_tolerance_ms = 1000
 # max_delete = 100
 
@@ -113,10 +113,14 @@ mtime_tolerance_ms = 1000
 > but not yet applied. A `push`/`pull`/`check` run refuses loudly when it is
 > present (exit 1); `status` warns on stderr and proceeds. Do not expect it
 > to filter the plan until the roadmap's ignore-patterns phase lands.
->
-> `[transfer].concurrency` is likewise a **Phase 3 feature** (inert until the
-> pool exists). Setting a value that differs from the default warns on every
-> run; an explicit copy of the default (`4`) is silent.
+
+`[transfer].concurrency` is **live** (issue 20): it bounds how many
+operations run in flight - the transfer passes (downloads, uploads,
+`DeleteRemote`, `DeleteLocal`) and the per-object head calls that enrich
+`list` results. Default `4`; must be `>= 1` (a loud config error otherwise);
+`1` runs everything sequentially on the caller's thread (the pre-issue-20
+behavior). There is no `--concurrency` CLI flag - this is a config-only
+knob, so `--concurrency` stays rejected as an unknown flag.
 
 `[transfer.retry]` is **live** (not Phase 3): the three knobs map directly to
 AWS SDK **standard-mode** retry policy (exponential backoff with jitter, and
@@ -137,12 +141,12 @@ to the S3 client vaultsync builds - the resolved `[transfer.retry]` policy
 replaces the ambient AWS retry configuration at client build, whether or not
 the section is present.
 
-If you want the full populated form (Phase 3, not yet applied), it is shown
-here for reference; copying it as-is will refuse `push`/`pull`/`check` until
-the ignore-patterns phase lands.
+If you want the full populated form, it is shown here for reference;
+`[transfer]` keys are live, but copying the `[ignore]` block as-is will
+refuse `push`/`pull`/`check` until the ignore-patterns phase lands.
 
 ```toml
-# Phase 3 (not yet applied): do not copy verbatim
+# [ignore] is Phase 3 (not yet applied): do not copy verbatim
 vault_root = "/Users/me/Notes"
 
 [store]

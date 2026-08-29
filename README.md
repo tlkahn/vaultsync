@@ -29,8 +29,10 @@ collision/mtime/case policies, `--follow-symlinks`, and an env-gated S3
 integration suite. Verified on AWS S3 (byte-identical + exact mtimes); the
 Cloudflare R2 matrix row is pending (no R2 endpoint this session). `cargo test`
 green offline (no network in the default suite). Phase 3 (the delete
-confirmation rail - `--yes`/`--max-delete`/prompt - ignore patterns,
-concurrency, CI) is next; the Phase 2 delete-safety surface is already
+confirmation rail - `--yes`/`--max-delete`/prompt - ignore patterns, and
+CI) is next; transfer concurrency already landed under issue 20
+(`[transfer].concurrency`, config-only, default 4). The Phase 2 delete-
+safety surface is already
 landed (freshness guards, parent locality, head-before-delete,
 NotFound-as-success).
 
@@ -79,12 +81,12 @@ action a plan - or delete files - against a non-existent store).
   post-pass is scoped to the ancestor chains of the files deleted this run
   (deepest-first, never the vault root): a pre-existing, plan-unrelated empty
   dir (e.g. an intentional `attachments/`) is kept.
-- **`[ignore].patterns` and `[transfer].concurrency` are Phase 3.** They are
-  parsed but not yet applied: `push`/`pull`/`check` refuse loudly on a
-  non-empty `[ignore].patterns` (`status` warns), and an explicitly-set
-  `[transfer].concurrency` that **differs from the default** warns on every
-  run until the pool exists (an explicit copy of the default, `4`, is
-  silent - it is behaviorally indistinguishable from omitting the key).
+- **`[ignore].patterns` is Phase 3.** It is parsed but not yet applied:
+  `push`/`pull`/`check` refuse loudly on a non-empty `[ignore].patterns`
+  (`status` warns).
+- **`[transfer].concurrency` is live (issue 20).** It bounds how many
+  transfers and list-enrichment heads run in flight (default 4, must be
+  `>= 1`; `1` = sequential). Config-only - there is no `--concurrency` flag.
 - **The `[transfer.retry]` table under `[transfer]` is live (not Phase 3).** The three knobs
   (`max_attempts` / `base_delay_ms` / `max_delay_ms`) map to the AWS SDK
   standard-mode retry policy on the S3 client; `max_attempts = 1` disables
