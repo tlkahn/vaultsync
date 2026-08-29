@@ -97,7 +97,7 @@ jobs:
     env:
       # Repo variables, not secrets: none of these are sensitive and showing
       # them in logs aids debugging. OIDC stores no AWS keys at all.
-      VAULTSYNC_TEST_S3_BUCKET: "" # TEMP break-test: blanked, job must go red
+      VAULTSYNC_TEST_S3_BUCKET: ${{ vars.VAULTSYNC_TEST_S3_BUCKET }}
       VAULTSYNC_TEST_S3_REGION: ${{ vars.VAULTSYNC_TEST_S3_REGION }}
       VAULTSYNC_TEST_S3_PREFIX: ci/
       # No-silent-skip sentinel (I6-sentinel): a missing bucket var fails
