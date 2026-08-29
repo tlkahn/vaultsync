@@ -57,10 +57,14 @@ jobs:
       - run: cargo test --locked --lib --bins
 
   msrv:
+    # The job name hardcodes the floor for check-list readability; rename it
+    # in the same commit as any `rust-version` bump in Cargo.toml.
     name: msrv (1.95)
     runs-on: ubuntu-latest
     env:
-      RUSTUP_TOOLCHAIN: 1.95.0   # env beats rust-toolchain.toml; the declared MSRV floor
+      # env beats rust-toolchain.toml; the declared MSRV floor - must match
+      # `rust-version` in Cargo.toml (bump both in the same commit).
+      RUSTUP_TOOLCHAIN: 1.95.0
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust 1.95.0
