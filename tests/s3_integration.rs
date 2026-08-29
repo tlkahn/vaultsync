@@ -93,11 +93,27 @@ where
 /// because the pool is `pub(crate)` and invisible to the external test crate.
 /// Order of deletes does not matter; counts and per-key W104 stderr do.
 /// Returns `(deleted, delete_errs)`.
+///
+/// I17-r1/F5 (W164): the worker count is capped at
+/// [`MAX_CLEANUP_DELETE_WORKERS`] via the pure `cleanup_delete_workers`
+/// helper (pinned offline below) - 128 OS threads against the single
+/// current-thread runtime (K=128 paginate cleanup) is needlessly rough on S3
+/// and the CI runner. Product `crate::pool::run_bounded` is unchanged.
+const MAX_CLEANUP_DELETE_WORKERS: usize = 32;
+
+/// Pure worker-count derivation for cleanup deletes: keep the pre-existing
+/// `.max(1)` / `min(concurrency, n_keys)` behavior, add the F5 ceiling.
+fn cleanup_delete_workers(concurrency: u32, n_keys: usize) -> usize {
+    (concurrency as usize)
+        .min(n_keys)
+        .clamp(1, MAX_CLEANUP_DELETE_WORKERS)
+}
+
 fn delete_keys_bounded(store: &S3Store, keys: &[String], concurrency: u32) -> (usize, usize) {
     if keys.is_empty() {
         return (0, 0);
     }
-    let workers = (concurrency as usize).min(keys.len()).max(1);
+    let workers = cleanup_delete_workers(concurrency, keys.len());
     let next = std::sync::atomic::AtomicUsize::new(0);
     let deleted = std::sync::atomic::AtomicUsize::new(0);
     let delete_errs = std::sync::atomic::AtomicUsize::new(0);
@@ -126,6 +142,26 @@ fn delete_keys_bounded(store: &S3Store, keys: &[String], concurrency: u32) -> (u
         deleted.load(std::sync::atomic::Ordering::SeqCst),
         delete_errs.load(std::sync::atomic::Ordering::SeqCst),
     )
+}
+
+#[test]
+fn cleanup_delete_workers_clamps_to_max() {
+    // I17-r1/F5 (W164): the cleanup delete fan-out is capped at 32 workers -
+    // 128 OS threads against the single current-thread S3 runtime (K=128
+    // paginate cleanup) is needlessly rough on S3 and the CI runner.
+    assert_eq!(cleanup_delete_workers(128, 1050), 32);
+}
+
+#[test]
+fn cleanup_delete_workers_respects_key_count() {
+    // I17-r1/F5: never spawn more workers than there are keys.
+    assert_eq!(cleanup_delete_workers(128, 4), 4);
+}
+
+#[test]
+fn cleanup_delete_workers_at_least_one() {
+    // I17-r1/F5: the pre-existing `.max(1)` contract is preserved.
+    assert_eq!(cleanup_delete_workers(0, 10), 1);
 }
 
 /// [`with_store`] with a non-default `[transfer].concurrency` (issue 20 cycle
