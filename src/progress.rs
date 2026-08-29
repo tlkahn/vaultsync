@@ -31,7 +31,12 @@ pub enum ProgressEvent {
         total_bytes: u64,
     },
     /// One key finished (transfer or delete). `bytes` is the action's
-    /// planned byte size (0 for deletes); `ok` mirrors the per-key result.
+    /// planned byte size (0 for deletes) regardless of `ok` - the executor
+    /// always emits the planned size on success and failure. `ok` mirrors
+    /// the per-key result; consumers tracking transferred bytes should
+    /// accumulate only on `ok` and subtract a failed key's planned bytes
+    /// from the pass total (the in-tree `ProgressLine` does exactly this,
+    /// policy B, PR 28 r1 F1).
     KeyDone {
         kind: PassKind,
         key: String,
@@ -113,13 +118,20 @@ impl ProgressLine {
                 kind,
                 key,
                 bytes,
-                ok: _,
+                ok,
             } => {
                 if self.pass == Some(kind) {
                     self.done += 1;
-                    // I27-bytes: failed keys still advance the key count;
-                    // bytes only accumulate from what actually completed.
-                    self.bytes_done += bytes;
+                    // I27-bytes (policy B, PR 28 r1 F1): failed keys still
+                    // advance the key count but only successful bytes
+                    // accumulate; the failed key's planned bytes leave the
+                    // pass total so the final frame stays a clean 100% with
+                    // no phantom ETA and rate/ETA reflect bytes that landed.
+                    if ok {
+                        self.bytes_done += bytes;
+                    } else {
+                        self.total_bytes = self.total_bytes.saturating_sub(bytes);
+                    }
                     self.current_key = key;
                 }
             }
@@ -921,5 +933,177 @@ mod tests {
     fn progress_is_send_sync() {
         fn assert_ss<T: ?Sized + Send + Sync>() {}
         assert_ss::<dyn super::Progress>();
+    }
+
+    // PR 28 r1 F1 (policy B): a failed key advances the key count but its
+    // planned bytes NEVER accumulate into `bytes_done`, so rate/ETA reflect
+    // bytes that actually landed. RED today: the failure's 600 bytes inflate
+    // `bytes_done` to 1000 and the rate renders as 500 B/s.
+    #[test]
+    fn key_done_failure_bytes_do_not_inflate_rate() {
+        let mut line = ProgressLine::new();
+        line.on_event(
+            ProgressEvent::PassStart {
+                kind: PassKind::Upload,
+                total_keys: 2,
+                total_bytes: 1000,
+            },
+            0,
+        );
+        // 600-byte key fails, 400-byte key succeeds, over 2s.
+        line.on_event(
+            ProgressEvent::KeyDone {
+                kind: PassKind::Upload,
+                key: "a.md".to_string(),
+                bytes: 600,
+                ok: false,
+            },
+            1000,
+        );
+        line.on_event(
+            ProgressEvent::KeyDone {
+                kind: PassKind::Upload,
+                key: "b.md".to_string(),
+                bytes: 400,
+                ok: true,
+            },
+            2000,
+        );
+        let r = line.render();
+        assert!(r.contains("2/2"), "{r}");
+        assert!(r.contains("100%"), "{r}");
+        // rate from the 400 transferred bytes over 2s, not the 1000 planned
+        assert!(
+            r.contains("200.0 B/s"),
+            "rate must count successful bytes: {r}"
+        );
+        assert!(!r.contains("ETA"), "no leftover ETA at done==total: {r}");
+    }
+
+    // PR 28 r1 F1 (policy B): the failed key's planned bytes leave the pass
+    // total (`total_bytes` shrinks), so a mid-pass ETA is computed against
+    // the adjusted remainder. RED today: `total_bytes` stays 1000 and the
+    // failure's bytes still count toward the rate, giving a wrong ETA.
+    #[test]
+    fn key_done_failure_shrinks_total_before_pass_end() {
+        let mut line = ProgressLine::new();
+        line.on_event(
+            ProgressEvent::PassStart {
+                kind: PassKind::Upload,
+                total_keys: 3,
+                total_bytes: 1000,
+            },
+            0,
+        );
+        // the 600-byte key fails: its planned size leaves the pass total
+        line.on_event(
+            ProgressEvent::KeyDone {
+                kind: PassKind::Upload,
+                key: "a.md".to_string(),
+                bytes: 600,
+                ok: false,
+            },
+            1000,
+        );
+        assert_eq!(
+            line.total_bytes, 400,
+            "failed planned bytes must shrink the pass total"
+        );
+        // one 200-byte success at t=2000: bytes_done 200 over 2s = 100 B/s;
+        // remaining = 400 - 200 = 200 -> ETA 2s (`0:02`).
+        line.on_event(
+            ProgressEvent::KeyDone {
+                kind: PassKind::Upload,
+                key: "b.md".to_string(),
+                bytes: 200,
+                ok: true,
+            },
+            2000,
+        );
+        let r = line.render();
+        assert!(r.contains("100.0 B/s"), "{r}");
+        assert!(
+            r.contains("ETA 0:02"),
+            "ETA must use the shrunk total (400-200): {r}"
+        );
+    }
+
+    // PR 28 r1 F1 edge (1): an all-keys-fail pass saturates `total_bytes` to
+    // zero and leaves `bytes_done` at zero, so the final frame shows 100%
+    // keys with no rate and no ETA. RED today: bytes_done still holds the
+    // failed bytes and a 500 B/s rate renders.
+    #[test]
+    fn key_done_all_failures_saturate_total_to_zero() {
+        let mut line = ProgressLine::new();
+        line.on_event(
+            ProgressEvent::PassStart {
+                kind: PassKind::Upload,
+                total_keys: 2,
+                total_bytes: 1000,
+            },
+            0,
+        );
+        line.on_event(
+            ProgressEvent::KeyDone {
+                kind: PassKind::Upload,
+                key: "a.md".to_string(),
+                bytes: 600,
+                ok: false,
+            },
+            1000,
+        );
+        line.on_event(
+            ProgressEvent::KeyDone {
+                kind: PassKind::Upload,
+                key: "b.md".to_string(),
+                bytes: 400,
+                ok: false,
+            },
+            2000,
+        );
+        assert_eq!(line.total_bytes, 0, "total saturates to zero");
+        assert_eq!(line.bytes_done, 0, "no bytes transferred");
+        let r = line.render();
+        assert!(r.contains("2/2"), "{r}");
+        assert!(r.contains("100%"), "{r}");
+        assert!(
+            !r.contains("B/s"),
+            "no rate with zero transferred bytes: {r}"
+        );
+        assert!(!r.contains("ETA"), "no ETA: {r}");
+    }
+
+    // PR 28 r1 F1 edge (2): a failed delete (bytes == 0) subtracts zero, so
+    // delete failures never distort byte accounting and the render is
+    // unaffected. No panic; `total_bytes` stays 0. Green on arrival (the
+    // 0-byte failure is a no-op under both policies) - characterization.
+    #[test]
+    fn key_done_failed_delete_subtracts_zero() {
+        let mut line = ProgressLine::new();
+        line.on_event(
+            ProgressEvent::PassStart {
+                kind: PassKind::DeleteRemote,
+                total_keys: 1,
+                total_bytes: 0,
+            },
+            0,
+        );
+        line.on_event(
+            ProgressEvent::KeyDone {
+                kind: PassKind::DeleteRemote,
+                key: "gone.md".to_string(),
+                bytes: 0,
+                ok: false,
+            },
+            1000,
+        );
+        assert_eq!(line.total_bytes, 0);
+        assert_eq!(line.bytes_done, 0);
+        assert_eq!(line.done, 1);
+        let r = line.render();
+        assert!(r.contains("1/1"), "{r}");
+        assert!(r.contains("100%"), "{r}");
+        assert!(!r.contains("B/s"), "{r}");
+        assert!(!r.contains("ETA"), "{r}");
     }
 }

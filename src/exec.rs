@@ -541,6 +541,7 @@ mod tests {
     use super::*;
     use crate::entity::Entity;
     use crate::plan::PlanOpts;
+    use crate::progress::ProgressLine;
     use crate::store::Listing;
     use crate::store::mock::MemoryStore;
     use crate::testutil::TempDir;
@@ -2710,7 +2711,11 @@ mod tests {
     #[test]
     fn execute_plan_with_progress_key_done_bytes_match_plan() {
         // I27 cycle 3: the sum of KeyDone bytes equals the PassStart
-        // total_bytes for a mixed-size plan (I27-bytes accounting).
+        // total_bytes for a mixed-size plan (I27-bytes accounting). This
+        // identity holds on the WIRE - the executor always emits planned
+        // bytes; the success-only accounting (policy B, PR 28 r1 F1) is a
+        // consumer-side (`ProgressLine`) policy, so an all-success plan
+        // keeps sum == total unchanged.
         let dir = TempDir::new("vaultsync-exec");
         let store = MemoryStore::new();
         std::fs::write(dir.join("tiny.md"), "x").unwrap(); // 1 byte
@@ -2948,6 +2953,89 @@ mod tests {
                 executed: 1,
                 failed: 1
             })
+        );
+    }
+
+    #[test]
+    fn execute_plan_with_progress_failed_key_bytes_policy() {
+        // PR 28 r1 F1 (policy B) at the executor boundary: a poisoned large
+        // key still emits `KeyDone { ok: false, bytes: <planned> }` on the
+        // wire, but a `ProgressLine` fed the recorded stream counts only the
+        // successful key's bytes. RED today on the render-shape assertions:
+        // the poisoned key's planned 1000 bytes inflate the cumulative rate.
+        let dir = TempDir::new("vaultsync-exec");
+        std::fs::write(dir.join("big.md"), "y".repeat(1000)).unwrap(); // 1000 bytes
+        std::fs::write(dir.join("small.md"), "abc").unwrap(); // 3 bytes
+        let local = LocalFs::new(dir.path());
+        let store = FailPutStore::new();
+        store.poison("big.md");
+        let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default())
+            .unwrap()
+            .plan;
+        let prog = RecordingProgress::new();
+        let rep = execute_plan_with_progress(
+            &local,
+            &store,
+            &plan,
+            Mode::Push,
+            &PlanOpts::default(),
+            1,
+            &prog,
+        );
+        assert_eq!(rep.executed, 1, "{:?}", rep);
+        assert_eq!(rep.failed.len(), 1, "{:?}", rep);
+        let evs = prog.events();
+        // executor wire contract: the failed key's KeyDone keeps its planned
+        // byte size (R28-f1: accounting is consumer-side).
+        match evs
+            .iter()
+            .find(|ev| matches!(ev, ProgressEvent::KeyDone { key, .. } if key == "big.md"))
+            .unwrap_or_else(|| panic!("no big.md KeyDone: {evs:?}"))
+        {
+            ProgressEvent::KeyDone { ok, bytes, .. } => {
+                assert!(!*ok, "big.md must fail");
+                assert_eq!(*bytes, 1000, "wire bytes stay planned on failure");
+            }
+            _ => unreachable!(),
+        }
+        match evs
+            .iter()
+            .find(|ev| matches!(ev, ProgressEvent::KeyDone { key, .. } if key == "small.md"))
+            .unwrap_or_else(|| panic!("no small.md KeyDone: {evs:?}"))
+        {
+            ProgressEvent::KeyDone { ok, bytes, .. } => {
+                assert!(*ok, "small.md must succeed");
+                assert_eq!(*bytes, 3);
+            }
+            _ => unreachable!(),
+        }
+        // feed the executor stream through the pure ProgressLine with an
+        // injected clock: PassStart at t=0, big at t=1000, small at t=2000;
+        // PassEnd/RunEnd are ignored by the state machine.
+        let mut line = ProgressLine::new();
+        let mut now = 0u64;
+        for ev in evs.iter() {
+            match ev {
+                ProgressEvent::PassStart { .. } | ProgressEvent::KeyDone { .. } => {
+                    line.on_event(ev.clone(), now);
+                    now += 1000;
+                }
+                _ => {}
+            }
+        }
+        let r = line.render();
+        assert!(r.contains("2/2"), "{r}");
+        assert!(r.contains("100%"), "{r}");
+        assert!(!r.contains("ETA"), "no phantom ETA: {r}");
+        // only the 3 transferred bytes over 2s = 1.5 B/s; the poisoned key's
+        // planned 1000 bytes must NOT inflate it (RED today: 501.5 B/s).
+        assert!(
+            r.contains("1.5 B/s"),
+            "rate must reflect only the successful key: {r}"
+        );
+        assert!(
+            !r.contains("501.5 B/s"),
+            "rate must not include the poisoned key's planned bytes: {r}"
         );
     }
 

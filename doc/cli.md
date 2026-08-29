@@ -74,6 +74,10 @@ Uploading  notes/foo.md  847/1204  [=========>--------]  70%  12.4 MiB/s  ETA 0:
 - `status`, `check`, `--dry-run` and `--json` never render progress.
 - Rate is cumulative (`bytes / elapsed`); ETA is `remaining / rate` - no
   sliding window, so a mixed-size vault shows a jittery ETA (accepted v1).
+- Rate/ETA count bytes of **successful** transfers only: a failed key still
+  advances the key count, but its planned size is removed from the pass
+  total, so a pass with failures still ends at a clean 100% with no leftover
+  ETA.
 - There is no `--progress=` flag yet; the mode seam (`Auto`/`Off`/`Always`)
   is the extension point for one.
 
