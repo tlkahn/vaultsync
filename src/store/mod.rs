@@ -386,12 +386,12 @@ mod tests {
 
     #[test]
     fn enrich_fails_closed_on_first_transient_head_error() {
-        // I8-stopgap: the SDK RetryConfig owns retry (cycle 4), so enrichment
+        // I8-retire: the SDK RetryConfig owns retry (cycle 4), so enrichment
         // calls head() exactly once per object - a transient error that the
         // old W117 stopgap would have retried (first head Unavailable, second
         // would succeed) now fails the listing closed on the first attempt,
-        // with the attempt counter at 1. RED: still retries (calls > 1 /
-        // succeeds) today.
+        // with the attempt counter at 1. Was RED under W117 (retried); GREEN
+        // under I8 (single attempt).
         let store = MemoryStore::new();
         let mut c = std::io::Cursor::new(b"a".to_vec());
         store.put_from("a.md", &mut c, 1, Some(100)).unwrap();
@@ -410,9 +410,9 @@ mod tests {
 
     #[test]
     fn enrich_transient_head_failure_is_single_attempt() {
-        // I8-stopgap: an always-Unavailable store fails closed after exactly 1
-        // head call - no sleeps, no retry loop (the SDK owns retry now). RED:
-        // retries up to HEAD_MAX_ATTEMPTS today.
+        // I8-retire: an always-Unavailable store fails closed after exactly 1
+        // head call - no sleeps, no retry loop (the SDK owns retry now).
+        // Was RED under W117 (retried); GREEN under I8 (single attempt).
         let store = HeadFailStore::new();
         let listing = Listing {
             entities: vec![file("a.md", 1, Some(9_999_999))],
