@@ -237,17 +237,15 @@ impl LocalFs {
                 fmd.len()
             )));
         }
-        if let Some(expect_ms) = expected_mtime_ms {
-            if let Ok(mt) = fmd.modified() {
-                if let Some(actual_ms) = system_time_to_ms(mt) {
-                    if actual_ms.abs_diff(expect_ms) > tolerance_ms {
-                        return Err(Error::Other(format!(
-                            "open_verified: mtime changed for {} (expected {expect_ms}, found {actual_ms})",
-                            key
-                        )));
-                    }
-                }
-            }
+        if let Some(expect_ms) = expected_mtime_ms
+            && let Ok(mt) = fmd.modified()
+            && let Some(actual_ms) = system_time_to_ms(mt)
+            && actual_ms.abs_diff(expect_ms) > tolerance_ms
+        {
+            return Err(Error::Other(format!(
+                "open_verified: mtime changed for {} (expected {expect_ms}, found {actual_ms})",
+                key
+            )));
         }
         Ok(f)
     }
@@ -1375,14 +1373,12 @@ fn is_stale(
     if smd.len() != expected_size {
         return true;
     }
-    if let Some(expect_ms) = expected_mtime_ms {
-        if let Ok(mt) = smd.modified() {
-            if let Some(actual_ms) = system_time_to_ms(mt) {
-                if actual_ms.abs_diff(expect_ms) > tolerance_ms {
-                    return true;
-                }
-            }
-        }
+    if let Some(expect_ms) = expected_mtime_ms
+        && let Ok(mt) = smd.modified()
+        && let Some(actual_ms) = system_time_to_ms(mt)
+        && actual_ms.abs_diff(expect_ms) > tolerance_ms
+    {
+        return true;
     }
     false
 }

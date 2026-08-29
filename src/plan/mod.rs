@@ -1290,13 +1290,13 @@ mod tests {
             for _ in 0..len {
                 s.push((b'a' + (rng.next() % 3) as u8) as char);
             }
-            if rng.next() % 5 == 0 {
+            if rng.next().is_multiple_of(5) {
                 s = s.to_uppercase();
             }
             parts.push(s);
         }
         let mut k = parts.join("/");
-        if rng.next() % 7 == 0 {
+        if rng.next().is_multiple_of(7) {
             k.push('/');
         }
         k

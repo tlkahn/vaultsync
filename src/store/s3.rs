@@ -218,12 +218,12 @@ fn encode_mtime(mtime_ms: Option<u64>) -> Option<String> {
 
 /// Decode an mtime from the metadata header, falling back to LastModified.
 fn decode_mtime(meta_val: Option<&str>, last_modified_ms: Option<u64>) -> Option<u64> {
-    if let Some(v) = meta_val {
-        if let Ok(ms) = v.parse::<u64>() {
-            return Some(ms);
-        }
-        // garbage metadata -> fall through to LastModified (sync-model policy 2)
+    if let Some(v) = meta_val
+        && let Ok(ms) = v.parse::<u64>()
+    {
+        return Some(ms);
     }
+    // garbage metadata -> fall through to LastModified (sync-model policy 2)
     last_modified_ms
 }
 

@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: every job only reads the checkout. `contents: read` covers
+# actions/checkout and rust-cache (the cache API is not repo contents write);
+# no job comments on PRs or writes checks.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      # Lib + bin unit tests only: the tests/ S3 integration suite hangs (issue
+      # #17) and is gated out of CI until that is fixed. Compilation of the
+      # suite is still covered by the clippy job's --all-targets.
+      - run: cargo test --locked --lib --bins
+
+  msrv:
+    # The job name hardcodes the floor for check-list readability; rename it
+    # in the same commit as any `rust-version` bump in Cargo.toml.
+    name: msrv (1.95)
+    runs-on: ubuntu-latest
+    env:
+      # env beats rust-toolchain.toml; the declared MSRV floor - must match
+      # `rust-version` in Cargo.toml (bump both in the same commit).
+      RUSTUP_TOOLCHAIN: 1.95.0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked
+      # lib + bin unit tests only; tests/ S3 integration suite hangs (issue #17)
+      - run: cargo test --locked --lib --bins

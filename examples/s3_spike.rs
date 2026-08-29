@@ -161,10 +161,10 @@ async fn probe_paginated_list(
                 .await
                 .map_err(|e| e.to_string())
         });
-        if inflight.len() >= W {
-            if let Some(res) = inflight.join_next().await {
-                res.map_err(|e| e.to_string())??;
-            }
+        if inflight.len() >= W
+            && let Some(res) = inflight.join_next().await
+        {
+            res.map_err(|e| e.to_string())??;
         }
     }
     while let Some(res) = inflight.join_next().await {
@@ -204,10 +204,10 @@ async fn probe_paginated_list(
                 .map_err(|e| e.to_string())?;
             Ok(())
         });
-        if inflight.len() >= W {
-            if let Some(res) = inflight.join_next().await {
-                res.map_err(|e| e.to_string())??;
-            }
+        if inflight.len() >= W
+            && let Some(res) = inflight.join_next().await
+        {
+            res.map_err(|e| e.to_string())??;
         }
     }
     while let Some(res) = inflight.join_next().await {

@@ -249,12 +249,12 @@ fn resolve_store(store: Option<&StoreConfig>, env: &EnvSnapshot) -> Result<Store
             // configured) skips validation.
             let prefix = s.prefix.as_deref().unwrap_or("");
             let normalized = normalize_prefix(prefix);
-            if !normalized.is_empty() {
-                if let Err(e) = crate::entity::ensure_valid_key(&normalized) {
-                    return Err(Error::Other(format!(
-                        "store.prefix is not a valid key prefix: {prefix:?} ({e})"
-                    )));
-                }
+            if !normalized.is_empty()
+                && let Err(e) = crate::entity::ensure_valid_key(&normalized)
+            {
+                return Err(Error::Other(format!(
+                    "store.prefix is not a valid key prefix: {prefix:?} ({e})"
+                )));
             }
             Ok(StoreSettings {
                 bucket,
