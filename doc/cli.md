@@ -104,6 +104,11 @@ mtime_tolerance_ms = 1000
 # max_delay_ms = 20000   # pre-jitter backoff ceiling, ms; SDK standard default
 ```
 
+> `[transfer.retry]` defaults are filled **per field**, so validation runs
+> against the filled mix: a lone `max_delay_ms = 500` fails because the
+> resolved base stays 1000, and a lone `base_delay_ms = 30000` fails against
+> the default max 20000. Set both when tightening either bound.
+
 > `[ignore].patterns` is a **Phase 3 feature**: it is parsed and validated
 > but not yet applied. A `push`/`pull`/`check` run refuses loudly when it is
 > present (exit 1); `status` warns on stderr and proceeds. Do not expect it
