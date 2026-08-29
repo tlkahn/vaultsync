@@ -35,11 +35,11 @@ Tracked on GitHub: #14 (tracking issue) with sub-issues #3-#13 in priority tiers
 2. Ignore patterns + Obsidian default profile (`[ignore].patterns` already
    parses but is unused, W25/M3; remaining work is walker application plus
    the profile)
-3. Concurrency limits + retries with backoff on transient S3 errors
+3. Concurrency limits (bounded request/transfer pool)
    (`[transfer].concurrency` parses but is inert with a warning, W28/M6;
    `LocalFs` is already Send/Sync, W82; transfers stay sequential). The
    **retries-with-backoff half landed under #8** (I8-retry-sdk below): the
-   SDK standard-mode `[transfer].retry` `RetryConfig` owns retry/backoff/
+   SDK standard-mode `[transfer.retry]` `RetryConfig` owns retry/backoff/
    jitter for all ops, and the W117 head stopgap is retired. The remaining
    work is bounded **concurrency** (follow-up **#20**): list-enrichment heads
    are the request pool's primary consumer - every list-driven plan is
