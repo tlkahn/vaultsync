@@ -541,6 +541,35 @@ max_delay_ms = 4000
     }
 
     #[test]
+    fn resolve_settings_retry_rejects_lone_delay_against_default_counterpart() {
+        // I8-validation (PR21-r2 L5 / W144): per-field defaults mean validation
+        // runs against the filled mix (cli.md W136). A lone max_delay_ms = 500
+        // fails against default base 1000; a lone base_delay_ms = 30000 fails
+        // against default max 20000. Both must name both keys (same surface as
+        // the both-set base>max error).
+        // Mutation-checked: removing the base>max branch flips this RED.
+        let text = "[transfer.retry]\nmax_delay_ms = 500\n";
+        let cfg = parse_config_str(text).unwrap();
+        let err = settings(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transfer.retry.base_delay_ms")
+                && msg.contains("transfer.retry.max_delay_ms"),
+            "lone max_delay_ms = 500 must fail naming both keys against default base: {msg}"
+        );
+
+        let text = "[transfer.retry]\nbase_delay_ms = 30000\n";
+        let cfg = parse_config_str(text).unwrap();
+        let err = settings(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transfer.retry.base_delay_ms")
+                && msg.contains("transfer.retry.max_delay_ms"),
+            "lone base_delay_ms = 30000 must fail naming both keys against default max: {msg}"
+        );
+    }
+
+    #[test]
     fn resolve_settings_retry_rejects_zero_base_delay() {
         // I8-validation (W130, M2): the SDK requires a non-zero initial
         // backoff, so `base_delay_ms = 0` must be rejected naming
