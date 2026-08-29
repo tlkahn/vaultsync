@@ -88,6 +88,46 @@ where
     with_store_conc(name, 1, f);
 }
 
+/// Fan-out deletes under `concurrency` workers (I17-cleanup-delete, W154).
+/// Same shape as `crate::pool::run_bounded` (AtomicUsize pull), inlined here
+/// because the pool is `pub(crate)` and invisible to the external test crate.
+/// Order of deletes does not matter; counts and per-key W104 stderr do.
+/// Returns `(deleted, delete_errs)`.
+fn delete_keys_bounded(store: &S3Store, keys: &[String], concurrency: u32) -> (usize, usize) {
+    if keys.is_empty() {
+        return (0, 0);
+    }
+    let workers = (concurrency as usize).min(keys.len()).max(1);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let deleted = std::sync::atomic::AtomicUsize::new(0);
+    let delete_errs = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| {
+                loop {
+                    let idx = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if idx >= keys.len() {
+                        break;
+                    }
+                    match store.delete(&keys[idx]) {
+                        Ok(()) => {
+                            deleted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        Err(err) => {
+                            delete_errs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            eprintln!("cleanup: failed to delete {}: {err}", keys[idx]);
+                        }
+                    }
+                }
+            });
+        }
+    });
+    (
+        deleted.load(std::sync::atomic::Ordering::SeqCst),
+        delete_errs.load(std::sync::atomic::Ordering::SeqCst),
+    )
+}
+
 /// [`with_store`] with a non-default `[transfer].concurrency` (issue 20 cycle
 /// 9: integration coverage for the parallel pool against real S3).
 ///
@@ -171,17 +211,10 @@ where
                 keys.len()
             );
             let t_del = std::time::Instant::now();
-            let mut deleted = 0usize;
-            let mut delete_errs = 0usize;
-            for key in keys {
-                match store.delete(&key) {
-                    Ok(()) => deleted += 1,
-                    Err(err) => {
-                        delete_errs += 1;
-                        eprintln!("cleanup: failed to delete {key}: {err}");
-                    }
-                }
-            }
+            // W154 / I17-cleanup-delete: Phase 0 row C showed sequential
+            // cleanup deletes at ~393s for 1050 keys - fan out under the
+            // store concurrency so deletes drop toward O((N/K) x RTT).
+            let (deleted, delete_errs) = delete_keys_bounded(&store, &keys, concurrency);
             eprintln!(
                 "[17] {name}: cleanup_delete_ms={} deleted={deleted} delete_errs={delete_errs}",
                 t_del.elapsed().as_millis()
