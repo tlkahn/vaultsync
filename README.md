@@ -88,7 +88,8 @@ action a plan - or delete files - against a non-existent store).
 - **The `[transfer.retry]` table under `[transfer]` is live (not Phase 3).** The three knobs
   (`max_attempts` / `base_delay_ms` / `max_delay_ms`) map to the AWS SDK
   standard-mode retry policy on the S3 client; `max_attempts = 1` disables
-  retries. All optional; absent = SDK standard defaults (3 / 1000 / 20000).
+  retries. All optional; absent = SDK standard defaults (3 / 1000 / 20000),
+  config-owned: AWS env/profile retry knobs do not apply.
 - **`--follow-symlinks` is inventory-only in v1.** The walker follows
   symlinks and lists them, but push/pull plan any followed *file* symlink as
   `Skip(followed_symlink)` (transfers refuse to open a symlink); only

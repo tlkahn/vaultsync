@@ -122,6 +122,12 @@ shown above. `max_attempts` must be >= 1 and `base_delay_ms` <= `max_delay_ms`
 (loud config errors otherwise); both delays must be >= 1 (the SDK requires
 non-zero backoffs).
 
+vaultsync's retry policy is **config-owned**: `AWS_MAX_ATTEMPTS`,
+`AWS_RETRY_MODE`, and profile `max_attempts` / `retry_mode` do **not** apply
+to the S3 client vaultsync builds - the resolved `[transfer.retry]` policy
+replaces the ambient AWS retry configuration at client build, whether or not
+the section is present.
+
 If you want the full populated form (Phase 3, not yet applied), it is shown
 here for reference; copying it as-is will refuse `push`/`pull`/`check` until
 the ignore-patterns phase lands.
