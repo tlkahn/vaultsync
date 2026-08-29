@@ -1194,22 +1194,36 @@ mod tests {
     }
 
     /// Store wrapper that gauges the max number of concurrent `get_to` calls
-    /// (I20 cycle 4 overlap probe - gauges, never wall-clock).
+    /// (I20 cycle 4 / I17-gauges: Condvar rendezvous, never wall-clock /
+    /// never `yield_now`). I17-r1/F1: `OverlapRendezvous` latches
+    /// `released` for the life of the wrapper (single gauge pass per
+    /// instance) - do NOT reuse the wrapper across a sequential baseline
+    /// leg: the conc-1 pass deadlocks (`target=2` never reached;
+    /// `n_workers` was sized for the N leg). Comparison legs must run
+    /// against `store.inner` (see `exec_parallel_downloads_overlap`).
+    /// Proves pool fan-out on `get_to` entry (Condvar rendezvous arrivals),
+    /// not concurrent byte streaming and not tmp allocation - the F3
+    /// `dir_create_lock` serializes create-alloc, so the rendezvous belongs
+    /// here around the inner store call.
     struct GaugedGetStore {
         inner: MemoryStore,
-        in_flight: std::sync::atomic::AtomicUsize,
-        max_in_flight: std::sync::atomic::AtomicUsize,
+        rendezvous: crate::testutil::OverlapRendezvous,
     }
     impl GaugedGetStore {
-        fn new() -> Self {
+        /// `n_workers` is the concurrency under test (pool size); the
+        /// rendezvous target is 2 (any real overlap).
+        fn new(n_workers: usize) -> Self {
             GaugedGetStore {
                 inner: MemoryStore::new(),
-                in_flight: std::sync::atomic::AtomicUsize::new(0),
-                max_in_flight: std::sync::atomic::AtomicUsize::new(0),
+                rendezvous: crate::testutil::OverlapRendezvous::new(
+                    2,
+                    n_workers,
+                    std::time::Duration::from_secs(5),
+                ),
             }
         }
         fn max_in_flight(&self) -> usize {
-            self.max_in_flight.load(std::sync::atomic::Ordering::SeqCst)
+            self.rendezvous.max_in_flight()
         }
     }
     impl ObjectStore for GaugedGetStore {
@@ -1220,16 +1234,9 @@ mod tests {
             self.inner.head(key)
         }
         fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
-            let cur = self
-                .in_flight
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                + 1;
-            self.max_in_flight
-                .fetch_max(cur, std::sync::atomic::Ordering::SeqCst);
-            std::thread::yield_now();
+            self.rendezvous.enter();
             let r = self.inner.get_to(key, w);
-            self.in_flight
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            self.rendezvous.leave();
             r
         }
         fn put_from(
@@ -1353,13 +1360,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "yield_now overlap gauge flaky under full-suite scheduling since the F3 dir_create_lock staggers create-alloc entry; reliability deferred to issue #17 - run via --ignored"]
     fn exec_parallel_downloads_overlap() {
-        // I20 cycle 4: a 16-key pull at concurrency 4 fans out - the
-        // max-in-flight `get_to` gauge must exceed 1 (real overlap) and stay
-        // <= 4; bytes land correctly and the report equals the concurrency-1
-        // report exactly.
-        let store = GaugedGetStore::new();
+        // I20 cycle 4 / I17-gauges (W158): a 16-key pull at concurrency 4 fans
+        // out - the max-in-flight `get_to` gauge must exceed 1 (real overlap
+        // via Condvar rendezvous, not yield_now) and stay <= 4; bytes land
+        // correctly and the report equals the concurrency-1 report exactly.
+        let store = GaugedGetStore::new(4);
         for i in 0..16 {
             put_str(
                 &store.inner,
@@ -1368,12 +1374,21 @@ mod tests {
                 Some(1_000 + i),
             );
         }
-        let dir4 = TempDir::new("vaultsync-exec");
-        let local4 = LocalFs::new(dir4.path());
         let opts = PlanOpts::default();
-        let plan = crate::build_plan(&local4, &store, Mode::Pull, &opts)
+        let dir1 = TempDir::new("vaultsync-exec");
+        let local1 = LocalFs::new(dir1.path());
+        let plan = crate::build_plan(&local1, &store, Mode::Pull, &opts)
             .unwrap()
             .plan;
+        // I17-r1/F1 (W161): the concurrency-1 leg is an EQUALITY pin, not a
+        // gauge, so it runs through `store.inner` (bare MemoryStore) - the
+        // Condvar rendezvous latches `released` for the life of the wrapper,
+        // so a conc-1 pass through the gauge deadlocks (target=2 never
+        // reached; `n_workers` was sized for the N leg). Same trap as
+        // `enrich_parallel_vanished_warning_order_stable`.
+        let rep1 = execute_plan(&local1, &store.inner, &plan, Mode::Pull, &opts, 1);
+        let dir4 = TempDir::new("vaultsync-exec");
+        let local4 = LocalFs::new(dir4.path());
         let rep4 = execute_plan(&local4, &store, &plan, Mode::Pull, &opts, 4);
         assert!(
             store.max_in_flight() > 1,
@@ -1387,9 +1402,6 @@ mod tests {
             let body = std::fs::read(dir4.join(format!("n{i:02}.md"))).unwrap();
             assert_eq!(body, format!("body-{i:02}").as_bytes());
         }
-        let dir1 = TempDir::new("vaultsync-exec");
-        let local1 = LocalFs::new(dir1.path());
-        let rep1 = execute_plan(&local1, &store, &plan, Mode::Pull, &opts, 1);
         assert_eq!(rep4, rep1);
     }
 
@@ -1486,7 +1498,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "probabilistic regression net: flaky under scheduling (residual interleavings beyond the create-alloc window); reliability deferred to issue #17 - run via --ignored"]
+    #[ignore = "probabilistic regression net: residual interleavings outside the create-alloc window still flake under scheduling; dir_create_lock remains the fix - run via --ignored. Deterministic exec pins (exec_parallel_failure_isolation / exec_report_is_deterministic_under_pool / exec_parallel_guards_hold) cover the contract without this net (I17-gauges B3-keep)."]
     fn exec_parallel_shared_parent_cleanup_no_spurious_failures() {
         // I20-r1/F3: probabilistic regression net (same ethos as the W48
         // overlap probes and the I20 overlap gauges), NOT a deterministic
@@ -1505,9 +1517,9 @@ mod tests {
         // NotFound/Invalid argument/File exists). The W150 fix (LocalFs
         // dir_create_lock) closed the create-alloc window, but the net still
         // shows residual flakiness under some schedulings (interleavings
-        // outside that window), so it is #[ignore]d and deferred to issue
-        // #17; the fix itself is kept (strictly no worse than the pre-I20
-        // contract).
+        // outside that window), so it stays #[ignore]d (I17-gauges B3-keep);
+        // the fix itself is kept (strictly no worse than the pre-I20
+        // contract). Rely on the lock + the deterministic exec pins.
         let opts = PlanOpts::default();
         for iter in 0..200 {
             let store = FastFailShuffleStore::new();

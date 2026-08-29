@@ -306,6 +306,94 @@ pub(crate) mod testutil {
     use std::ops::Deref;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// Deterministic overlap rendezvous for concurrency gauges (I17-gauges).
+    ///
+    /// Single gauge pass per instance: `released` latches once the target
+    /// or worker ceiling is hit, so do not reuse one instance across a
+    /// sequential baseline leg (I17-r1/F1) - comparison legs go through the
+    /// bare inner store instead.
+    ///
+    /// Replaces scheduler-sensitive `yield_now` probes: each worker enters,
+    /// bumps `in_flight` / `max_in_flight` / `entered`, then blocks on a
+    /// Condvar until either `max_in_flight >= target` (overlap proven) **or**
+    /// `entered >= n_workers` (every worker has arrived - release so a missing
+    /// overlap fails the assertion loudly instead of deadlocking), with a
+    /// hard timeout. Call `enter()` at the start of the gauged op and
+    /// `leave()` after the inner call returns.
+    pub(crate) struct OverlapRendezvous {
+        state: Mutex<OverlapState>,
+        cv: Condvar,
+        target: usize,
+        n_workers: usize,
+        timeout: Duration,
+    }
+
+    struct OverlapState {
+        in_flight: usize,
+        max_in_flight: usize,
+        entered: usize,
+        /// Once true, every waiter proceeds (overlap seen or all entered).
+        released: bool,
+    }
+
+    impl OverlapRendezvous {
+        /// `target` = min concurrent entries that count as overlap (usually 2);
+        /// `n_workers` = expected concurrent workers (pool size); `timeout` is
+        /// the hard deadlock ceiling (panic on expiry).
+        pub(crate) fn new(target: usize, n_workers: usize, timeout: Duration) -> Self {
+            OverlapRendezvous {
+                state: Mutex::new(OverlapState {
+                    in_flight: 0,
+                    max_in_flight: 0,
+                    entered: 0,
+                    released: false,
+                }),
+                cv: Condvar::new(),
+                target: target.max(1),
+                n_workers: n_workers.max(1),
+                timeout,
+            }
+        }
+
+        /// Enter the gauged region: bump gauges, then block until release.
+        pub(crate) fn enter(&self) {
+            let mut g = self.state.lock().unwrap();
+            g.in_flight += 1;
+            g.entered += 1;
+            if g.in_flight > g.max_in_flight {
+                g.max_in_flight = g.in_flight;
+            }
+            if g.max_in_flight >= self.target || g.entered >= self.n_workers {
+                g.released = true;
+                self.cv.notify_all();
+            }
+            let deadline = Instant::now() + self.timeout;
+            while !g.released {
+                let now = Instant::now();
+                if now >= deadline {
+                    panic!(
+                        "OverlapRendezvous deadlock: max_in_flight={} entered={} target={} n_workers={} after {:?}",
+                        g.max_in_flight, g.entered, self.target, self.n_workers, self.timeout
+                    );
+                }
+                let (gg, _timeout) = self.cv.wait_timeout(g, deadline - now).unwrap();
+                g = gg;
+            }
+        }
+
+        /// Leave the gauged region (after the inner op returns).
+        pub(crate) fn leave(&self) {
+            let mut g = self.state.lock().unwrap();
+            g.in_flight = g.in_flight.saturating_sub(1);
+        }
+
+        pub(crate) fn max_in_flight(&self) -> usize {
+            self.state.lock().unwrap().max_in_flight
+        }
+    }
 
     /// Unique temp dir per instance, removed on drop (std-only; no `tempfile`).
     /// Derefs to `Path` so `dir.join("x")` and `&dir -> &Path` coercion work.

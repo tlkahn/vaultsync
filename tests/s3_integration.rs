@@ -88,12 +88,89 @@ where
     with_store_conc(name, 1, f);
 }
 
+/// Fan-out deletes under `concurrency` workers (I17-cleanup-delete, W154).
+/// Same shape as `crate::pool::run_bounded` (AtomicUsize pull), inlined here
+/// because the pool is `pub(crate)` and invisible to the external test crate.
+/// Order of deletes does not matter; counts and per-key W104 stderr do.
+/// Returns `(deleted, delete_errs)`.
+///
+/// I17-r1/F5 (W164): the worker count is capped at
+/// [`MAX_CLEANUP_DELETE_WORKERS`] via the pure `cleanup_delete_workers`
+/// helper (pinned offline below) - 128 OS threads against the single
+/// current-thread runtime (K=128 paginate cleanup) is needlessly rough on S3
+/// and the CI runner. Product `crate::pool::run_bounded` is unchanged.
+const MAX_CLEANUP_DELETE_WORKERS: usize = 32;
+
+/// Pure worker-count derivation for cleanup deletes: keep the pre-existing
+/// `.max(1)` / `min(concurrency, n_keys)` behavior, add the F5 ceiling.
+fn cleanup_delete_workers(concurrency: u32, n_keys: usize) -> usize {
+    (concurrency as usize)
+        .min(n_keys)
+        .clamp(1, MAX_CLEANUP_DELETE_WORKERS)
+}
+
+fn delete_keys_bounded(store: &S3Store, keys: &[String], concurrency: u32) -> (usize, usize) {
+    if keys.is_empty() {
+        return (0, 0);
+    }
+    let workers = cleanup_delete_workers(concurrency, keys.len());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let deleted = std::sync::atomic::AtomicUsize::new(0);
+    let delete_errs = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| {
+                loop {
+                    let idx = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if idx >= keys.len() {
+                        break;
+                    }
+                    match store.delete(&keys[idx]) {
+                        Ok(()) => {
+                            deleted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        Err(err) => {
+                            delete_errs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            eprintln!("cleanup: failed to delete {}: {err}", keys[idx]);
+                        }
+                    }
+                }
+            });
+        }
+    });
+    (
+        deleted.load(std::sync::atomic::Ordering::SeqCst),
+        delete_errs.load(std::sync::atomic::Ordering::SeqCst),
+    )
+}
+
+#[test]
+fn cleanup_delete_workers_clamps_to_max() {
+    // I17-r1/F5 (W164): the cleanup delete fan-out is capped at 32 workers -
+    // 128 OS threads against the single current-thread S3 runtime (K=128
+    // paginate cleanup) is needlessly rough on S3 and the CI runner.
+    assert_eq!(cleanup_delete_workers(128, 1050), 32);
+}
+
+#[test]
+fn cleanup_delete_workers_respects_key_count() {
+    // I17-r1/F5: never spawn more workers than there are keys.
+    assert_eq!(cleanup_delete_workers(128, 4), 4);
+}
+
+#[test]
+fn cleanup_delete_workers_at_least_one() {
+    // I17-r1/F5: the pre-existing `.max(1)` contract is preserved.
+    assert_eq!(cleanup_delete_workers(0, 10), 1);
+}
+
 /// [`with_store`] with a non-default `[transfer].concurrency` (issue 20 cycle
 /// 9: integration coverage for the parallel pool against real S3).
 fn with_store_conc<F>(name: &str, concurrency: u32, f: F)
 where
     F: FnOnce(&S3Store) -> Result<(), String>,
 {
+    let t_total = std::time::Instant::now();
     let bucket = match bucket_or_skip(
         std::env::var("VAULTSYNC_TEST_S3_BUCKET").ok(),
         require_mode(),
@@ -135,21 +212,24 @@ where
 
     let result = f(&store);
 
-    // Cleanup: list + delete everything (files only; folders are views).
+    // Cleanup: list keys + delete everything (W153, I17-cleanup-list: the
+    // cleanup must NOT re-run the enriched list - that is a second N-head
+    // pass; `list_object_keys` is the raw unenriched path, ~pages x RTT).
     // L12 (W104): a failed cleanup must be reported on stderr, never silently
     // swallowed - leaked objects make CI flakes hard to diagnose (a later run
     // re-encounters them under a fresh unique prefix, but the bucket slowly
     // fills). Reporting never fails the test outcome; the harness already
     // eprintln!s its skip path, so this matches the file's convention.
-    match store.list("") {
-        Ok(listing) => {
-            for e in listing.entities {
-                if e.is_folder() {
-                    continue;
-                }
-                if let Err(err) = store.delete(&e.key) {
-                    eprintln!("cleanup: failed to delete {}: {err}", e.key);
-                }
+    // W154 / I17-cleanup-delete: fan out deletes under store concurrency
+    // (Phase 0 row C: sequential cleanup deletes ~393s for 1050 keys).
+    match store.list_object_keys("") {
+        Ok(keys) => {
+            let (deleted, delete_errs) = delete_keys_bounded(&store, &keys, concurrency);
+            if delete_errs > 0 {
+                eprintln!(
+                    "cleanup: deleted {deleted}/{} keys ({delete_errs} errors)",
+                    keys.len()
+                );
             }
         }
         Err(err) => eprintln!("cleanup: failed to list for cleanup: {err}"),
@@ -158,7 +238,7 @@ where
     if let Err(e) = result {
         panic!("{name} failed: {e}");
     }
-    eprintln!("[ok] {}", name);
+    eprintln!("[ok] {name} {}ms", t_total.elapsed().as_millis());
 }
 
 #[test]
@@ -194,12 +274,22 @@ fn s3_integ_put_get_head_delete_roundtrip() {
 #[test]
 fn s3_integ_list_paginates() {
     // Seed >1000 keys (S3 pages at 1000) concurrently, confirm list returns all.
+    // Issue #17 (I17-conc) + P30-paginate-sub-30s: run through `with_store_conc`
+    // at K = 128 (not `with_store` / concurrency 1) - live proof of I20-heads at
+    // the scale that motivated it. Seed fan-out is independent of store K and
+    // is set to 64 so put RTT is not the wall-clock floor. K swept 32 -> 64 ->
+    // 128: K=64 already crossed <30s but occasional totals sat near/over the
+    // bar (~28-33s); K=128 holds ~18-24s with margin. Harness cleanup uses
+    // unenriched list_object_keys + parallel deletes under the same K.
+    // DeleteObjects / put fast-path / coverage split were not needed.
     let n = 1050usize;
-    with_store("paginate", |s| {
+    let seed_workers = 64usize;
+    let store_k = 128u32;
+    with_store_conc("paginate", store_k, |s| {
         std::thread::scope(|scope| {
-            for t in 0..16 {
+            for t in 0..seed_workers {
                 scope.spawn(move || {
-                    for i in (t..n).step_by(16) {
+                    for i in (t..n).step_by(seed_workers) {
                         put_bytes(s, &format!("p/obj-{i:05}.dat"), b"x", Some(i as u64)).unwrap();
                     }
                 });
