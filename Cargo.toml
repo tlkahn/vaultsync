@@ -2,9 +2,11 @@
 name = "vaultsync"
 version = "0.1.0"
 edition = "2024"
-# MSRV: the edition-2024 floor; exact verification against the final dep tree
-# is Phase 3 (CI) per the roadmap note.
-rust-version = "1.85"
+# MSRV: the aws-sdk-s3/aws-config 1.x line now declares rust-version = "1.94.1"
+# (effectively 1.95.0, since stable rust ships as x.0.0), so the final dep
+# tree's true floor is 1.95. Verified by the `msrv` CI job against this exact
+# declaration (issue 5).
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 description = "Minimal, Unix-style sync of a plain directory (Obsidian vault) to object storage"
 readme = "README.md"

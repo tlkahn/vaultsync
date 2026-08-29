@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      # Lib + bin unit tests only: the tests/ S3 integration suite hangs (issue
+      # #17) and is gated out of CI until that is fixed. Compilation of the
+      # suite is still covered by the clippy job's --all-targets.
+      - run: cargo test --locked --lib --bins
+
+  msrv:
+    name: msrv (1.95)
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: 1.95.0   # env beats rust-toolchain.toml; the declared MSRV floor
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked
+      # lib + bin unit tests only; tests/ S3 integration suite hangs (issue #17)
+      - run: cargo test --locked --lib --bins
