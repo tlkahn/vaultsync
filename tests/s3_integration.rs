@@ -5,6 +5,10 @@
 //! `VAULTSYNC_TEST_S3_ENDPOINT`, `VAULTSYNC_TEST_S3_REGION`,
 //! `VAULTSYNC_TEST_S3_PREFIX`, `VAULTSYNC_TEST_S3_PATH_STYLE=1`.
 //!
+//! `VAULTSYNC_TEST_S3_REQUIRE=1` (CI sentinel, I6-sentinel): turns the
+//! bucket-missing skip into a hard test failure, so a green CI job proves
+//! the suite really ran against S3 instead of silently skipping.
+//!
 //! Credentials come from the ambient AWS default chain (env, shared
 //! credentials file, profile); the tests never read secret values themselves.
 //!
@@ -31,6 +35,38 @@ fn unique_num() -> u64 {
     ts.wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
+/// Skip-or-require decision for the bucket env gate (I6-sentinel, issue #6).
+/// Pure function so it is unit-testable without mutating process env
+/// (edition 2024 makes `std::env::set_var` unsafe; parallel tests would race
+/// on env anyway). An unset OR empty/whitespace-only value counts as missing:
+/// in GitHub Actions a deleted repo variable expands to `""`, which must hit
+/// the same sentinel path rather than failing later with an opaque
+/// "failed to construct request" from the S3 client. Returns
+/// `Ok(Some(bucket))` to run, `Ok(None)` to skip (caller prints the `[skip]`
+/// note), `Err(msg)` when require mode is on and the bucket is missing - the
+/// caller panics with the message.
+fn bucket_or_skip(
+    bucket: Option<String>,
+    require: bool,
+    name: &str,
+) -> Result<Option<String>, String> {
+    let missing = bucket.as_deref().map(str::trim).unwrap_or("").is_empty();
+    match (missing, require) {
+        (false, _) => Ok(bucket),
+        (true, false) => Ok(None),
+        (true, true) => Err(format!(
+            "{name}: VAULTSYNC_TEST_S3_BUCKET is unset or empty but \
+             VAULTSYNC_TEST_S3_REQUIRE=1 - refusing to silently skip"
+        )),
+    }
+}
+
+fn require_mode() -> bool {
+    std::env::var("VAULTSYNC_TEST_S3_REQUIRE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 fn put_bytes(
     store: &S3Store,
     key: &str,
@@ -49,15 +85,20 @@ fn with_store<F>(name: &str, f: F)
 where
     F: FnOnce(&S3Store) -> Result<(), String>,
 {
-    let bucket = match std::env::var("VAULTSYNC_TEST_S3_BUCKET") {
-        Ok(b) => b,
-        Err(_) => {
+    let bucket = match bucket_or_skip(
+        std::env::var("VAULTSYNC_TEST_S3_BUCKET").ok(),
+        require_mode(),
+        name,
+    ) {
+        Ok(Some(b)) => b,
+        Ok(None) => {
             eprintln!(
                 "[skip] {}: VAULTSYNC_TEST_S3_BUCKET not set (set to run real S3 tests)",
                 name
             );
             return;
         }
+        Err(msg) => panic!("{msg}"),
     };
     let region = std::env::var("VAULTSYNC_TEST_S3_REGION").unwrap_or_else(|_| "us-west-1".into());
     let endpoint = std::env::var("VAULTSYNC_TEST_S3_ENDPOINT").ok();
@@ -220,7 +261,15 @@ fn s3_integ_prefix_isolation() {
 /// returns `None` (caller prints the suite-skip note) when
 /// `VAULTSYNC_TEST_S3_BUCKET` is unset.
 fn path_style_env(name: &str) -> Option<(String, String, Option<String>, String)> {
-    let bucket = std::env::var("VAULTSYNC_TEST_S3_BUCKET").ok()?;
+    let bucket = match bucket_or_skip(
+        std::env::var("VAULTSYNC_TEST_S3_BUCKET").ok(),
+        require_mode(),
+        name,
+    ) {
+        Ok(Some(b)) => b,
+        Ok(None) => return None,
+        Err(msg) => panic!("{msg}"),
+    };
     let region = std::env::var("VAULTSYNC_TEST_S3_REGION").unwrap_or_else(|_| "us-west-1".into());
     let endpoint = std::env::var("VAULTSYNC_TEST_S3_ENDPOINT").ok();
     let base = std::env::var("VAULTSYNC_TEST_S3_PREFIX").unwrap_or_default();
@@ -309,7 +358,7 @@ fn s3_integ_path_style_vhost() -> Result<(), String> {
     };
     if endpoint.is_some() {
         eprintln!(
-            "[skip] path-style vhost: VAULTSYNC_TEST_S3_ENDPOINT set (custom endpoints require path-style addressing; vhost is AWS-only)"
+            "[skip] path-style vhost: VAULTSYNC_TEST_S3_ENDPOINT set (custom endpoints require path-style addressing; vhost is AWS-only - intentional branch, not a missing-config skip, even under VAULTSYNC_TEST_S3_REQUIRE=1)"
         );
         return Ok(());
     }
@@ -551,6 +600,45 @@ fn s3_integ_status_converges_after_push() {
         assert_eq!(status.stats.conflict, 0, "conflicts: {:?}", status.actions);
         Ok(())
     });
+}
+
+#[test]
+fn bucket_or_skip_sentinel_unit() {
+    // I6-sentinel (issue #6): the skip-or-require decision, all three arms.
+    // Pure-function test - no env mutation, runs everywhere (no S3 needed),
+    // including in the CI integration job where REQUIRE=1 is set.
+    assert_eq!(
+        bucket_or_skip(Some("b".into()), false, "t").unwrap(),
+        Some("b".to_string()),
+        "bucket set, require off: run"
+    );
+    assert_eq!(
+        bucket_or_skip(Some("b".into()), true, "t").unwrap(),
+        Some("b".to_string()),
+        "bucket set, require on: run"
+    );
+    assert_eq!(
+        bucket_or_skip(None, false, "t").unwrap(),
+        None,
+        "bucket missing, require off: skip"
+    );
+    // Empty string counts as missing (break-test finding: a deleted GitHub
+    // repo variable expands to "", not to an unset var).
+    assert_eq!(
+        bucket_or_skip(Some(String::new()), false, "t").unwrap(),
+        None,
+        "bucket empty, require off: skip"
+    );
+    let err = bucket_or_skip(Some(String::new()), true, "t").unwrap_err();
+    assert!(
+        err.contains("VAULTSYNC_TEST_S3_BUCKET") && err.contains("VAULTSYNC_TEST_S3_REQUIRE"),
+        "bucket empty, require on: loud failure naming both vars: {err}"
+    );
+    let err = bucket_or_skip(None, true, "t").unwrap_err();
+    assert!(
+        err.contains("VAULTSYNC_TEST_S3_BUCKET") && err.contains("VAULTSYNC_TEST_S3_REQUIRE"),
+        "bucket missing, require on: loud failure naming both vars: {err}"
+    );
 }
 
 #[test]
