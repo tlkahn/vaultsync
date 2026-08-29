@@ -86,8 +86,8 @@ jobs:
     # Single job on push/PR/schedule (I6-trigger / I17-ci): the #17
     # paginate skip that forced the PR-gate vs nightly split is retired.
     runs-on: ubuntu-latest
-    # Hang guard; live suite (incl. s3_integ_list_paginates at conc 32 with
-    # unenriched/parallel cleanup) is ~1 min on us-west-1 after #17.
+    # Hang guard; live suite (incl. s3_integ_list_paginates at K=128 with
+    # seed_workers=64, unenriched/parallel cleanup) is ~18-24s after P30.
     timeout-minutes: 20
     permissions:
       contents: read
@@ -111,6 +111,7 @@ jobs:
           role-to-assume: ${{ vars.VAULTSYNC_CI_ROLE_ARN }}
           aws-region: ${{ vars.VAULTSYNC_TEST_S3_REGION }}
       # Full suite including s3_integ_list_paginates (issue #17 close-out:
-      # with_store_conc(32) + unenriched cleanup list + parallel deletes).
+      # with_store_conc("paginate", 128, ...) + seed_workers=64 + unenriched
+      # cleanup list + parallel deletes clamped at 32).
       # --nocapture keeps the [ok]/[skip]/cleanup stderr notes in the log.
       - run: cargo test --locked --test s3_integration -- --nocapture

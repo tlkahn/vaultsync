@@ -1201,9 +1201,10 @@ mod tests {
     /// leg: the conc-1 pass deadlocks (`target=2` never reached;
     /// `n_workers` was sized for the N leg). Comparison legs must run
     /// against `store.inner` (see `exec_parallel_downloads_overlap`).
-    /// Measures get_to overlap (bytes streaming), not tmp allocation - the
-    /// F3 dir_create_lock serializes create-alloc, so the rendezvous
-    /// belongs here around the inner store call.
+    /// Proves pool fan-out on `get_to` entry (Condvar rendezvous arrivals),
+    /// not concurrent byte streaming and not tmp allocation - the F3
+    /// `dir_create_lock` serializes create-alloc, so the rendezvous belongs
+    /// here around the inner store call.
     struct GaugedGetStore {
         inner: MemoryStore,
         rendezvous: crate::testutil::OverlapRendezvous,
