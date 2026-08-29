@@ -73,6 +73,9 @@ pub struct S3Store {
     /// Vault-relative prefix with a trailing `/` (may be empty).
     prefix: String,
     rt: tokio::runtime::Runtime,
+    /// I20-heads: bound on concurrent `head` calls issued by `list`
+    /// enrichment (same `[transfer].concurrency` knob; `1` = sequential).
+    concurrency: u32,
 }
 
 impl S3Store {
@@ -81,7 +84,15 @@ impl S3Store {
     /// `retry` carries the resolved `[transfer.retry]` policy (I8); absent
     /// `[transfer]`-derived policy is kept out of `[store]`-derived
     /// `StoreSettings` so existing store literals stay untouched.
-    pub fn new(settings: &StoreSettings, retry: &RetrySettings) -> Result<S3Store, Error> {
+    /// `concurrency` caps the `list`-enrichment heads (I20-heads) - the
+    /// current-thread runtime (W48, confirmed under concurrent `block_on` in
+    /// issue 20 cycle 2) is unchanged; the cap is applied by the caller-side
+    /// worker pool.
+    pub fn new(
+        settings: &StoreSettings,
+        retry: &RetrySettings,
+        concurrency: u32,
+    ) -> Result<S3Store, Error> {
         // W88/r10-L2: best-effort reap of stale upload temp buffers left by a
         // crashed run in the shared temp dir. Conservative 24h age; every
         // error is swallowed (hygiene, not an operation the user can act on).
@@ -128,6 +139,7 @@ impl S3Store {
             // public constructor contract must not depend on that.
             prefix: crate::config::normalize_prefix(&settings.prefix),
             rt,
+            concurrency,
         })
     }
 
@@ -546,8 +558,10 @@ impl ObjectStore for S3Store {
         // upload times. Folder views are skipped; a NotFound head drops the
         // row (surfaced as a bounded warning); transient errors are retried
         // by the SDK `RetryConfig` (I8, supersedes the retired W117 stopgap);
-        // any other head error fails the listing (I15-errors).
-        enrich_with_head_mtimes(self, Listing { entities, warnings })
+        // any other head error fails the listing (I15-errors). I20-heads:
+        // the enrichment heads fan out under `self.concurrency` (same
+        // `[transfer].concurrency` cap as the transfer passes).
+        enrich_with_head_mtimes(self, Listing { entities, warnings }, self.concurrency)
     }
 
     fn head(&self, key: &str) -> Result<Entity, Error> {
@@ -893,7 +907,7 @@ mod tests {
             prefix: String::new(),
             path_style: false,
         };
-        let store = S3Store::new(&settings, &RetrySettings::default()).unwrap();
+        let store = S3Store::new(&settings, &RetrySettings::default(), 1).unwrap();
         let mut r = std::io::empty();
         let err = store
             .put_from("a.md", &mut r, 5 * 1024 * 1024 * 1024 + 1, None)
@@ -1055,7 +1069,7 @@ mod tests {
                 prefix: input.to_string(),
                 path_style: false,
             };
-            let store = S3Store::new(&settings, &RetrySettings::default()).unwrap();
+            let store = S3Store::new(&settings, &RetrySettings::default(), 1).unwrap();
             assert_eq!(store.prefix, expected, "input {input:?}");
         }
     }

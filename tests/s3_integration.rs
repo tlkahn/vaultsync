@@ -115,7 +115,7 @@ where
         prefix,
         path_style,
     };
-    let store = S3Store::new(&settings, &RetrySettings::default())
+    let store = S3Store::new(&settings, &RetrySettings::default(), 1)
         .map_err(|e| format!("S3Store::new: {e}"));
     let store = match store {
         Ok(s) => s,
@@ -235,6 +235,7 @@ fn s3_integ_prefix_isolation() {
                 path_style,
             },
             &RetrySettings::default(),
+            1,
         )
         .expect("other store");
         put_bytes(&other, "secret.txt", b"s", None)?;
@@ -330,6 +331,7 @@ fn s3_integ_path_style_true() -> Result<(), String> {
                 path_style: true,
             },
             &RetrySettings::default(),
+            1,
         )
         .map_err(|e| format!("path-style true store: {e}"))?,
     )];
@@ -380,6 +382,7 @@ fn s3_integ_path_style_vhost() -> Result<(), String> {
                 path_style: false,
             },
             &RetrySettings::default(),
+            1,
         )
         .map_err(|e| format!("path-style vhost store: {e}"))?,
     )];

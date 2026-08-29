@@ -645,7 +645,7 @@ fn run_with_settings(
     let store: Box<dyn ObjectStore> = if settings.store.bucket.is_empty() {
         Box::new(MemoryStore::new())
     } else {
-        match crate::store::s3::S3Store::new(&settings.store, &settings.retry) {
+        match crate::store::s3::S3Store::new(&settings.store, &settings.retry, 1) {
             Ok(s) => Box::new(s),
             Err(e) => {
                 let _ = writeln!(err, "error: {e}");

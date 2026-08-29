@@ -404,7 +404,9 @@ pub(crate) mod testutil {
                     .push(crate::reserved_drops_warning(&reserved_dropped));
             }
             listing.entities = entities;
-            crate::store::enrich_with_head_mtimes(self, listing)
+            // I20-heads: the test double stays sequential (concurrency 1) so
+            // existing lib tests keep their deterministic head-attempt order.
+            crate::store::enrich_with_head_mtimes(self, listing, 1)
         }
         fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
             self.head_log.lock().unwrap().push(key.to_string());
