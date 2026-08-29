@@ -85,8 +85,10 @@ action a plan - or delete files - against a non-existent store).
   `push`/`pull`/`check` refuse loudly on a non-empty `[ignore].patterns`
   (`status` warns).
 - **`[transfer].concurrency` is live (issue 20).** It bounds how many
-  transfers and list-enrichment heads run in flight (default 4, must be
-  `>= 1`; `1` = sequential). Config-only - there is no `--concurrency` flag.
+  transfers and list-enrichment heads run in flight (default 4, valid range
+  `1..=256`; `1` = sequential; the `256` cap is I20-r1 config-layer - library
+  callers are uncapped, the pool clamps to `min(concurrency, items)`).
+  Config-only - there is no `--concurrency` flag.
 - **The `[transfer.retry]` table under `[transfer]` is live (not Phase 3).** The three knobs
   (`max_attempts` / `base_delay_ms` / `max_delay_ms`) map to the AWS SDK
   standard-mode retry policy on the S3 client; `max_attempts = 1` disables

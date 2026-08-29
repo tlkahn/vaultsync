@@ -94,7 +94,7 @@ region = "us-west-2"
 # ]
 
 [transfer]
-# concurrency = 4   # live (issue 20): bounds transfer passes AND list-enrichment heads; 1 = sequential; >= 1
+# concurrency = 4   # live (issue 20): bounds transfer passes AND list-enrichment heads; 1 = sequential; 1..=256 (256 = I20-r1 cap)
 mtime_tolerance_ms = 1000
 # max_delete = 100
 
@@ -117,10 +117,15 @@ mtime_tolerance_ms = 1000
 `[transfer].concurrency` is **live** (issue 20): it bounds how many
 operations run in flight - the transfer passes (downloads, uploads,
 `DeleteRemote`, `DeleteLocal`) and the per-object head calls that enrich
-`list` results. Default `4`; must be `>= 1` (a loud config error otherwise);
+`list` results. Default `4`; valid range `1..=256` (loud config errors
+otherwise - `0` is rejected, and `256` is the I20-r1 cap: S3 single-client
+throughput saturates well below 256 concurrent ops, so anything above is
+OS-thread cost for zero gain and is a config mistake, not a tuning choice);
 `1` runs everything sequentially on the caller's thread (the pre-issue-20
 behavior). There is no `--concurrency` CLI flag - this is a config-only
-knob, so `--concurrency` stays rejected as an unknown flag.
+knob, so `--concurrency` stays rejected as an unknown flag. The cap is
+config-layer only: library callers of `execute_plan`/`S3Store::new` are
+uncapped, and the pool clamps workers to `min(concurrency, items)`.
 
 `[transfer.retry]` is **live** (not Phase 3): the three knobs map directly to
 AWS SDK **standard-mode** retry policy (exponential backoff with jitter, and
