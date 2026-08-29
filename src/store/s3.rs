@@ -37,7 +37,7 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
 
-use crate::config::StoreSettings;
+use crate::config::{RetrySettings, StoreSettings};
 use crate::entity::Entity;
 use crate::error::Error;
 use crate::store::{Listing, ObjectStore, enrich_with_head_mtimes};
@@ -52,6 +52,19 @@ const MTIME_KEY: &str = "vaultsync-mtime";
 /// disk buffer + upload attempt and failing at the backend.
 const MAX_SINGLE_PUT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
+/// Map resolved `[transfer.retry]` settings (millis) onto an SDK standard-
+/// mode [`RetryConfig`](aws_sdk_s3::config::retry::RetryConfig), which owns
+/// retry/backoff/jitter for every S3 op (I8-layer). `RetrySettings::default()`
+/// maps to the SDK's own `RetryConfig::standard()` (3 / 1s / 20s), so a
+/// default-config run is a no-op change in flight. Pure builder + getters,
+/// hence unit-testable offline.
+pub fn build_retry_config(retry: &RetrySettings) -> aws_sdk_s3::config::retry::RetryConfig {
+    aws_sdk_s3::config::retry::RetryConfig::standard()
+        .with_max_attempts(retry.max_attempts)
+        .with_initial_backoff(std::time::Duration::from_millis(retry.base_delay_ms))
+        .with_max_backoff(std::time::Duration::from_millis(retry.max_delay_ms))
+}
+
 /// The S3 backend. Async fully contained behind the `Runtime`.
 pub struct S3Store {
     client: Client,
@@ -64,7 +77,10 @@ pub struct S3Store {
 impl S3Store {
     /// Build from resolved store settings. Credentials come from the ambient
     /// AWS default chain (env, shared config, profile) - never from the TOML.
-    pub fn new(settings: &StoreSettings) -> Result<S3Store, Error> {
+    /// `retry` carries the resolved `[transfer.retry]` policy (I8); absent
+    /// `[transfer]`-derived policy is kept out of `[store]`-derived
+    /// `StoreSettings` so existing store literals stay untouched.
+    pub fn new(settings: &StoreSettings, retry: &RetrySettings) -> Result<S3Store, Error> {
         // W88/r10-L2: best-effort reap of stale upload temp buffers left by a
         // crashed run in the shared temp dir. Conservative 24h age; every
         // error is swallowed (hygiene, not an operation the user can act on).
@@ -83,6 +99,11 @@ impl S3Store {
             let sdk = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
             let mut b =
                 aws_sdk_s3::config::Builder::from(&sdk).force_path_style(settings.path_style);
+            // I8-layer: the SDK's standard-mode RetryConfig owns retry/backoff/
+            // jitter for ALL S3 ops (lists, heads, gets, puts, deletes) per the
+            // resolved `[transfer.retry]` policy. A default config equals the
+            // SDK's own default, so pre-I8 flight behavior is unchanged.
+            b = b.retry_config(build_retry_config(retry));
             // W7/B-M2: only override the region when explicitly configured;
             // `None` leaves the AWS default chain (env, shared config,
             // profile) already loaded into `sdk` to decide - never a
@@ -778,7 +799,7 @@ mod tests {
             prefix: String::new(),
             path_style: false,
         };
-        let store = S3Store::new(&settings).unwrap();
+        let store = S3Store::new(&settings, &RetrySettings::default()).unwrap();
         let mut r = std::io::empty();
         let err = store
             .put_from("a.md", &mut r, 5 * 1024 * 1024 * 1024 + 1, None)
@@ -940,7 +961,7 @@ mod tests {
                 prefix: input.to_string(),
                 path_style: false,
             };
-            let store = S3Store::new(&settings).unwrap();
+            let store = S3Store::new(&settings, &RetrySettings::default()).unwrap();
             assert_eq!(store.prefix, expected, "input {input:?}");
         }
     }
@@ -1134,6 +1155,35 @@ mod tests {
             validate_object_key("notes/"),
             Err(Error::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn retry_config_from_settings_maps_all_fields() {
+        // I8-layer (pure seam test): `build_retry_config` maps the resolved
+        // `RetrySettings` (millis) onto an SDK standard-mode `RetryConfig`
+        // (Durations), reflected by `max_attempts()` / `initial_backoff()` /
+        // `max_backoff()`. RED: `build_retry_config` does not exist (compile
+        // failure).
+        let rc = build_retry_config(&RetrySettings {
+            max_attempts: 5,
+            base_delay_ms: 250,
+            max_delay_ms: 4000,
+        });
+        assert_eq!(rc.max_attempts(), 5);
+        assert_eq!(rc.initial_backoff(), std::time::Duration::from_millis(250));
+        assert_eq!(rc.max_backoff(), std::time::Duration::from_millis(4000));
+    }
+
+    #[test]
+    fn retry_config_from_settings_default_is_sdk_standard() {
+        // I8-config pin: the default RetrySettings maps to the SDK's own
+        // `RetryConfig::standard()` on all three knobs - so a default-\
+        // config run is a no-op change in flight.
+        let ours = build_retry_config(&crate::config::RetrySettings::default());
+        let std = aws_sdk_s3::config::retry::RetryConfig::standard();
+        assert_eq!(ours.max_attempts(), std.max_attempts());
+        assert_eq!(ours.initial_backoff(), std.initial_backoff());
+        assert_eq!(ours.max_backoff(), std.max_backoff());
     }
 
     #[test]

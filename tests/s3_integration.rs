@@ -18,7 +18,7 @@
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use vaultsync::config::StoreSettings;
+use vaultsync::config::{RetrySettings, StoreSettings};
 use vaultsync::error::Error;
 use vaultsync::local::LocalFs;
 use vaultsync::plan::{Mode, PlanOpts};
@@ -115,7 +115,8 @@ where
         prefix,
         path_style,
     };
-    let store = S3Store::new(&settings).map_err(|e| format!("S3Store::new: {e}"));
+    let store = S3Store::new(&settings, &RetrySettings::default())
+        .map_err(|e| format!("S3Store::new: {e}"));
     let store = match store {
         Ok(s) => s,
         Err(e) => {
@@ -223,15 +224,18 @@ fn s3_integ_prefix_isolation() {
             .map(|v| v == "1")
             .unwrap_or(false);
         let base = std::env::var("VAULTSYNC_TEST_S3_PREFIX").unwrap_or_default();
-        let other = S3Store::new(&StoreSettings {
-            bucket,
-            region: Some(region),
-            endpoint: endpoint.clone(),
-            // normalized trailing `/` (R5-M2): an unnormalized sibling prefix
-            // would actually share the primary prefix on a raw-concat.
-            prefix: format!("{base}vaultsync-other-prefix-{}/", unique_num()),
-            path_style,
-        })
+        let other = S3Store::new(
+            &StoreSettings {
+                bucket,
+                region: Some(region),
+                endpoint: endpoint.clone(),
+                // normalized trailing `/` (R5-M2): an unnormalized sibling prefix
+                // would actually share the primary prefix on a raw-concat.
+                prefix: format!("{base}vaultsync-other-prefix-{}/", unique_num()),
+                path_style,
+            },
+            &RetrySettings::default(),
+        )
         .expect("other store");
         put_bytes(&other, "secret.txt", b"s", None)?;
         // Capture the listing, then clean up the sibling-prefix object BEFORE
@@ -317,13 +321,16 @@ fn s3_integ_path_style_true() -> Result<(), String> {
     };
     let stores: Vec<(bool, S3Store)> = vec![(
         true,
-        S3Store::new(&StoreSettings {
-            bucket,
-            region: Some(region),
-            endpoint,
-            prefix,
-            path_style: true,
-        })
+        S3Store::new(
+            &StoreSettings {
+                bucket,
+                region: Some(region),
+                endpoint,
+                prefix,
+                path_style: true,
+            },
+            &RetrySettings::default(),
+        )
         .map_err(|e| format!("path-style true store: {e}"))?,
     )];
     let mut roundtrip = 0usize;
@@ -364,13 +371,16 @@ fn s3_integ_path_style_vhost() -> Result<(), String> {
     }
     let stores: Vec<(bool, S3Store)> = vec![(
         false,
-        S3Store::new(&StoreSettings {
-            bucket,
-            region: Some(region),
-            endpoint: None,
-            prefix,
-            path_style: false,
-        })
+        S3Store::new(
+            &StoreSettings {
+                bucket,
+                region: Some(region),
+                endpoint: None,
+                prefix,
+                path_style: false,
+            },
+            &RetrySettings::default(),
+        )
         .map_err(|e| format!("path-style vhost store: {e}"))?,
     )];
     let mut roundtrip = 0usize;
