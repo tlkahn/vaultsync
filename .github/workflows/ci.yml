@@ -4,14 +4,20 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Nightly full integration suite (off-hour UTC); the PR-gate integration
+    # job excludes the paginate test until #17 lands.
+    - cron: "17 5 * * *"
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Least privilege: every job only reads the checkout. `contents: read` covers
-# actions/checkout and rust-cache (the cache API is not repo contents write);
-# no job comments on PRs or writes checks.
+# Least privilege: jobs default to `contents: read` (covers actions/checkout
+# and rust-cache - the cache API is not repo contents write). Only the
+# `integration*` jobs add `id-token: write` (job-level) for OIDC -> IAM role
+# auth to the dedicated test bucket (I6-creds); no job comments on PRs or
+# writes checks.
 permissions:
   contents: read
 
@@ -51,9 +57,10 @@ jobs:
       - name: Install pinned toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
-      # Lib + bin unit tests only: the tests/ S3 integration suite hangs (issue
-      # #17) and is gated out of CI until that is fixed. Compilation of the
-      # suite is still covered by the clippy job's --all-targets.
+      # Lib + bin unit tests only: the tests/ S3 integration suite runs in
+      # the dedicated `integration` jobs below (issue #6); the paginate test
+      # is excluded from the PR gate until issue #17 is fixed. Compilation
+      # of the suite is still covered by the clippy job's --all-targets.
       - run: cargo test --locked --lib --bins
 
   msrv:
@@ -71,5 +78,70 @@ jobs:
         run: rustup toolchain install 1.95.0 --profile minimal
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked
-      # lib + bin unit tests only; tests/ S3 integration suite hangs (issue #17)
+      # lib + bin unit tests only; the S3 integration suite runs in the
+      # dedicated `integration` jobs (issue #6)
       - run: cargo test --locked --lib --bins
+
+  integration:
+    name: integration (S3, PR gate)
+    # PRs + pushes to main only; the nightly cron run is the separate job
+    # below (I6-trigger).
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    # Bounds a stuck run (the I15 per-object-head cost makes the suite
+    # network-latency-sensitive, issue #17); revisit once #17 lands.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write # OIDC -> IAM role, this job only (I6-creds)
+    env:
+      # Repo variables, not secrets: none of these are sensitive and showing
+      # them in logs aids debugging. OIDC stores no AWS keys at all.
+      VAULTSYNC_TEST_S3_BUCKET: ${{ vars.VAULTSYNC_TEST_S3_BUCKET }}
+      VAULTSYNC_TEST_S3_REGION: ${{ vars.VAULTSYNC_TEST_S3_REGION }}
+      VAULTSYNC_TEST_S3_PREFIX: ci/
+      # No-silent-skip sentinel (I6-sentinel): a missing bucket var fails
+      # every test instead of passing on a skip.
+      VAULTSYNC_TEST_S3_REQUIRE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.VAULTSYNC_CI_ROLE_ARN }}
+          aws-region: ${{ vars.VAULTSYNC_TEST_S3_REGION }}
+      # s3_integ_list_paginates excluded until #17 lands (it seeds 1050
+      # objects and pays the I15 per-object-head cost ~2100x, 15+ min live);
+      # --nocapture keeps the [ok]/[skip]/cleanup stderr notes in the log.
+      - run: >-
+          cargo test --locked --test s3_integration --
+          --skip s3_integ_list_paginates --nocapture
+
+  integration-nightly:
+    name: integration (S3, nightly full)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VAULTSYNC_TEST_S3_BUCKET: ${{ vars.VAULTSYNC_TEST_S3_BUCKET }}
+      VAULTSYNC_TEST_S3_REGION: ${{ vars.VAULTSYNC_TEST_S3_REGION }}
+      VAULTSYNC_TEST_S3_PREFIX: ci/
+      VAULTSYNC_TEST_S3_REQUIRE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.VAULTSYNC_CI_ROLE_ARN }}
+          aws-region: ${{ vars.VAULTSYNC_TEST_S3_REGION }}
+      # Full suite including s3_integ_list_paginates. May be red while #17
+      # is open (the paginate test can hit the 20-min timeout); it does not
+      # gate PRs - it is the regression net and the bucket-leak tripwire.
+      - run: cargo test --locked --test s3_integration -- --nocapture
