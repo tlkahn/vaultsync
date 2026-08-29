@@ -9,6 +9,12 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: every job only reads the checkout. `contents: read` covers
+# actions/checkout and rust-cache (the cache API is not repo contents write);
+# no job comments on PRs or writes checks.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
