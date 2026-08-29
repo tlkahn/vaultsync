@@ -375,7 +375,13 @@ mod tests {
 
     /// Store wrapper that gauges the max number of concurrent `head` calls
     /// (I20 cycle 5 / I17-gauges: Condvar rendezvous, never wall-clock /
-    /// never `yield_now`).
+    /// never `yield_now`). I17-r1/F1: `OverlapRendezvous` latches
+    /// `released` for the life of the wrapper (single gauge pass per
+    /// instance) - do NOT reuse the wrapper across a sequential baseline
+    /// leg: the conc-1 pass deadlocks (`target=2` never reached;
+    /// `n_workers` was sized for the N leg). Comparison legs must run
+    /// against `store.inner` (see `enrich_heads_bounded_parallel`; same
+    /// trap documented on `enrich_parallel_vanished_warning_order_stable`).
     struct GaugedHeadStore {
         inner: MemoryStore,
         rendezvous: crate::testutil::OverlapRendezvous,
@@ -484,14 +490,20 @@ mod tests {
                 .unwrap();
         }
         let listing = store.inner.list("").unwrap();
-        let enriched4 = enrich_with_head_mtimes(&store, listing.clone(), 4).unwrap();
+        // I17-r1/F1 (W161): the concurrency-1 leg is an EQUALITY pin, not a
+        // gauge, so it runs through `store.inner` (bare MemoryStore) - the
+        // Condvar rendezvous latches `released` for the life of the wrapper,
+        // so a conc-1 pass through the gauge deadlocks (target=2 never
+        // reached; `n_workers` was sized for the N leg). Same trap as
+        // `enrich_parallel_vanished_warning_order_stable`.
+        let enriched1 = enrich_with_head_mtimes(&store.inner, listing.clone(), 1).unwrap();
+        let enriched4 = enrich_with_head_mtimes(&store, listing, 4).unwrap();
         assert!(
             store.max_in_flight() > 1,
             "heads must overlap at concurrency 4 (max in-flight {})",
             store.max_in_flight()
         );
         assert!(store.max_in_flight() <= 4);
-        let enriched1 = enrich_with_head_mtimes(&store, listing, 1).unwrap();
         assert_eq!(enriched4, enriched1, "enriched listings must be identical");
     }
 

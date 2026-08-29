@@ -1195,9 +1195,15 @@ mod tests {
 
     /// Store wrapper that gauges the max number of concurrent `get_to` calls
     /// (I20 cycle 4 / I17-gauges: Condvar rendezvous, never wall-clock /
-    /// never `yield_now`). Measures get_to overlap (bytes streaming), not tmp
-    /// allocation - the F3 dir_create_lock serializes create-alloc, so the
-    /// rendezvous belongs here around the inner store call.
+    /// never `yield_now`). I17-r1/F1: `OverlapRendezvous` latches
+    /// `released` for the life of the wrapper (single gauge pass per
+    /// instance) - do NOT reuse the wrapper across a sequential baseline
+    /// leg: the conc-1 pass deadlocks (`target=2` never reached;
+    /// `n_workers` was sized for the N leg). Comparison legs must run
+    /// against `store.inner` (see `exec_parallel_downloads_overlap`).
+    /// Measures get_to overlap (bytes streaming), not tmp allocation - the
+    /// F3 dir_create_lock serializes create-alloc, so the rendezvous
+    /// belongs here around the inner store call.
     struct GaugedGetStore {
         inner: MemoryStore,
         rendezvous: crate::testutil::OverlapRendezvous,
@@ -1367,12 +1373,21 @@ mod tests {
                 Some(1_000 + i),
             );
         }
-        let dir4 = TempDir::new("vaultsync-exec");
-        let local4 = LocalFs::new(dir4.path());
         let opts = PlanOpts::default();
-        let plan = crate::build_plan(&local4, &store, Mode::Pull, &opts)
+        let dir1 = TempDir::new("vaultsync-exec");
+        let local1 = LocalFs::new(dir1.path());
+        let plan = crate::build_plan(&local1, &store, Mode::Pull, &opts)
             .unwrap()
             .plan;
+        // I17-r1/F1 (W161): the concurrency-1 leg is an EQUALITY pin, not a
+        // gauge, so it runs through `store.inner` (bare MemoryStore) - the
+        // Condvar rendezvous latches `released` for the life of the wrapper,
+        // so a conc-1 pass through the gauge deadlocks (target=2 never
+        // reached; `n_workers` was sized for the N leg). Same trap as
+        // `enrich_parallel_vanished_warning_order_stable`.
+        let rep1 = execute_plan(&local1, &store.inner, &plan, Mode::Pull, &opts, 1);
+        let dir4 = TempDir::new("vaultsync-exec");
+        let local4 = LocalFs::new(dir4.path());
         let rep4 = execute_plan(&local4, &store, &plan, Mode::Pull, &opts, 4);
         assert!(
             store.max_in_flight() > 1,
@@ -1386,9 +1401,6 @@ mod tests {
             let body = std::fs::read(dir4.join(format!("n{i:02}.md"))).unwrap();
             assert_eq!(body, format!("body-{i:02}").as_bytes());
         }
-        let dir1 = TempDir::new("vaultsync-exec");
-        let local1 = LocalFs::new(dir1.path());
-        let rep1 = execute_plan(&local1, &store, &plan, Mode::Pull, &opts, 1);
         assert_eq!(rep4, rep1);
     }
 

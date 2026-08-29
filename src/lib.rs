@@ -311,6 +311,11 @@ pub(crate) mod testutil {
 
     /// Deterministic overlap rendezvous for concurrency gauges (I17-gauges).
     ///
+    /// Single gauge pass per instance: `released` latches once the target
+    /// or worker ceiling is hit, so do not reuse one instance across a
+    /// sequential baseline leg (I17-r1/F1) - comparison legs go through the
+    /// bare inner store instead.
+    ///
     /// Replaces scheduler-sensitive `yield_now` probes: each worker enters,
     /// bumps `in_flight` / `max_in_flight` / `entered`, then blocks on a
     /// Condvar until either `max_in_flight >= target` (overlap proven) **or**
