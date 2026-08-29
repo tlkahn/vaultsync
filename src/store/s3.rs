@@ -9,15 +9,20 @@
 //! backend to `s3://bucket/<prefix><key>`. `list` strips the prefix back off.
 //!
 //! mtime: stored as user metadata `vaultsync-mtime` (decimal ms) on put.
-//! `list` uses `LastModified` (ListObjectsV2 does not return metadata); `head`
-//! and `get_to` prefer the metadata, falling back to `LastModified`.
+//! `head` and `get_to` prefer the metadata, falling back to `LastModified`.
+//! `list` (ListObjectsV2) cannot return user metadata, so it enriches each
+//! listed object's metadata (mtime, etag, size) via a per-object HeadObject
+//! (W113/I15, `enrich_with_head_mtimes`) - which reads `vaultsync-mtime` - so
+//! list-driven
+//! plans compare client mtimes, not upload `LastModified`.
 //!
-//! Consequence (documented limitation): a `list`-driven plan compares against
-//! each object's upload `LastModified`, so after a push many unmodified files
-//! can look "remote newer" by seconds-of-granularity and a later `pull` may
-//! re-download them. Bytes are correct and downloads apply the true client
-//! mtime from `get_to` metadata; a per-object `head` in `list` (to surface
-//! client mtimes in plans) is a post-v1 optimization.
+//! Cost (accepted, I15): a list-driven plan costs 1+ ListObjectsV2 page
+//! requests plus N HeadObject requests (N = remote objects under the prefix),
+//! latency ~ N x RTT. Sequential heads until Phase 3's request-pool work
+//! (I15-concurrency; see roadmap decision log). Head failures are fail-closed
+//! except a NotFound drop (I15-errors): a NotFound head (object deleted
+//! between LIST and HEAD) drops the row; any other head error fails the
+//! listing.
 //!
 //! Streaming: `get_to` streams the object body to the caller's writer;
 //! `put_from` buffers the reader to a temp file on disk and streams that file
@@ -35,7 +40,8 @@ use aws_sdk_s3::primitives::ByteStream;
 use crate::config::StoreSettings;
 use crate::entity::Entity;
 use crate::error::Error;
-use crate::store::{Listing, ObjectStore};
+use crate::store::{Listing, ObjectStore, enrich_with_head_mtimes};
+use crate::{partition_reserved_remote_keys, reserved_drops_warning};
 
 /// User-metadata key for the client-visible mtime (decimal ms).
 const MTIME_KEY: &str = "vaultsync-mtime";
@@ -126,7 +132,9 @@ impl S3Store {
                     let Some(rel) = strip_prefix(&self.prefix, full) else {
                         continue;
                     };
-                    // LastModified is the only mtime source in a listing.
+                    // LastModified is the only mtime source in a raw listing;
+                    // `enrich_with_head_mtimes` overwrites mtime/etag/size for
+                    // object entities before `list` returns (W113/I15).
                     let last = obj.last_modified().and_then(dt_millis);
                     out.push((
                         rel.to_string(),
@@ -496,8 +504,26 @@ impl ObjectStore for S3Store {
         // the `Listing.warnings` channel (same text as before, minus the CLI
         // "warning: " prefix) so the CLI layer prints it; library code must
         // not write to process stderr.
-        let warnings = dropped_folder_warnings(dropped_nonempty);
-        Ok(Listing { entities, warnings })
+        let mut warnings = dropped_folder_warnings(dropped_nonempty);
+        // W118/R2-2: partition reserved-namespace leftovers
+        // (`.vaultsync-check-*` / `.name.vaultsync-tmp-*`) out of the listing
+        // *before* any head is issued - no wasted requests and no fail-closed
+        // scope creep (a transient head error on a junk key must not abort
+        // the run). The shared `reserved_drops_warning` is appended here once;
+        // `build_plan`'s partition stays as a second-line guard for other
+        // backends and no longer fires for S3.
+        let (entities, reserved_dropped) = partition_reserved_remote_keys(entities);
+        if !reserved_dropped.is_empty() {
+            warnings.push(reserved_drops_warning(&reserved_dropped));
+        }
+        // W113/I15: ListObjectsV2 cannot return user metadata, so the
+        // converted entities carry upload `LastModified` mtimes; enrich each
+        // object's mtime/etag/size via a per-object HeadObject (`head` reads
+        // `vaultsync-mtime`) so list-driven plans compare client mtimes, not
+        // upload times. Folder views are skipped; a NotFound head drops the
+        // row (surfaced as a bounded warning); transient errors are retried
+        // (W117); any other head error fails the listing (I15-errors).
+        enrich_with_head_mtimes(self, Listing { entities, warnings })
     }
 
     fn head(&self, key: &str) -> Result<Entity, Error> {

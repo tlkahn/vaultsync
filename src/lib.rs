@@ -71,20 +71,7 @@ pub fn build_plan(
     // namespace), and now every run that encounters a leftover says so.
     let (remote_entities, reserved_dropped) = partition_reserved_remote_keys(remote_entities);
     if !reserved_dropped.is_empty() {
-        // W70-style one-line warning ("surface, don't hide"); names bounded
-        // so a pathological namespace can't flood stderr.
-        let names: Vec<String> = reserved_dropped.iter().map(|e| e.key.clone()).collect();
-        let shown = names.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
-        let more = names.len().saturating_sub(5);
-        let suffix = if more > 0 {
-            format!(" and {more} more")
-        } else {
-            String::new()
-        };
-        warnings.push(format!(
-            "ignoring {} remote object(s) under the reserved vaultsync namespace: {shown}{suffix}",
-            names.len()
-        ));
+        warnings.push(reserved_drops_warning(&reserved_dropped));
     }
     for e in &remote_entities {
         crate::entity::ensure_valid_key(&e.key)?;
@@ -139,10 +126,12 @@ pub fn build_plan(
 /// namespace filter (W63/A-L3 + W79/r9 L1): a tmp-sibling key
 /// (`.name.vaultsync-tmp-*`) or a `.vaultsync-check-*` probe leftover on the
 /// remote is never planned. Pure and unit-testable offline; the warning
-/// side effect over the `dropped` list lives in `build_plan` (surfaced via
-/// `PlanReport.warnings`, not capture-tested, same precedent as W70). Both
-/// output lists preserve the input order.
-fn partition_reserved_remote_keys(entities: Vec<Entity>) -> (Vec<Entity>, Vec<Entity>) {
+/// side effect over the `dropped` list lives in [`reserved_drops_warning`]
+/// (surfaced via `PlanReport.warnings`, not capture-tested, same precedent
+/// as W70). Both output lists preserve the input order. `pub(crate)` so
+/// `S3Store::list` partitions reserved keys out *before* issuing any head
+/// (W118) - no wasted requests and no fail-closed scope creep over junk.
+pub(crate) fn partition_reserved_remote_keys(entities: Vec<Entity>) -> (Vec<Entity>, Vec<Entity>) {
     let mut kept = Vec::new();
     let mut dropped = Vec::new();
     for e in entities {
@@ -165,6 +154,27 @@ fn partition_reserved_remote_keys(entities: Vec<Entity>) -> (Vec<Entity>, Vec<En
         }
     }
     (kept, dropped)
+}
+
+/// The W70-style one-line warning ("surface, don't hide") for a list of
+/// reserved-namespace leftovers. Names bounded (first 5 + "and N more") so a
+/// pathological namespace can't flood stderr. Single source of truth shared
+/// by `build_plan` and `S3Store::list` (W118) so the text is identical
+/// wherever it fires; `S3Store::list` emits it once (store side) so
+/// `build_plan`'s partition no longer re-fires for S3.
+pub(crate) fn reserved_drops_warning(dropped: &[Entity]) -> String {
+    let names: Vec<String> = dropped.iter().map(|e| e.key.clone()).collect();
+    let shown = names.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+    let more = names.len().saturating_sub(5);
+    let suffix = if more > 0 {
+        format!(" and {more} more")
+    } else {
+        String::new()
+    };
+    format!(
+        "ignoring {} remote object(s) under the reserved vaultsync namespace: {shown}{suffix}",
+        names.len()
+    )
 }
 
 fn compute_stats(actions: &[plan::Action]) -> plan::PlanStats {
@@ -325,6 +335,103 @@ pub(crate) mod testutil {
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Offline test double replicating issue #15's S3 behavior (W111, I15).
+    ///
+    /// Wraps a [`crate::store::mock::MemoryStore`]. `list` delegates to the
+    /// mock but rewrites every OBJECT entity's mtime to a fixed later "upload
+    /// time" and drops its etag (simulating the ListObjectsV2 `LastModified`
+    /// fallback - user metadata is invisible to a listing), then runs the
+    /// production [`crate::store::enrich_with_head_mtimes`] - mirroring the
+    /// W113 S3 wiring so lib-level convergence tests exercise the real
+    /// production path. `head`/`get_to`/`put_from`/`delete` delegate unchanged
+    /// (the mock `head` reports the metadata mtime, exactly like S3).
+    pub(crate) struct S3LikeListStore {
+        inner: crate::store::mock::MemoryStore,
+        /// Listed upload-time override applied to every object mtime (picked
+        /// bigger than any real mtime so the degraded frame is unambiguous).
+        upload_time_ms: u64,
+        /// Every key the double's `head` delegate has served, in order.
+        head_log: std::cell::RefCell<Vec<String>>,
+        /// Keys whose `head` should answer `Unavailable` (W118 fail-closed
+        /// scope-creep probe).
+        fail_head_keys: Vec<String>,
+    }
+
+    impl S3LikeListStore {
+        pub(crate) fn new() -> Self {
+            S3LikeListStore {
+                inner: crate::store::mock::MemoryStore::new(),
+                upload_time_ms: 9_999_999_999,
+                head_log: std::cell::RefCell::new(Vec::new()),
+                fail_head_keys: Vec::new(),
+            }
+        }
+        pub(crate) fn inner(&self) -> &crate::store::mock::MemoryStore {
+            &self.inner
+        }
+        /// Keys whose `head` should answer `Unavailable` (throttle).
+        pub(crate) fn fail_head(&mut self, key: &str) -> &mut Self {
+            self.fail_head_keys.push(key.to_string());
+            self
+        }
+        /// Snapshot of every key the double's `head` has served, in order.
+        pub(crate) fn head_log(&self) -> Vec<String> {
+            self.head_log.borrow().clone()
+        }
+    }
+
+    impl crate::store::ObjectStore for S3LikeListStore {
+        fn list(&self, prefix: &str) -> Result<crate::store::Listing, crate::error::Error> {
+            let mut listing = self.inner.list(prefix)?;
+            for e in listing.entities.iter_mut() {
+                if !e.is_folder() {
+                    e.mtime_ms = Some(self.upload_time_ms);
+                    e.etag = None;
+                }
+            }
+            // W118: partition reserved-namespace leftovers out before any
+            // head is issued and surface the shared bounded warning, mirroring
+            // `S3Store::list`'s wiring order (degrade -> partition -> enrich).
+            let (entities, reserved_dropped) =
+                crate::partition_reserved_remote_keys(listing.entities);
+            if !reserved_dropped.is_empty() {
+                listing
+                    .warnings
+                    .push(crate::reserved_drops_warning(&reserved_dropped));
+            }
+            listing.entities = entities;
+            crate::store::enrich_with_head_mtimes(self, listing)
+        }
+        fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.head_log.borrow_mut().push(key.to_string());
+            if self.fail_head_keys.iter().any(|k| k == key) {
+                return Err(crate::error::Error::Unavailable(format!(
+                    "throttled: {key}"
+                )));
+            }
+            self.inner.head(key)
+        }
+        fn get_to(
+            &self,
+            key: &str,
+            w: &mut dyn std::io::Write,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime_ms: Option<u64>,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.put_from(key, r, size, mtime_ms)
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
+            self.inner.delete(key)
         }
     }
 }
@@ -488,6 +595,112 @@ mod tests {
                 .iter()
                 .any(|a| a.key.starts_with(".vaultsync-check-")),
             "reserved key planned: {:?}",
+            report.plan.actions
+        );
+    }
+
+    #[test]
+    fn list_filters_reserved_keys_before_head_enrichment() {
+        use crate::testutil::S3LikeListStore;
+        // W118/R2-2: reserved-namespace leftovers are partitioned out of the
+        // S3 listing *before* any head is issued, so a junk key appears in no
+        // plan row, the shared W79 warning fires exactly once (store side,
+        // not re-fired by build_plan for S3), and the head log shows only the
+        // healthy key - never the reserved one.
+        let dir = TempDir::new("vaultsync-lib-test");
+        let store = S3LikeListStore::new();
+        store
+            .inner()
+            .put_from(
+                ".vaultsync-check-9",
+                &mut std::io::Cursor::new(b"junk".to_vec()),
+                4,
+                Some(1_600_000_000_000),
+            )
+            .unwrap();
+        store
+            .inner()
+            .put_from(
+                "notes/a.md",
+                &mut std::io::Cursor::new(b"aaa".to_vec()),
+                3,
+                Some(1_600_000_000_000),
+            )
+            .unwrap();
+        let local = LocalFs::new(dir.path());
+        let report = build_plan(&local, &store, Mode::Status, &PlanOpts::default()).unwrap();
+        // reserved key never planned.
+        assert!(
+            !report
+                .plan
+                .actions
+                .iter()
+                .any(|a| a.key.starts_with(".vaultsync-check-")),
+            "reserved key planned: {:?}",
+            report.plan.actions
+        );
+        // store-side warning present exactly once with the W79 text.
+        let matching: Vec<&String> = report
+            .warnings
+            .iter()
+            .filter(|w| w.contains("reserved vaultsync namespace"))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "expected exactly one warning: {:?}",
+            report.warnings
+        );
+        assert!(
+            matching[0].contains(".vaultsync-check-9"),
+            "warning must name the junk key: {}",
+            matching[0]
+        );
+        // head log during list: healthy key served, reserved key never.
+        let head_log = store.head_log();
+        assert!(
+            head_log.iter().any(|k| k == "notes/a.md"),
+            "healthy key not headed: {head_log:?}"
+        );
+        assert!(
+            !head_log.iter().any(|k| k == ".vaultsync-check-9"),
+            "reserved key was headed (should be pre-filtered): {head_log:?}"
+        );
+    }
+
+    #[test]
+    fn reserved_key_head_failure_does_not_fail_listing() {
+        use crate::testutil::S3LikeListStore;
+        // W118/R2-2 fail-closed scope creep: a transient head error (throttle)
+        // on a reserved leftover must NOT abort the whole listing/plan - the
+        // junk key is filtered before any head, so the healthy key still
+        // plans.
+        let dir = TempDir::new("vaultsync-lib-test");
+        let mut store = S3LikeListStore::new();
+        store.fail_head(".vaultsync-check-9");
+        store
+            .inner()
+            .put_from(
+                ".vaultsync-check-9",
+                &mut std::io::Cursor::new(b"junk".to_vec()),
+                4,
+                Some(1_600_000_000_000),
+            )
+            .unwrap();
+        store
+            .inner()
+            .put_from(
+                "notes/a.md",
+                &mut std::io::Cursor::new(b"aaa".to_vec()),
+                3,
+                Some(1_600_000_000_000),
+            )
+            .unwrap();
+        let local = LocalFs::new(dir.path());
+        let report = build_plan(&local, &store, Mode::Status, &PlanOpts::default()).unwrap();
+        assert!(
+            report.plan.actions.iter().any(|a| a.key == "notes/a.md"),
+            "healthy key dropped: {:?}",
             report.plan.actions
         );
     }
@@ -1257,5 +1470,131 @@ mod tests {
             verbose.lines().any(|l| l.starts_with("S  ")),
             "skips hidden with -v: {verbose}"
         );
+    }
+
+    /// Pin a file's mtime to a fixed ms value (deterministic convergence tests).
+    fn set_mtime(p: &std::path::Path, ms: u64) {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms);
+        let times = std::fs::FileTimes::new().set_modified(t);
+        std::fs::File::open(p).unwrap().set_times(times).unwrap();
+    }
+
+    fn mtime_ms(p: &std::path::Path) -> u64 {
+        std::fs::metadata(p)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    /// Pre-fix sanity (documented, issue #15): planning against this double's
+    /// RAW degraded listing (every object mtime rewritten to a later upload
+    /// time, as S3's ListObjectsV2 `LastModified` fallback does) classifies
+    /// every key `RemoteNewer` => Download-everything - reproduced here with
+    /// no socket. The `enrich_with_head_mtimes` call inside the double's
+    /// `list` (mirroring the W113 S3 wiring) is what turns that into a no-op.
+    #[test]
+    fn build_plan_status_converges_after_push_with_s3like_listing() {
+        use crate::testutil::S3LikeListStore;
+        let dir = TempDir::new("vaultsync-lib-test");
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        let files = [
+            ("a.md", b"aaa".to_vec()),
+            ("notes/b.md", b"bbbb".to_vec()),
+            ("c.md", b"cc".to_vec()),
+        ];
+        let fixed = 1_600_000_000_123u64;
+        for (rel, bytes) in &files {
+            let p = dir.join(rel);
+            std::fs::write(&p, bytes).unwrap();
+            set_mtime(&p, fixed);
+        }
+        let store = S3LikeListStore::new();
+        let local = LocalFs::new(dir.path());
+        // push (the S3LikeListStore list enriches via head, so this converges)
+        let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default())
+            .unwrap()
+            .plan;
+        // W120/R1-M3: assert the push plan actually planned the seeded
+        // uploads (a vacuous pass on an empty push would hide regressions).
+        assert_eq!(
+            plan.stats.upload,
+            files.len() as u32,
+            "push plan must plan the seeded uploads: {:?}",
+            plan.actions
+        );
+        let rep =
+            crate::exec::execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default());
+        assert!(rep.failed.is_empty(), "push failures: {:?}", rep.failed);
+        assert_eq!(
+            rep.executed,
+            files.len() as u32,
+            "push must execute exactly the seeded uploads: {:?}",
+            rep
+        );
+        // per-key size sanity: each upload landed with the true byte count.
+        for (rel, bytes) in &files {
+            let h = store.head(rel).unwrap();
+            assert_eq!(
+                h.size,
+                bytes.len() as u64,
+                "uploaded {rel} size wrong: {:?}",
+                h
+            );
+        }
+        // status after push must plan 0 mutating actions (issue acceptance 1)
+        let status = crate::build_plan(&local, &store, Mode::Status, &PlanOpts::default())
+            .unwrap()
+            .plan;
+        assert_eq!(status.stats.upload, 0, "uploads: {:?}", status.actions);
+        assert_eq!(status.stats.download, 0, "downloads: {:?}", status.actions);
+        assert_eq!(status.stats.conflict, 0, "conflicts: {:?}", status.actions);
+        // every non-folder row is a visible Skip (folders may Skip as well)
+        for a in &status.actions {
+            if !a.key.ends_with('/') {
+                assert_eq!(a.kind, ActionKind::Skip, "non-converged row: {:?}", a);
+            }
+        }
+    }
+
+    /// Maps onto the issue's second acceptance bullet: pull into a fresh dir
+    /// restores byte-identical files with exact mtimes, and a following
+    /// `status` there plans 0 mutating actions (download-direction
+    /// incrementality exists).
+    #[test]
+    fn pull_into_fresh_dir_then_status_converges_with_s3like_listing() {
+        use crate::testutil::S3LikeListStore;
+        let store = S3LikeListStore::new();
+        let fixed = 1_600_000_000_123u64;
+        let files = [("a.md", b"aaa".to_vec()), ("notes/b.md", b"bbbb".to_vec())];
+        for (rel, bytes) in &files {
+            let mut c = std::io::Cursor::new(bytes.clone());
+            store
+                .inner()
+                .put_from(rel, &mut c, bytes.len() as u64, Some(fixed))
+                .unwrap();
+        }
+        let dst = TempDir::new("vaultsync-lib-test");
+        let ldst = LocalFs::new(dst.path());
+        let plan = crate::build_plan(&ldst, &store, Mode::Pull, &PlanOpts::default())
+            .unwrap()
+            .plan;
+        let rep = crate::exec::execute_plan(&ldst, &store, &plan, Mode::Pull, &PlanOpts::default());
+        assert!(rep.failed.is_empty(), "pull failures: {:?}", rep.failed);
+        // byte-identical + exact mtime restored (existing feature must hold)
+        for (rel, bytes) in &files {
+            assert_eq!(std::fs::read(dst.join(rel)).unwrap(), *bytes, "{rel} bytes");
+            let gm = mtime_ms(&dst.join(rel));
+            assert!(gm.abs_diff(fixed) < 2000, "{rel} mtime {gm} != {fixed}");
+        }
+        // status in the fresh dir plans 0 mutating actions (issue acceptance 2)
+        let status = crate::build_plan(&ldst, &store, Mode::Status, &PlanOpts::default())
+            .unwrap()
+            .plan;
+        assert_eq!(status.stats.upload, 0, "uploads: {:?}", status.actions);
+        assert_eq!(status.stats.download, 0, "downloads: {:?}", status.actions);
+        assert_eq!(status.stats.conflict, 0, "conflicts: {:?}", status.actions);
     }
 }

@@ -51,13 +51,22 @@ action a plan - or delete files - against a non-existent store).
 
 ## Known behaviors
 
-- **List-driven plans compare upload `LastModified`.** A plan is built from
-  `list`, which exposes S3's second-granular `LastModified`, not the client
-  `vaultsync-mtime` carried in object metadata. After a `push`, a later `pull`
-  can therefore re-download unchanged files once (they look "remote newer" by
-  seconds). Bytes and the applied `vaultsync-mtime` are correct; only the
-  *plan* is pessimistic. An opt-in head-on-list to surface client mtimes in
-  plans is Phase 3.
+- **List-driven plans compare client `vaultsync-mtime` (issue #15 fixed).**
+  A plan is built from `list`, which enriches each object via a per-object
+  `HeadObject` (reading the client `vaultsync-mtime` metadata), so plans
+  compare the client mtime, not the upload `LastModified`. After a `push`, a
+  later `pull`/`status` sees the uploaded file as in-sync (no pessimistic
+  one-time re-download). Accepted cost: N+1 requests per list-driven plan
+  (1+ ListObjectsV2 pages + N sequential heads, roughly N x RTT) until Phase
+  3's request pool; a bounded transient retry (W117) covers throttles
+  mid-enrich.
+- **Reserved-namespace leftovers are filtered before any head** (W118):
+  `.vaultsync-check-*` / `.*.vaultsync-tmp-*` keys are partitioned out of a
+  listing before a `HeadObject` is issued - no wasted requests and no
+  fail-closed scope creep over junk keys.
+- **A listed key deleted before its head is dropped with a warning** (W116);
+  any other head error fails the listing (fail-closed, W61 ethos), so a plan
+  is never built against a knowingly-degraded remote view.
 - **Mock store is `status` only.** Without a `[store]` section, `push`/
   `pull`/`check` refuse (exit 1); only `status` runs against the in-memory
   mock.

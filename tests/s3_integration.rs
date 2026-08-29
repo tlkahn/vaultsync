@@ -495,3 +495,115 @@ fn s3_integ_e2e_push_pull() {
         Ok(())
     });
 }
+
+#[test]
+fn s3_integ_status_converges_after_push() {
+    // Issue #15 acceptance bullet 1 (W112): after a real push, a Status plan
+    // on the same vault plans 0 mutating actions. RED on real S3 before the
+    // W113 list-enrich wiring (list sees upload LastModified, so it plans N
+    // downloads - the exact issue report); GREEN after. Env-gated like the
+    // rest of this suite.
+    with_store("statusconv", |s| {
+        let src = TestDir::new("src");
+        std::fs::create_dir_all(src.join("notes")).unwrap();
+        let files: Vec<(&str, Vec<u8>)> = vec![
+            ("note.md", b"hello world\n".to_vec()),
+            ("notes/a.md", b"nested\n".to_vec()),
+            ("b.md", b"bb\n".to_vec()),
+        ];
+        let fixed = 1_600_000_000_123u64;
+        for (rel, bytes) in &files {
+            let path = src.join(rel);
+            std::fs::write(&path, bytes).unwrap();
+            set_mtime(&path, fixed);
+        }
+        let local = LocalFs::new(src.path());
+        let plan = vaultsync::build_plan(&local, s, Mode::Push, &PlanOpts::default())
+            .map_err(|e| format!("{e}"))?
+            .plan;
+        // W120/R1-M3: assert the push plan actually planned the seeded uploads
+        // (a vacuous pass on an empty push would hide regressions).
+        assert_eq!(
+            plan.stats.upload,
+            files.len() as u32,
+            "push plan must plan the seeded uploads: {:?}",
+            plan.actions
+        );
+        let rep = vaultsync::exec::execute_plan(&local, s, &plan, Mode::Push, &PlanOpts::default());
+        assert!(rep.failed.is_empty(), "push failures: {:?}", rep.failed);
+        assert_eq!(
+            rep.executed,
+            files.len() as u32,
+            "push must execute exactly the seeded uploads: {:?}",
+            rep
+        );
+        // per-key size sanity: each upload landed with the true byte count.
+        for (rel, bytes) in &files {
+            let h = s.head(rel).map_err(|e| format!("{e}"))?.size;
+            assert_eq!(h, bytes.len() as u64, "uploaded {rel} size wrong");
+        }
+
+        let status = vaultsync::build_plan(&local, s, Mode::Status, &PlanOpts::default())
+            .map_err(|e| format!("{e}"))?
+            .plan;
+        assert_eq!(status.stats.upload, 0, "uploads: {:?}", status.actions);
+        assert_eq!(status.stats.download, 0, "downloads: {:?}", status.actions);
+        assert_eq!(status.stats.conflict, 0, "conflicts: {:?}", status.actions);
+        Ok(())
+    });
+}
+
+#[test]
+fn s3_integ_pull_then_status_converges() {
+    // Issue #15 acceptance bullet 2 (W112): wipe local, pull into a fresh dir
+    // (exact mtimes restored), then a Status plan there plans 0 mutating
+    // actions - download-direction incrementality exists. RED on real S3
+    // before the W113 wiring; GREEN after.
+    with_store("pullconv", |s| {
+        let src = TestDir::new("src");
+        std::fs::create_dir_all(src.join("notes")).unwrap();
+        let files: Vec<(&str, Vec<u8>)> = vec![
+            ("note.md", b"hello world\n".to_vec()),
+            ("notes/a.md", b"nested\n".to_vec()),
+        ];
+        let fixed = 1_600_000_000_123u64;
+        for (rel, bytes) in &files {
+            let path = src.join(rel);
+            std::fs::write(&path, bytes).unwrap();
+            set_mtime(&path, fixed);
+        }
+        // stage the remote
+        let local = LocalFs::new(src.path());
+        let plan = vaultsync::build_plan(&local, s, Mode::Push, &PlanOpts::default())
+            .map_err(|e| format!("{e}"))?
+            .plan;
+        let rep = vaultsync::exec::execute_plan(&local, s, &plan, Mode::Push, &PlanOpts::default());
+        assert!(rep.failed.is_empty(), "push failures: {:?}", rep.failed);
+
+        // wipe local, pull into a fresh dir
+        let _ = std::fs::remove_dir_all(src.path());
+        let dst = TestDir::new("dst");
+        let ldst = LocalFs::new(dst.path());
+        let plan2 = vaultsync::build_plan(&ldst, s, Mode::Pull, &PlanOpts::default())
+            .map_err(|e| format!("{e}"))?
+            .plan;
+        let rep2 =
+            vaultsync::exec::execute_plan(&ldst, s, &plan2, Mode::Pull, &PlanOpts::default());
+        assert!(rep2.failed.is_empty(), "pull failures: {:?}", rep2.failed);
+
+        // exact mtimes restored (existing feature must hold)
+        for (rel, _bytes) in &files {
+            let gm = mtime_ms(&dst.join(rel));
+            assert!(gm.abs_diff(fixed) < 2000, "{rel} mtime {gm} != {fixed}");
+        }
+
+        // status on the fresh dir plans 0 mutating actions
+        let status = vaultsync::build_plan(&ldst, s, Mode::Status, &PlanOpts::default())
+            .map_err(|e| format!("{e}"))?
+            .plan;
+        assert_eq!(status.stats.upload, 0, "uploads: {:?}", status.actions);
+        assert_eq!(status.stats.download, 0, "downloads: {:?}", status.actions);
+        assert_eq!(status.stats.conflict, 0, "conflicts: {:?}", status.actions);
+        Ok(())
+    });
+}

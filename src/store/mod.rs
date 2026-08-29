@@ -12,6 +12,14 @@ use crate::error::Error;
 pub mod mock;
 pub mod s3;
 
+/// Bounded retry policy for transient head errors inside listing enrichment
+/// (W117, R2-3). `HEAD_MAX_ATTEMPTS` is 1 initial attempt + 2 retries;
+/// backoff is a small fixed sleep (`[100ms, 300ms]`) before each retry, so
+/// the worst added latency per key on the failing path is 400ms. This is a
+/// stopgap; the Phase 3 request pool owns full retry/backoff/jitter.
+const HEAD_MAX_ATTEMPTS: usize = 3;
+const HEAD_BACKOFF_MS: [u64; 2] = [100, 300];
+
 /// A listing result: the entities plus advisory warnings the backend wants
 /// surfaced (e.g. keys dropped while listing). A struct, not a tuple, so
 /// Phase 3 fields extend without another signature break. The CLI prints
@@ -85,4 +93,425 @@ pub trait ObjectStore {
     /// (the mock and `LocalFs::delete_file` do). Callers must treat both as
     /// reaching the goal state; the executor normalizes `NotFound` to success.
     fn delete(&self, key: &str) -> Result<(), Error>;
+}
+
+/// Enrich a listing's object entities with per-object `head()` results so
+/// plans compare client mtimes, not upload times (issue #15, I15-approach).
+///
+/// Each object entity is replaced by a coherent head snapshot: `mtime_ms`,
+/// `etag`, and `size` all come from the same `head()` result. Taking `size`
+/// from head (not the raw list) aligns the W106 `CappedWriter` cap and the
+/// head-before-delete size check with the mtime identity the planner just
+/// trusted, and retires the stale-list-size chimera (a list-era size with a
+/// head-era mtime). The residual race shrinks to "object changed between
+/// enrich-head and get/delete-head", which the executor already handles.
+///
+/// Folder views are skipped (not objects; `head` on a folder key is NotFound
+/// by contract - see the `ObjectStore::list` doc). A `NotFound` head drops the
+/// row (a genuine concurrent-delete race; planning against a vanished object
+/// would be worse) and is surfaced, not hidden, as one bounded warning in
+/// `Listing.warnings` (W70/W79 surface-don't-hide; see W116). Note that
+/// folder views synthesized before enrichment can survive their children -
+/// all objects under a prefix deleted between LIST and HEAD leaves a stale
+/// folder view - which is benign because folders plan as Skip and are never
+/// delete targets. Any *other* head error fails the whole listing (I15-errors,
+/// fail-closed - never plan against a knowingly-degraded remote view, matching
+/// the W61 ethos and `pull --delete` safety). Entity order (sorted) and
+/// `warnings` are preserved verbatim.
+pub(crate) fn enrich_with_head_mtimes<S: ObjectStore + ?Sized>(
+    store: &S,
+    listing: Listing,
+) -> Result<Listing, Error> {
+    let mut entities = Vec::new();
+    let mut vanished: Vec<String> = Vec::new();
+    for e in listing.entities {
+        if e.is_folder() {
+            entities.push(e);
+            continue;
+        }
+        match head_with_retry(store, &e.key) {
+            Ok(h) => {
+                let mut e = e;
+                e.mtime_ms = h.mtime_ms;
+                e.etag = h.etag;
+                e.size = h.size;
+                entities.push(e);
+            }
+            Err(Error::NotFound(_)) => {
+                // Concurrent-delete race between LIST and HEAD: drop the row,
+                // and surface the drop (W70/W79 surface-don't-hide ethos) via
+                // one bounded warning appended below.
+                vanished.push(e.key);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    let mut warnings = listing.warnings;
+    if !vanished.is_empty() {
+        const MAX: usize = 5;
+        let total = vanished.len();
+        let shown: Vec<&str> = vanished.iter().take(MAX).map(|s| s.as_str()).collect();
+        let mut msg = format!(
+            "{} listed key(s) vanished before head (deleted between LIST and HEAD); skipping: ",
+            total
+        );
+        msg.push_str(&shown.join(", "));
+        if total > MAX {
+            msg.push_str(&format!(" and {} more", total - MAX));
+        }
+        warnings.push(msg);
+    }
+    Ok(Listing { entities, warnings })
+}
+
+/// Head a key with a bounded stopgap retry on transient store errors.
+///
+/// `Unavailable` and `Timeout` (throttling / transient service blips) are
+/// retried up to `HEAD_MAX_ATTEMPTS` with a small fixed backoff ([100ms,
+/// 300ms]); all other errors (`NotFound` drop, `Unauthorized`, `Other`) keep
+/// their single-attempt semantics. This stays private (no new API surface);
+/// it is a stopgap - the Phase 3 request pool owns full retry/backoff/jitter.
+fn head_with_retry<S: ObjectStore + ?Sized>(store: &S, key: &str) -> Result<Entity, Error> {
+    let mut attempt = 1;
+    loop {
+        match store.head(key) {
+            Ok(h) => return Ok(h),
+            Err(Error::Unavailable(_)) | Err(Error::Timeout(_)) if attempt < HEAD_MAX_ATTEMPTS => {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    HEAD_BACKOFF_MS[attempt - 1],
+                ));
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entity::{file, folder};
+    use crate::store::mock::MemoryStore;
+
+    /// Build a store with two files (true metadata mtimes 100/200) and return
+    /// a listing whose FILE entities carry later "upload-time" mtimes and no
+    /// etag - exactly the degraded input real S3 `list` produces today
+    /// (ListObjectsV2 `LastModified` fallback; issue #15).
+    fn degraded_listing() -> (MemoryStore, Listing) {
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"a".to_vec());
+        store.put_from("a.md", &mut c, 1, Some(100)).unwrap();
+        let mut c = std::io::Cursor::new(b"b".to_vec());
+        store.put_from("notes/b.md", &mut c, 1, Some(200)).unwrap();
+        let mut listing = store.list("").unwrap();
+        for e in listing.entities.iter_mut() {
+            if !e.is_folder() {
+                e.mtime_ms = Some(9_999_999);
+                e.etag = None;
+            }
+        }
+        listing.warnings = vec!["warn-1".to_string()];
+        // sanity: this is the exact input today's planner would classify
+        // RemoteNewer on every key (the issue's Download-everything shape).
+        assert!(
+            listing
+                .entities
+                .iter()
+                .all(|e| e.is_folder() || e.mtime_ms == Some(9_999_999))
+        );
+        (store, listing)
+    }
+
+    #[test]
+    fn enrich_corrects_stale_listing_size_with_head_size() {
+        let (store, mut listing) = degraded_listing();
+        // Corrupt one file entity's listed `size` far from the real value.
+        // The enrichment must replace it with the head's size (a coherent
+        // head snapshot: size + mtime + etag from the same HeadObject), so
+        // the W106 CappedWriter cap and the head-before-delete size check key
+        // off the same identity the planner just trusted.
+        let a = listing
+            .entities
+            .iter_mut()
+            .find(|e| e.key == "a.md")
+            .unwrap();
+        a.size = 9_999;
+        let enriched = enrich_with_head_mtimes(&store, listing).unwrap();
+        let a = enriched.entities.iter().find(|e| e.key == "a.md").unwrap();
+        assert_eq!(a.size, store.head("a.md").unwrap().size);
+        assert_eq!(
+            a.size, 1,
+            "mock true size is 1; stale listed size must be corrected"
+        );
+    }
+
+    #[test]
+    fn enrich_overrides_listing_mtime_with_head_mtime() {
+        let (store, listing) = degraded_listing();
+        let enriched = enrich_with_head_mtimes(&store, listing).unwrap();
+        // head reports the true (earlier) metadata mtimes and the real etag.
+        let a = enriched.entities.iter().find(|e| e.key == "a.md").unwrap();
+        assert_eq!(a.mtime_ms, Some(100));
+        assert_eq!(a.etag, store.head("a.md").unwrap().etag);
+        let b = enriched
+            .entities
+            .iter()
+            .find(|e| e.key == "notes/b.md")
+            .unwrap();
+        assert_eq!(b.mtime_ms, Some(200));
+        // folder entity passes through untouched (mtime stays None).
+        let notes = enriched
+            .entities
+            .iter()
+            .find(|e| e.key == "notes/")
+            .unwrap();
+        assert_eq!(notes.mtime_ms, None);
+        // order stays sorted; warnings preserved verbatim.
+        let keys: Vec<_> = enriched.entities.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["a.md", "notes/", "notes/b.md"]);
+        assert_eq!(enriched.warnings, vec!["warn-1".to_string()]);
+    }
+
+    #[test]
+    fn enrich_warns_bounded_when_rows_vanish_before_head() {
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"a".to_vec());
+        store.put_from("a.md", &mut c, 1, Some(100)).unwrap();
+        // Seven listed keys that no longer exist (deleted between LIST and
+        // HEAD) plus one healthy key. The drop is surfaced as a single
+        // bounded warning naming the first 5 + "and N more" (W79 ethos).
+        let vanished: Vec<Entity> = (0..7)
+            .map(|i| file(&format!("gone-{i}.md"), 5, Some(9_999_999)))
+            .collect();
+        let mut entities = Vec::new();
+        entities.push(file("a.md", 1, Some(9_999_999)));
+        entities.extend(vanished);
+        let listing = Listing {
+            entities,
+            warnings: vec!["pre-existing".to_string()],
+        };
+        let enriched = enrich_with_head_mtimes(&store, listing).unwrap();
+        // Healthy row kept; all vanished rows dropped.
+        let keys: Vec<_> = enriched.entities.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["a.md"]);
+        // Exactly one appended warning, bounded to 5 names + "and 2 more";
+        // pre-existing warning preserved verbatim (append, not replace).
+        assert_eq!(enriched.warnings.len(), 2);
+        assert_eq!(enriched.warnings[0], "pre-existing");
+        assert_eq!(
+            enriched.warnings[1],
+            "7 listed key(s) vanished before head (deleted between LIST and HEAD); skipping: \
+             gone-0.md, gone-1.md, gone-2.md, gone-3.md, gone-4.md and 2 more"
+        );
+    }
+
+    #[test]
+    fn enrich_drops_row_when_head_not_found() {
+        let (store, mut listing) = degraded_listing();
+        // A listed key that vanishes between LIST and HEAD (concurrent-delete
+        // race): head answers NotFound, so the row is dropped, siblings kept.
+        listing.entities.push(file("gone.md", 5, Some(9_999_999)));
+        let enriched = enrich_with_head_mtimes(&store, listing).unwrap();
+        let keys: Vec<_> = enriched.entities.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["a.md", "notes/", "notes/b.md"]);
+    }
+
+    /// Store whose `head` fails with a non-NotFound error (throttling class).
+    struct HeadFailStore {
+        calls: std::cell::Cell<usize>,
+    }
+    impl HeadFailStore {
+        fn new() -> Self {
+            Self {
+                calls: std::cell::Cell::new(0),
+            }
+        }
+    }
+    impl ObjectStore for HeadFailStore {
+        fn list(&self, _prefix: &str) -> Result<Listing, Error> {
+            Ok(Listing::default())
+        }
+        fn head(&self, _key: &str) -> Result<Entity, Error> {
+            self.calls.set(self.calls.get() + 1);
+            Err(Error::Unavailable("throttled".to_string()))
+        }
+        fn get_to(&self, _key: &str, _w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            Err(Error::Unavailable("throttled".to_string()))
+        }
+        fn put_from(
+            &self,
+            _key: &str,
+            _r: &mut dyn std::io::Read,
+            _size: u64,
+            _mtime_ms: Option<u64>,
+        ) -> Result<Entity, Error> {
+            Err(Error::Unavailable("throttled".to_string()))
+        }
+        fn delete(&self, _key: &str) -> Result<(), Error> {
+            Err(Error::Unavailable("throttled".to_string()))
+        }
+    }
+
+    /// Which transient/nontransient error a flaky head stub answers with.
+    #[derive(Clone, Copy)]
+    enum FlakyKind {
+        Unavailable,
+        Timeout,
+        Unauthorized,
+    }
+
+    /// Store whose `head` fails the first `fail_first` calls with `kind`,
+    /// then answers from `inner`. Counts total head calls.
+    struct FlakyHeadStore {
+        inner: MemoryStore,
+        fail_first: usize,
+        kind: FlakyKind,
+        calls: std::cell::Cell<usize>,
+    }
+    impl FlakyHeadStore {
+        fn new(inner: MemoryStore, fail_first: usize, kind: FlakyKind) -> Self {
+            Self {
+                inner,
+                fail_first,
+                kind,
+                calls: std::cell::Cell::new(0),
+            }
+        }
+        fn err(&self) -> Error {
+            match self.kind {
+                FlakyKind::Unavailable => Error::Unavailable("throttled".to_string()),
+                FlakyKind::Timeout => Error::Timeout("timed out".to_string()),
+                FlakyKind::Unauthorized => Error::Unauthorized("denied".to_string()),
+            }
+        }
+    }
+    impl ObjectStore for FlakyHeadStore {
+        fn list(&self, _prefix: &str) -> Result<Listing, Error> {
+            self.inner.list("")
+        }
+        fn head(&self, key: &str) -> Result<Entity, Error> {
+            let n = self.calls.get();
+            self.calls.set(n + 1);
+            if n < self.fail_first {
+                return Err(self.err());
+            }
+            self.inner.head(key)
+        }
+        fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime_ms: Option<u64>,
+        ) -> Result<Entity, Error> {
+            self.inner.put_from(key, r, size, mtime_ms)
+        }
+        fn delete(&self, key: &str) -> Result<(), Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    #[test]
+    fn enrich_retries_transient_head_errors() {
+        // Unavailable: first 2 heads fail, third succeeds; enrich succeeds
+        // and the stub saw exactly 3 head calls.
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"a".to_vec());
+        store.put_from("a.md", &mut c, 1, Some(100)).unwrap();
+        let flaky = FlakyHeadStore::new(store, 2, FlakyKind::Unavailable);
+        let listing = Listing {
+            entities: vec![file("a.md", 9_999, Some(9_999_999))],
+            warnings: Vec::new(),
+        };
+        let enriched = enrich_with_head_mtimes(&flaky, listing).unwrap();
+        let a = enriched.entities.iter().find(|e| e.key == "a.md").unwrap();
+        assert_eq!(a.mtime_ms, Some(100));
+        assert_eq!(a.size, 1);
+        assert_eq!(flaky.calls.get(), 3);
+
+        // Timeout: first failure also retried (single attempt test).
+        let store2 = MemoryStore::new();
+        let mut c2 = std::io::Cursor::new(b"a".to_vec());
+        store2.put_from("a.md", &mut c2, 1, Some(100)).unwrap();
+        let flaky2 = FlakyHeadStore::new(store2, 1, FlakyKind::Timeout);
+        let listing2 = Listing {
+            entities: vec![file("a.md", 1, None)],
+            warnings: Vec::new(),
+        };
+        let enriched2 = enrich_with_head_mtimes(&flaky2, listing2).unwrap();
+        assert_eq!(enriched2.entities.len(), 1);
+        assert_eq!(flaky2.calls.get(), 2);
+    }
+
+    #[test]
+    fn enrich_retry_is_bounded_and_fail_closed() {
+        // Always-Unavailable store: fail-closed after exactly HEAD_MAX_ATTEMPTS
+        // head calls (bound pinned; full retry does not loop forever).
+        let store = HeadFailStore::new();
+        let listing = Listing {
+            entities: vec![file("a.md", 1, Some(9_999_999))],
+            warnings: Vec::new(),
+        };
+        let err = enrich_with_head_mtimes(&store, listing).unwrap_err();
+        assert!(matches!(err, Error::Unavailable(_)));
+        assert_eq!(store.calls.get(), HEAD_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn enrich_does_not_retry_nontransient_errors() {
+        // Unauthorized is nontransient: fail-closed after exactly 1 head call.
+        let store = MemoryStore::new();
+        let flaky = FlakyHeadStore::new(store, 1, FlakyKind::Unauthorized);
+        let listing = Listing {
+            entities: vec![file("a.md", 1, None)],
+            warnings: Vec::new(),
+        };
+        let err = enrich_with_head_mtimes(&flaky, listing).unwrap_err();
+        assert!(matches!(err, Error::Unauthorized(_)));
+        assert_eq!(flaky.calls.get(), 1);
+    }
+
+    #[test]
+    fn enrich_fails_closed_on_head_error() {
+        let listing = Listing {
+            entities: vec![file("a.md", 1, Some(9_999_999))],
+            warnings: Vec::new(),
+        };
+        let err = enrich_with_head_mtimes(&HeadFailStore::new(), listing).unwrap_err();
+        assert!(
+            matches!(err, Error::Unavailable(_)),
+            "non-NotFound head error must fail the listing, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn enrich_handles_empty_and_folder_only_listings() {
+        let store = MemoryStore::new();
+        // empty listing: no heads, unchanged.
+        let empty = enrich_with_head_mtimes(
+            &store,
+            Listing {
+                entities: Vec::new(),
+                warnings: vec!["w".to_string()],
+            },
+        )
+        .unwrap();
+        assert!(empty.entities.is_empty());
+        assert_eq!(empty.warnings, vec!["w".to_string()]);
+        // folder-only listing: no heads attempted (head on a folder view is
+        // NotFound by contract), folders pass through.
+        let folder_only = enrich_with_head_mtimes(
+            &store,
+            Listing {
+                entities: vec![folder("notes")],
+                warnings: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(folder_only.entities.len(), 1);
+        assert_eq!(folder_only.entities[0].key, "notes/");
+    }
 }

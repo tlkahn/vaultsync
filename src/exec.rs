@@ -84,15 +84,13 @@ pub fn execute_plan(
     // authority for a delete (the local side got `delete_file_guarded` for
     // exactly this race class). Re-verify the remote object immediately
     // before unlinking it: a NotFound means the goal state (absent) is
-    // already achieved (counts as success, matching W10); a size drift means
-    // the object changed since the plan - the key fails and the new remote
-    // content survives. mtime is deliberately NOT compared (R-c): the
-    // planned entity's `mtime_ms` comes from the listing's `LastModified`
-    // while `head` prefers the `vaultsync-mtime` client metadata, so an
-    // mtime comparison would systematically false-fail every key whose
-    // client mtime differs from its upload time beyond the tolerance (the
-    // documented list-skew limitation). Same-size replacement between list
-    // and delete remains a documented residual.
+    // already achieved (counts as success, matching W10); a size or mtime
+    // drift (beyond the tolerance) means the object changed since the plan -
+    // the key fails and the new remote content survives. Post-W113 the
+    // planned entity's `mtime_ms` IS the head/`vaultsync-mtime` value (the
+    // R-c list-skew rationale is retired; no in-tree backend systematically
+    // false-fails). The residual race is a same-size replacement whose mtime
+    // is within tolerance between plan and delete.
     for a in plan
         .actions
         .iter()
@@ -112,6 +110,25 @@ pub fn execute_plan(
         match store.head(&a.key) {
             Ok(cur) => {
                 if cur.size != planned_remote.size {
+                    fail(
+                        &mut rep,
+                        &a.key,
+                        Error::Other(format!(
+                            "remote changed since plan for {}; not deleting",
+                            a.key
+                        )),
+                    );
+                    continue;
+                }
+                // W119/R1-M2: post-W113 the planned `mtime_ms` IS the head/
+                // `vaultsync-mtime` value (the old R-c list-skew rationale is
+                // retired), so a same-size replacement whose mtime drifted
+                // beyond the tolerance between plan and delete is refused too;
+                // the residual race is only a same-size replacement within
+                // tolerance. Refuse only when both sides carry an mtime.
+                if let (Some(planned_m), Some(cur_m)) = (planned_remote.mtime_ms, cur.mtime_ms)
+                    && planned_m.abs_diff(cur_m) > opts.mtime_tolerance_ms
+                {
                     fail(
                         &mut rep,
                         &a.key,
@@ -306,8 +323,9 @@ impl std::io::Write for CappedWriter<'_> {
 }
 
 /// Download one key into an atomic temp + rename, applying the remote mtime
-/// from the `get_to` metadata (which carries the client `vaultsync-mtime`, not
-/// the list's LastModified).
+/// from the `get_to` metadata (which carries the client `vaultsync-mtime`;
+/// post-W113 the plan's mtime is that same client value, not a list-time
+/// LastModified).
 fn exec_download(
     local: &LocalFs,
     store: &dyn ObjectStore,
@@ -1025,6 +1043,86 @@ mod tests {
         );
         // the new remote content survives (not deleted)
         assert_eq!(get_bytes(&store, "gone.md"), b"replacement-bytes-xyz");
+    }
+
+    #[test]
+    fn exec_push_delete_refuses_same_size_mtime_drift() {
+        // W119/R1-M2 (adopted per R16-scope-delete-mtime): post-W113 the
+        // planned remote mtime IS the head/`vaultsync-mtime` value, so the
+        // old R-c list-skew false-fail rationale is retired and the
+        // freshness check is sound. A same-size replacement with an mtime
+        // drift far beyond the tolerance (default 1000ms) between plan and
+        // delete must fail the key "changed since plan" and the replacement
+        // survives. RED today: the size-only check passes (same size) and
+        // the delete proceeds.
+        let dir = TempDir::new("vaultsync-exec");
+        let store = MemoryStore::new();
+        put_str(&store, "old.md", "abc", Some(100)); // size 3, mtime T=100
+        let local = LocalFs::new(dir.path());
+        let opts = PlanOpts {
+            delete: true,
+            ..Default::default()
+        };
+        let plan = crate::build_plan(&local, &store, Mode::Push, &opts)
+            .unwrap()
+            .plan;
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| a.key == "old.md" && a.kind == ActionKind::DeleteRemote)
+        );
+        // replace the remote in place with same-size content drifted far
+        // beyond the tolerance (mtime + 60_000ms).
+        put_str(&store, "old.md", "xyz", Some(100 + 60_000));
+        let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts);
+        assert!(
+            rep.failed.iter().any(|fl| fl.key == "old.md"),
+            "old.md not failed: {:?}",
+            rep.failed
+        );
+        assert!(
+            rep.failed
+                .iter()
+                .any(|fl| fl.message.contains("changed since plan")),
+            "no changed-since-plan message: {:?}",
+            rep.failed
+        );
+        // the replacement survives (not deleted), with its drifted mtime.
+        let cur = store.head("old.md").unwrap();
+        assert_eq!(cur.mtime_ms, Some(100 + 60_000));
+        assert_eq!(get_bytes(&store, "old.md"), b"xyz");
+    }
+
+    #[test]
+    fn exec_push_delete_allows_same_size_mtime_within_tolerance() {
+        // Companion guard (no-over-refusal): a same-size replacement whose
+        // mtime drift is *within* the tolerance (500ms < 1000ms) still
+        // deletes. Pins that the mtime arm only refuses genuine drift.
+        let dir = TempDir::new("vaultsync-exec");
+        let store = MemoryStore::new();
+        put_str(&store, "old.md", "abc", Some(100)); // size 3, mtime T=100
+        let local = LocalFs::new(dir.path());
+        let opts = PlanOpts {
+            delete: true,
+            ..Default::default()
+        };
+        let plan = crate::build_plan(&local, &store, Mode::Push, &opts)
+            .unwrap()
+            .plan;
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| a.key == "old.md" && a.kind == ActionKind::DeleteRemote)
+        );
+        put_str(&store, "old.md", "xyz", Some(100 + 500));
+        let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts);
+        assert!(
+            rep.failed.is_empty(),
+            "delete should succeed: {:?}",
+            rep.failed
+        );
+        // delete proceeded: key is gone (goal state reached).
+        assert!(matches!(store.head("old.md"), Err(Error::NotFound(_))));
     }
 
     #[test]
