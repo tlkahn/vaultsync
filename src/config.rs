@@ -256,6 +256,16 @@ fn resolve_retry(transfer: Option<&TransferConfig>) -> Result<RetrySettings, Err
             "transfer.retry.max_attempts must be >= 1 (1 disables retries), got {max_attempts}"
         )));
     }
+    if base_delay_ms == 0 {
+        return Err(Error::Other(format!(
+            "transfer.retry.base_delay_ms must be >= 1 (the SDK requires a non-zero initial backoff), got {base_delay_ms}"
+        )));
+    }
+    if max_delay_ms == 0 {
+        return Err(Error::Other(format!(
+            "transfer.retry.max_delay_ms must be >= 1 (the SDK requires a non-zero max backoff), got {max_delay_ms}"
+        )));
+    }
     if base_delay_ms > max_delay_ms {
         return Err(Error::Other(format!(
             "transfer.retry.base_delay_ms ({base_delay_ms}) must not exceed transfer.retry.max_delay_ms ({max_delay_ms})"
@@ -524,6 +534,61 @@ max_delay_ms = 4000
                 && msg.contains("transfer.retry.max_delay_ms"),
             "must name both keys: {msg}"
         );
+    }
+
+    #[test]
+    fn resolve_settings_retry_rejects_zero_base_delay() {
+        // I8-validation (W130, M2): the SDK requires a non-zero initial
+        // backoff, so `base_delay_ms = 0` must be rejected naming
+        // transfer.retry.base_delay_ms.
+        // RED: resolves fine today (0 <= 20000 default max).
+        let text = "[transfer.retry]\nmax_attempts = 5\nbase_delay_ms = 0\nmax_delay_ms = 20000\n";
+        let cfg = parse_config_str(text).unwrap();
+        let err = settings(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transfer.retry.base_delay_ms") && msg.contains(">= 1"),
+            "must name base_delay_ms with a non-zero reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_settings_retry_rejects_zero_max_delay() {
+        // I8-validation (W130, M2): the SDK requires a non-zero max backoff.
+        // Two sub-cases per the reviewer's example.
+        // RED (lone max_delay_ms = 0): today errors via the base>max rule
+        // naming both keys with the wrong reason; a max_delay_ms = 0 alone
+        // with the default base (1000) must instead name max_delay_ms with a
+        // non-zero reason.
+        let text = "[transfer.retry]\nmax_attempts = 5\nmax_delay_ms = 0\n";
+        let cfg = parse_config_str(text).unwrap();
+        let err = settings(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transfer.retry.max_delay_ms") && msg.contains(">= 1"),
+            "must name max_delay_ms with a non-zero reason: {msg}"
+        );
+
+        // RED (base and max both 0): resolves today (0 <= 0); must error.
+        let text = "[transfer.retry]\nmax_attempts = 5\nbase_delay_ms = 0\nmax_delay_ms = 0\n";
+        let cfg = parse_config_str(text).unwrap();
+        let err = settings(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transfer.retry.base_delay_ms") && msg.contains(">= 1"),
+            "must name base_delay_ms first for the both-zero case: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_settings_retry_allows_equal_base_and_max() {
+        // I8-validation (W130, M2 boundary pin): base == max with both > 0
+        // is valid (reviewer: "equal base==max with both > 0 is fine").
+        let text = "[transfer.retry]\nmax_attempts = 5\nbase_delay_ms = 500\nmax_delay_ms = 500\n";
+        let cfg = parse_config_str(text).unwrap();
+        let s = settings(&cfg).unwrap();
+        assert_eq!(s.retry.base_delay_ms, 500);
+        assert_eq!(s.retry.max_delay_ms, 500);
     }
 
     #[test]

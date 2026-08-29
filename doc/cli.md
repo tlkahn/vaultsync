@@ -119,7 +119,8 @@ SDK-classified throttling / 5xx / connection-reset retryables), set on the S3
 client at build time. `max_attempts = 1` disables retries entirely. Each key
 is optional; an absent key (or absent section) keeps the SDK-standard defaults
 shown above. `max_attempts` must be >= 1 and `base_delay_ms` <= `max_delay_ms`
-(loud config errors otherwise).
+(loud config errors otherwise); both delays must be >= 1 (the SDK requires
+non-zero backoffs).
 
 If you want the full populated form (Phase 3, not yet applied), it is shown
 here for reference; copying it as-is will refuse `push`/`pull`/`check` until
