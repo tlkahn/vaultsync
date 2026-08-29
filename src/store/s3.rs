@@ -1178,7 +1178,7 @@ mod tests {
     #[test]
     fn retry_config_from_settings_default_is_sdk_standard() {
         // I8-config pin: the default RetrySettings maps to the SDK's own
-        // `RetryConfig::standard()` on all three knobs - so a default-\
+        // `RetryConfig::standard()` on all three knobs - so a default
         // config run is a no-op change in flight.
         let ours = build_retry_config(&crate::config::RetrySettings::default());
         let std = aws_sdk_s3::config::retry::RetryConfig::standard();

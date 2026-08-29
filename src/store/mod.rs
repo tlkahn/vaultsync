@@ -386,7 +386,7 @@ mod tests {
 
     #[test]
     fn enrich_fails_closed_on_first_transient_head_error() {
-        // I8-stopgap: the SDk RetryConfig owns retry (cycle 4), so enrichment
+        // I8-stopgap: the SDK RetryConfig owns retry (cycle 4), so enrichment
         // calls head() exactly once per object - a transient error that the
         // old W117 stopgap would have retried (first head Unavailable, second
         // would succeed) now fails the listing closed on the first attempt,
