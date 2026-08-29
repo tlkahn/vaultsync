@@ -154,34 +154,31 @@ where
         result.is_ok()
     );
 
-    // Cleanup: list + delete everything (files only; folders are views).
+    // Cleanup: list keys + delete everything (W153, I17-cleanup-list: the
+    // cleanup must NOT re-run the enriched list - that is a second N-head
+    // pass; `list_object_keys` is the raw unenriched path, ~pages x RTT).
     // L12 (W104): a failed cleanup must be reported on stderr, never silently
     // swallowed - leaked objects make CI flakes hard to diagnose (a later run
     // re-encounters them under a fresh unique prefix, but the bucket slowly
     // fills). Reporting never fails the test outcome; the harness already
     // eprintln!s its skip path, so this matches the file's convention.
     let t_clean = std::time::Instant::now();
-    match store.list("") {
-        Ok(listing) => {
+    match store.list_object_keys("") {
+        Ok(keys) => {
             eprintln!(
-                "[17] {name}: cleanup_list_ms={} entities={} files={} folders={}",
+                "[17] {name}: cleanup_list_ms={} keys={}",
                 t_clean.elapsed().as_millis(),
-                listing.entities.len(),
-                listing.entities.iter().filter(|e| !e.is_folder()).count(),
-                listing.entities.iter().filter(|e| e.is_folder()).count()
+                keys.len()
             );
             let t_del = std::time::Instant::now();
             let mut deleted = 0usize;
             let mut delete_errs = 0usize;
-            for e in listing.entities {
-                if e.is_folder() {
-                    continue;
-                }
-                match store.delete(&e.key) {
+            for key in keys {
+                match store.delete(&key) {
                     Ok(()) => deleted += 1,
                     Err(err) => {
                         delete_errs += 1;
-                        eprintln!("cleanup: failed to delete {}: {err}", e.key);
+                        eprintln!("cleanup: failed to delete {key}: {err}");
                     }
                 }
             }
