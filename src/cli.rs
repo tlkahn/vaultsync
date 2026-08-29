@@ -807,6 +807,7 @@ mod tests {
             },
             mtime_tolerance_ms: 1000,
             concurrency: 4,
+            retry: crate::config::RetrySettings::default(),
             ignore_patterns: Vec::new(),
             concurrency_explicitly_set: false,
         };
@@ -1399,6 +1400,7 @@ mod tests {
             },
             mtime_tolerance_ms: 1000,
             concurrency: 4,
+            retry: crate::config::RetrySettings::default(),
             ignore_patterns: Vec::new(),
             concurrency_explicitly_set: false,
         }

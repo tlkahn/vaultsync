@@ -14,6 +14,14 @@ use crate::error::Error;
 pub const DEFAULT_MTIME_TOLERANCE_MS: u64 = 1000;
 pub const DEFAULT_CONCURRENCY: u32 = 4;
 
+/// AWS SDK standard-mode retry defaults (I8-config): the resolved policy when
+/// `[transfer.retry]` is absent or a field is unset mirrors the SDK's own
+/// `RetryConfig::standard()` (3 attempts / 1s initial / 20s max), so a
+/// default run is a no-op change vs the pre-I8 SDK behavior.
+pub const DEFAULT_RETRY_MAX_ATTEMPTS: u32 = 3;
+pub const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 1000;
+pub const DEFAULT_RETRY_MAX_DELAY_MS: u64 = 20000;
+
 /// On-disk config mirroring [cli.md]. All sections optional; defaults applied
 /// at resolution time. Unknown keys anywhere in the file are rejected loudly
 /// (W56, B nit): a typo like `mtime_tolerance` (missing `_ms`) or a
@@ -93,6 +101,9 @@ pub struct Settings {
     pub store: StoreSettings,
     pub mtime_tolerance_ms: u64,
     pub concurrency: u32,
+    /// resolved `[transfer.retry]` policy (I8). Milliseconds at this layer;
+    /// `Duration` conversion happens at the S3 boundary.
+    pub retry: RetrySettings,
     /// Parsed non-empty `[ignore].patterns` (W25/M3). A Phase 3 feature that
     /// is surfaced loudly - never silently applied - so a user copying the
     /// cli.md example is not let to believe patterns are in effect.
@@ -101,6 +112,27 @@ pub struct Settings {
     /// inert until Phase 3 (the pool does not exist), so dispatch warns rather
     /// than silently accepting it.
     pub concurrency_explicitly_set: bool,
+}
+
+/// Resolved retry policy (I8). Milliseconds at this layer; `Duration`
+/// conversion is owned by the S3 boundary (`build_retry_config`). `Default`
+/// is the AWS SDK standard-mode default (3 / 1000 / 20000).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetrySettings {
+    /// Total attempts including the initial one (1 = retries disabled).
+    pub max_attempts: u32,
+    pub base_delay_ms: u64,
+    pub max_delay_ms: u64,
+}
+
+impl Default for RetrySettings {
+    fn default() -> Self {
+        Self {
+            max_attempts: DEFAULT_RETRY_MAX_ATTEMPTS,
+            base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
+            max_delay_ms: DEFAULT_RETRY_MAX_DELAY_MS,
+        }
+    }
 }
 
 /// Resolved store connection settings (no credentials - those stay in the AWS
@@ -189,15 +221,37 @@ pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings,
         .as_ref()
         .map(|i| i.patterns.clone())
         .unwrap_or_default();
+    let retry = resolve_retry(cfg.transfer.as_ref());
     let concurrency_explicitly_set = cfg.transfer.as_ref().and_then(|t| t.concurrency).is_some();
     Ok(Settings {
         vault_root,
         store,
         mtime_tolerance_ms,
         concurrency,
+        retry,
         ignore_patterns,
         concurrency_explicitly_set,
     })
+}
+
+/// Resolve `[transfer.retry]` (I8): each absent field falls back to the AWS
+/// SDK standard-mode default (per-field, not all-or-nothing); an absent
+/// section resolves to the full default. Validation of the resolved values
+/// (max_attempts >= 1, base <= max) happens here for cycle-3, keep the shape
+/// now.
+fn resolve_retry(transfer: Option<&TransferConfig>) -> RetrySettings {
+    let r = transfer.and_then(|t| t.retry.as_ref());
+    RetrySettings {
+        max_attempts: r
+            .and_then(|r| r.max_attempts)
+            .unwrap_or(DEFAULT_RETRY_MAX_ATTEMPTS),
+        base_delay_ms: r
+            .and_then(|r| r.base_delay_ms)
+            .unwrap_or(DEFAULT_RETRY_BASE_DELAY_MS),
+        max_delay_ms: r
+            .and_then(|r| r.max_delay_ms)
+            .unwrap_or(DEFAULT_RETRY_MAX_DELAY_MS),
+    }
 }
 
 /// W69/W86 policy: an empty or whitespace-only value is treated as unset
@@ -373,6 +427,48 @@ max_delay_ms = 4000
         assert_eq!(retry.max_attempts, Some(5));
         assert_eq!(retry.base_delay_ms, Some(250));
         assert_eq!(retry.max_delay_ms, Some(4000));
+    }
+
+    #[test]
+    fn resolve_settings_retry_defaults_sdk_standard() {
+        // I8-config: no `[transfer.retry]` section => the resolved retry
+        // policy is the AWS SDK standard-mode default (3 / 1000 / 20000),
+        // pinned against the DEFAULT_RETRY_* constants. RED:
+        // `Settings.retry` does not exist yet (compile failure).
+        let cfg = FileConfig::default();
+        let s = settings(&cfg).unwrap();
+        assert_eq!(
+            s.retry,
+            RetrySettings {
+                max_attempts: DEFAULT_RETRY_MAX_ATTEMPTS,
+                base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
+                max_delay_ms: DEFAULT_RETRY_MAX_DELAY_MS,
+            },
+            "absent [transfer.retry] resolves to SDK standard defaults"
+        );
+    }
+
+    #[test]
+    fn resolve_settings_retry_partial_fills_defaults() {
+        // I8-config: per-field resolution - setting only `max_attempts`
+        // leaves the delays at their SDK defaults (not all-or-nothing).
+        let text = "[transfer.retry]\nmax_attempts = 5\n";
+        let cfg = parse_config_str(text).unwrap();
+        let s = settings(&cfg).unwrap();
+        assert_eq!(s.retry.max_attempts, 5);
+        assert_eq!(s.retry.base_delay_ms, DEFAULT_RETRY_BASE_DELAY_MS);
+        assert_eq!(s.retry.max_delay_ms, DEFAULT_RETRY_MAX_DELAY_MS);
+    }
+
+    #[test]
+    fn resolve_settings_retry_full_override() {
+        // I8-config: all three set => all three resolved verbatim.
+        let text = "[transfer.retry]\nmax_attempts = 7\nbase_delay_ms = 50\nmax_delay_ms = 5000\n";
+        let cfg = parse_config_str(text).unwrap();
+        let s = settings(&cfg).unwrap();
+        assert_eq!(s.retry.max_attempts, 7);
+        assert_eq!(s.retry.base_delay_ms, 50);
+        assert_eq!(s.retry.max_delay_ms, 5000);
     }
 
     #[test]
