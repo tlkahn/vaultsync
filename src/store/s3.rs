@@ -190,6 +190,33 @@ impl S3Store {
             Ok(out)
         })
     }
+
+    /// List the object keys under `prefix` WITHOUT head enrichment, folder
+    /// views, or warnings (I17-cleanup-api). A raw ListObjectsV2 pass through
+    /// [`S3Store::list_prefix_objects`] filtered to file keys only: keys
+    /// ending in `/` (folder-marker leftovers) and the empty exact-prefix
+    /// marker are dropped, so deleting every returned key is safe. Intended
+    /// for bulk discovery / harness cleanup where mtime/etag are not needed.
+    /// Production planning stays on [`ObjectStore::list`], which enriches
+    /// mtimes via per-object head (I15) and honors `self.concurrency`
+    /// (I20-heads); this API is deliberately NOT on the trait so the
+    /// planner-facing surface remains enrichment-honest.
+    pub fn list_object_keys(&self, prefix: &str) -> Result<Vec<String>, Error> {
+        Ok(object_keys_from_raw(self.list_prefix_objects(prefix)?))
+    }
+}
+
+/// Pure conversion of a raw listing into object keys only (I17-cleanup-api):
+/// drops the empty relative key (the exact-prefix folder marker, R4-M2) and
+/// any trailing-`/` key (folder-marker leftover, W70/A-N2) so the caller can
+/// safely `delete` every returned key - folder views are never objects.
+/// File keys keep their listing order. Used by [`S3Store::list_object_keys`]
+/// and pinned offline by the `object_keys_from_raw_*` tests.
+pub(crate) fn object_keys_from_raw(raw: Vec<(String, u64, Option<u64>)>) -> Vec<String> {
+    raw.into_iter()
+        .map(|(key, _size, _mtime)| key)
+        .filter(|key| !key.is_empty() && !key.ends_with('/'))
+        .collect()
 }
 
 /// Fail-closed pagination decision (W61/A-M1): a provider that reports a
@@ -1023,6 +1050,57 @@ mod tests {
         );
         assert_eq!(dropped, vec![("odd/".to_string(), 10)]);
         assert!(ents.iter().any(|e| e.key == "real.md"));
+    }
+
+    #[test]
+    fn object_keys_from_raw_drops_folder_markers() {
+        // I17-cleanup-api (W152): `list_object_keys` must never hand back a
+        // folder-view key for delete - a trailing-`/` row (nonempty folder
+        // marker leftover, W70/A-N2) is dropped, file keys keep order.
+        let keys = object_keys_from_raw(vec![
+            ("notes/".to_string(), 10, None),
+            ("a.md".to_string(), 1, Some(100)),
+            ("b/".to_string(), 0, None),
+            ("notes/c.md".to_string(), 3, Some(200)),
+        ]);
+        assert_eq!(
+            keys,
+            vec!["a.md".to_string(), "notes/c.md".to_string()],
+            "folder-marker rows must be dropped, file keys keep stable order"
+        );
+    }
+
+    #[test]
+    fn object_keys_from_raw_drops_exact_prefix_marker() {
+        // I17-cleanup-api (W152) + R4-M2 parity: the exact-prefix folder
+        // marker strips to an empty relative key; `delete("")` would fail
+        // ensure_valid_key, so it must be dropped just like `convert_listed`
+        // drops it. RED: helper does not exist (compile failure).
+        let keys = object_keys_from_raw(vec![
+            (String::new(), 0, Some(123)),
+            ("a.md".to_string(), 1, None),
+        ]);
+        assert_eq!(
+            keys,
+            vec!["a.md".to_string()],
+            "empty exact-prefix marker must be dropped"
+        );
+    }
+
+    #[test]
+    fn object_keys_from_raw_preserves_all_files() {
+        // I17-cleanup-api (W152): 3 plain file rows round-trip unchanged, in
+        // order - the unenriched bulk-discovery path must not reorder or drop
+        // anything that is a real object key.
+        let keys = object_keys_from_raw(vec![
+            ("z.md".to_string(), 5, Some(1)),
+            ("a/b.md".to_string(), 2, Some(2)),
+            ("m.md".to_string(), 1, None),
+        ]);
+        assert_eq!(
+            keys,
+            vec!["z.md".to_string(), "a/b.md".to_string(), "m.md".to_string()]
+        );
     }
 
     #[test]
