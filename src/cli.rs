@@ -300,8 +300,15 @@ fn reject_json(err: &mut dyn Write) -> i32 {
 /// dispatch); `Always` forces the bar for CLI progress tests.
 ///
 /// `err` is `&mut (dyn Write + Send)` (not bare `dyn Write`) so the I27
-/// renderer built over it can satisfy `Progress: Send + Sync`; all in-tree
-/// writers (`Vec<u8>`, `String`, `StderrLock`) are `Send`.
+/// renderer built over it can satisfy `Progress: Send + Sync`. In-tree `Send`
+/// writers include `Vec<u8>`, `String`, and `Stderr` (the process handle);
+/// `StderrLock` is `!Send`, so pass `std::io::stderr()` here (as
+/// [`run_from_env`] does) rather than a `stderr().lock()`.
+///
+/// I27 (F7): `ProgressMode::Auto` probes the *process* stderr
+/// (`std::io::stderr().is_terminal()`), so `Auto` is only meaningful when
+/// `err` is the process stderr; captured-writer callers should pass
+/// `Off`/`Always` explicitly.
 pub fn run_with_io(
     cmd: Command,
     store: &dyn ObjectStore,
