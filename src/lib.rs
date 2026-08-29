@@ -327,6 +327,70 @@ pub(crate) mod testutil {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+
+    /// Offline test double replicating issue #15's S3 behavior (W111, I15).
+    ///
+    /// Wraps a [`crate::store::mock::MemoryStore`]. `list` delegates to the
+    /// mock but rewrites every OBJECT entity's mtime to a fixed later "upload
+    /// time" and drops its etag (simulating the ListObjectsV2 `LastModified`
+    /// fallback - user metadata is invisible to a listing), then runs the
+    /// production [`crate::store::enrich_with_head_mtimes`] - mirroring the
+    /// W113 S3 wiring so lib-level convergence tests exercise the real
+    /// production path. `head`/`get_to`/`put_from`/`delete` delegate unchanged
+    /// (the mock `head` reports the metadata mtime, exactly like S3).
+    pub(crate) struct S3LikeListStore {
+        inner: crate::store::mock::MemoryStore,
+        /// Listed upload-time override applied to every object mtime (picked
+        /// bigger than any real mtime so the degraded frame is unambiguous).
+        upload_time_ms: u64,
+    }
+
+    impl S3LikeListStore {
+        pub(crate) fn new() -> Self {
+            S3LikeListStore {
+                inner: crate::store::mock::MemoryStore::new(),
+                upload_time_ms: 9_999_999_999,
+            }
+        }
+        pub(crate) fn inner(&self) -> &crate::store::mock::MemoryStore {
+            &self.inner
+        }
+    }
+
+    impl crate::store::ObjectStore for S3LikeListStore {
+        fn list(&self, prefix: &str) -> Result<crate::store::Listing, crate::error::Error> {
+            let mut listing = self.inner.list(prefix)?;
+            for e in listing.entities.iter_mut() {
+                if !e.is_folder() {
+                    e.mtime_ms = Some(self.upload_time_ms);
+                    e.etag = None;
+                }
+            }
+            crate::store::enrich_with_head_mtimes(self, listing)
+        }
+        fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.head(key)
+        }
+        fn get_to(
+            &self,
+            key: &str,
+            w: &mut dyn std::io::Write,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime_ms: Option<u64>,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.put_from(key, r, size, mtime_ms)
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
+            self.inner.delete(key)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1257,5 +1321,107 @@ mod tests {
             verbose.lines().any(|l| l.starts_with("S  ")),
             "skips hidden with -v: {verbose}"
         );
+    }
+
+    /// Pin a file's mtime to a fixed ms value (deterministic convergence tests).
+    fn set_mtime(p: &std::path::Path, ms: u64) {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms);
+        let times = std::fs::FileTimes::new().set_modified(t);
+        std::fs::File::open(p).unwrap().set_times(times).unwrap();
+    }
+
+    fn mtime_ms(p: &std::path::Path) -> u64 {
+        std::fs::metadata(p)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    /// Pre-fix sanity (documented, issue #15): planning against this double's
+    /// RAW degraded listing (every object mtime rewritten to a later upload
+    /// time, as S3's ListObjectsV2 `LastModified` fallback does) classifies
+    /// every key `RemoteNewer` => Download-everything - reproduced here with
+    /// no socket. The `enrich_with_head_mtimes` call inside the double's
+    /// `list` (mirroring the W113 S3 wiring) is what turns that into a no-op.
+    #[test]
+    fn build_plan_status_converges_after_push_with_s3like_listing() {
+        use crate::testutil::S3LikeListStore;
+        let dir = TempDir::new("vaultsync-lib-test");
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        let files = [
+            ("a.md", b"aaa".to_vec()),
+            ("notes/b.md", b"bbbb".to_vec()),
+            ("c.md", b"cc".to_vec()),
+        ];
+        let fixed = 1_600_000_000_123u64;
+        for (rel, bytes) in &files {
+            let p = dir.join(rel);
+            std::fs::write(&p, bytes).unwrap();
+            set_mtime(&p, fixed);
+        }
+        let store = S3LikeListStore::new();
+        let local = LocalFs::new(dir.path());
+        // push (the S3LikeListStore list enriches via head, so this converges)
+        let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default())
+            .unwrap()
+            .plan;
+        let rep =
+            crate::exec::execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default());
+        assert!(rep.failed.is_empty(), "push failures: {:?}", rep.failed);
+        // status after push must plan 0 mutating actions (issue acceptance 1)
+        let status = crate::build_plan(&local, &store, Mode::Status, &PlanOpts::default())
+            .unwrap()
+            .plan;
+        assert_eq!(status.stats.upload, 0, "uploads: {:?}", status.actions);
+        assert_eq!(status.stats.download, 0, "downloads: {:?}", status.actions);
+        assert_eq!(status.stats.conflict, 0, "conflicts: {:?}", status.actions);
+        // every non-folder row is a visible Skip (folders may Skip as well)
+        for a in &status.actions {
+            if !a.key.ends_with('/') {
+                assert_eq!(a.kind, ActionKind::Skip, "non-converged row: {:?}", a);
+            }
+        }
+    }
+
+    /// Maps onto the issue's second acceptance bullet: pull into a fresh dir
+    /// restores byte-identical files with exact mtimes, and a following
+    /// `status` there plans 0 mutating actions (download-direction
+    /// incrementality exists).
+    #[test]
+    fn pull_into_fresh_dir_then_status_converges_with_s3like_listing() {
+        use crate::testutil::S3LikeListStore;
+        let store = S3LikeListStore::new();
+        let fixed = 1_600_000_000_123u64;
+        let files = [("a.md", b"aaa".to_vec()), ("notes/b.md", b"bbbb".to_vec())];
+        for (rel, bytes) in &files {
+            let mut c = std::io::Cursor::new(bytes.clone());
+            store
+                .inner()
+                .put_from(rel, &mut c, bytes.len() as u64, Some(fixed))
+                .unwrap();
+        }
+        let dst = TempDir::new("vaultsync-lib-test");
+        let ldst = LocalFs::new(dst.path());
+        let plan = crate::build_plan(&ldst, &store, Mode::Pull, &PlanOpts::default())
+            .unwrap()
+            .plan;
+        let rep = crate::exec::execute_plan(&ldst, &store, &plan, Mode::Pull, &PlanOpts::default());
+        assert!(rep.failed.is_empty(), "pull failures: {:?}", rep.failed);
+        // byte-identical + exact mtime restored (existing feature must hold)
+        for (rel, bytes) in &files {
+            assert_eq!(std::fs::read(dst.join(rel)).unwrap(), *bytes, "{rel} bytes");
+            let gm = mtime_ms(&dst.join(rel));
+            assert!(gm.abs_diff(fixed) < 2000, "{rel} mtime {gm} != {fixed}");
+        }
+        // status in the fresh dir plans 0 mutating actions (issue acceptance 2)
+        let status = crate::build_plan(&ldst, &store, Mode::Status, &PlanOpts::default())
+            .unwrap()
+            .plan;
+        assert_eq!(status.stats.upload, 0, "uploads: {:?}", status.actions);
+        assert_eq!(status.stats.download, 0, "downloads: {:?}", status.actions);
+        assert_eq!(status.stats.conflict, 0, "conflicts: {:?}", status.actions);
     }
 }

@@ -86,3 +86,188 @@ pub trait ObjectStore {
     /// reaching the goal state; the executor normalizes `NotFound` to success.
     fn delete(&self, key: &str) -> Result<(), Error>;
 }
+
+/// Enrich a listing's object entities with per-object `head()` results so
+/// plans compare client mtimes, not upload times (issue #15, I15-approach).
+///
+/// Folder views are skipped (not objects; `head` on a folder key is NotFound
+/// by contract - see the `ObjectStore::list` doc). A `NotFound` head drops the
+/// row (a genuine concurrent-delete race; planning against a vanished object
+/// would be worse). Any *other* head error fails the whole listing (I15-errors,
+/// fail-closed - never plan against a knowingly-degraded remote view, matching
+/// the W61 ethos and `pull --delete` safety). Entity order (sorted) and
+/// `warnings` are preserved verbatim; only `mtime_ms` and `etag` are
+/// overridden from the head result (`size` stays as listed - a mid-list
+/// rewrite race is out of scope, and `plan()` tolerates either value).
+// W113: the `#[allow(dead_code)]` below exists only because the production
+// caller (`S3Store::list`) lands in W113; it is removed in that same commit.
+#[allow(dead_code)]
+pub(crate) fn enrich_with_head_mtimes<S: ObjectStore + ?Sized>(
+    store: &S,
+    listing: Listing,
+) -> Result<Listing, Error> {
+    let mut entities = Vec::new();
+    for e in listing.entities {
+        if e.is_folder() {
+            entities.push(e);
+            continue;
+        }
+        match store.head(&e.key) {
+            Ok(h) => {
+                let mut e = e;
+                e.mtime_ms = h.mtime_ms;
+                e.etag = h.etag;
+                entities.push(e);
+            }
+            Err(Error::NotFound(_)) => {
+                // Concurrent-delete race between LIST and HEAD: drop the row.
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(Listing {
+        entities,
+        warnings: listing.warnings,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entity::{file, folder};
+    use crate::store::mock::MemoryStore;
+
+    /// Build a store with two files (true metadata mtimes 100/200) and return
+    /// a listing whose FILE entities carry later "upload-time" mtimes and no
+    /// etag - exactly the degraded input real S3 `list` produces today
+    /// (ListObjectsV2 `LastModified` fallback; issue #15).
+    fn degraded_listing() -> (MemoryStore, Listing) {
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"a".to_vec());
+        store.put_from("a.md", &mut c, 1, Some(100)).unwrap();
+        let mut c = std::io::Cursor::new(b"b".to_vec());
+        store.put_from("notes/b.md", &mut c, 1, Some(200)).unwrap();
+        let mut listing = store.list("").unwrap();
+        for e in listing.entities.iter_mut() {
+            if !e.is_folder() {
+                e.mtime_ms = Some(9_999_999);
+                e.etag = None;
+            }
+        }
+        listing.warnings = vec!["warn-1".to_string()];
+        // sanity: this is the exact input today's planner would classify
+        // RemoteNewer on every key (the issue's Download-everything shape).
+        assert!(
+            listing
+                .entities
+                .iter()
+                .all(|e| e.is_folder() || e.mtime_ms == Some(9_999_999))
+        );
+        (store, listing)
+    }
+
+    #[test]
+    fn enrich_overrides_listing_mtime_with_head_mtime() {
+        let (store, listing) = degraded_listing();
+        let enriched = enrich_with_head_mtimes(&store, listing).unwrap();
+        // head reports the true (earlier) metadata mtimes and the real etag.
+        let a = enriched.entities.iter().find(|e| e.key == "a.md").unwrap();
+        assert_eq!(a.mtime_ms, Some(100));
+        assert_eq!(a.etag, store.head("a.md").unwrap().etag);
+        let b = enriched
+            .entities
+            .iter()
+            .find(|e| e.key == "notes/b.md")
+            .unwrap();
+        assert_eq!(b.mtime_ms, Some(200));
+        // folder entity passes through untouched (mtime stays None).
+        let notes = enriched
+            .entities
+            .iter()
+            .find(|e| e.key == "notes/")
+            .unwrap();
+        assert_eq!(notes.mtime_ms, None);
+        // order stays sorted; warnings preserved verbatim.
+        let keys: Vec<_> = enriched.entities.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["a.md", "notes/", "notes/b.md"]);
+        assert_eq!(enriched.warnings, vec!["warn-1".to_string()]);
+    }
+
+    #[test]
+    fn enrich_drops_row_when_head_not_found() {
+        let (store, mut listing) = degraded_listing();
+        // A listed key that vanishes between LIST and HEAD (concurrent-delete
+        // race): head answers NotFound, so the row is dropped, siblings kept.
+        listing.entities.push(file("gone.md", 5, Some(9_999_999)));
+        let enriched = enrich_with_head_mtimes(&store, listing).unwrap();
+        let keys: Vec<_> = enriched.entities.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["a.md", "notes/", "notes/b.md"]);
+    }
+
+    /// Store whose `head` fails with a non-NotFound error (throttling class).
+    struct HeadFailStore;
+    impl ObjectStore for HeadFailStore {
+        fn list(&self, _prefix: &str) -> Result<Listing, Error> {
+            Ok(Listing::default())
+        }
+        fn head(&self, _key: &str) -> Result<Entity, Error> {
+            Err(Error::Unavailable("throttled".to_string()))
+        }
+        fn get_to(&self, _key: &str, _w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            Err(Error::Unavailable("throttled".to_string()))
+        }
+        fn put_from(
+            &self,
+            _key: &str,
+            _r: &mut dyn std::io::Read,
+            _size: u64,
+            _mtime_ms: Option<u64>,
+        ) -> Result<Entity, Error> {
+            Err(Error::Unavailable("throttled".to_string()))
+        }
+        fn delete(&self, _key: &str) -> Result<(), Error> {
+            Err(Error::Unavailable("throttled".to_string()))
+        }
+    }
+
+    #[test]
+    fn enrich_fails_closed_on_head_error() {
+        let listing = Listing {
+            entities: vec![file("a.md", 1, Some(9_999_999))],
+            warnings: Vec::new(),
+        };
+        let err = enrich_with_head_mtimes(&HeadFailStore, listing).unwrap_err();
+        assert!(
+            matches!(err, Error::Unavailable(_)),
+            "non-NotFound head error must fail the listing, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn enrich_handles_empty_and_folder_only_listings() {
+        let store = MemoryStore::new();
+        // empty listing: no heads, unchanged.
+        let empty = enrich_with_head_mtimes(
+            &store,
+            Listing {
+                entities: Vec::new(),
+                warnings: vec!["w".to_string()],
+            },
+        )
+        .unwrap();
+        assert!(empty.entities.is_empty());
+        assert_eq!(empty.warnings, vec!["w".to_string()]);
+        // folder-only listing: no heads attempted (head on a folder view is
+        // NotFound by contract), folders pass through.
+        let folder_only = enrich_with_head_mtimes(
+            &store,
+            Listing {
+                entities: vec![folder("notes")],
+                warnings: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(folder_only.entities.len(), 1);
+        assert_eq!(folder_only.entities[0].key, "notes/");
+    }
+}
