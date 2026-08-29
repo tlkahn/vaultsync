@@ -227,8 +227,9 @@ fn human_rate(rate: f64) -> String {
     format!("{v:.1} {}/s", UNITS[unit])
 }
 
-/// ETA clock text: `m:ss` under an hour, `h:mm:ss` from an hour up
-/// (I27-render `0:01:12` is the hour-prefixed form).
+/// ETA clock text (PR 28 r1 F2): renders `m:ss` under an hour (`1:12` for
+/// 72 s) and `h:mm:ss` from an hour up (`1:01:01` for 3661 s). No hour
+/// prefix is shown below an hour.
 fn format_eta(secs: f64) -> String {
     let total = secs.round() as u64;
     let h = total / 3600;

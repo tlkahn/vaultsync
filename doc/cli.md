@@ -63,7 +63,7 @@ Push and pull render a live progress bar on stderr while the executor runs
 (issue 27), e.g. one `\r`-refreshed line per active pass:
 
 ```text
-Uploading  notes/foo.md  847/1204  [=========>--------]  70%  12.4 MiB/s  ETA 0:01:12
+Uploading  notes/foo.md  847/1204  [=========>--------]  70%  12.4 MiB/s  ETA 1:12
 ```
 
 - **stderr only, TTY only.** The bar appears only when stderr is a terminal
