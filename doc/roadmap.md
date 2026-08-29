@@ -44,6 +44,9 @@ Tracked on GitHub: #14 (tracking issue) with sub-issues #3-#13 in priority tiers
    work is bounded **concurrency** (follow-up **#20**): list-enrichment heads
    are the request pool's primary consumer - every list-driven plan is
    currently 1+ ListObjectsV2 pages + N sequential heads (~N x RTT).
+   (The SDK's client-side retry quota is shared: parallel workers on the
+   same sustained storm burn the same standard-mode token bucket faster,
+   so the quota interaction belongs in the concurrency design notes.)
 4. Lock file to prevent concurrent runs on same vault
 5. JSON schema stability for `--json` (parses today; dispatch rejects with
    "not implemented (Phase 3)" + exit 1)

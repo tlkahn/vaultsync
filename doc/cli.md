@@ -120,7 +120,11 @@ client at build time. `max_attempts = 1` disables retries entirely. Each key
 is optional; an absent key (or absent section) keeps the SDK-standard defaults
 shown above. `max_attempts` must be >= 1 and `base_delay_ms` <= `max_delay_ms`
 (loud config errors otherwise); both delays must be >= 1 (the SDK requires
-non-zero backoffs).
+non-zero backoffs). The SDK's client-side **retry quota** (standard-mode
+token bucket) also applies: under sustained failure with no interleaved
+successes the SDK may stop retrying before `max_attempts` is reached (a
+retryable error then fails on the first attempt), and retries remain silent
+(no log line).
 
 vaultsync's retry policy is **config-owned**: `AWS_MAX_ATTEMPTS`,
 `AWS_RETRY_MODE`, and profile `max_attempts` / `retry_mode` do **not** apply
