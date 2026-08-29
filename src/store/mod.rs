@@ -121,68 +121,116 @@ pub trait ObjectStore: Send + Sync {
 /// are preserved verbatim.
 ///
 /// I20-heads: `concurrency` bounds how many heads run in flight (same knob as
-/// the transfer passes - workers = `min(concurrency, rows)`, `concurrency
-/// <= 1` runs sequentially on the caller's thread, byte-for-byte today's
-/// loop). Heads fan out through [`crate::pool::run_bounded`] and results are
+/// the transfer passes - workers = `min(concurrency, rows)`). The sequential
+/// path (`concurrency <= 1`) is the literal pre-issue-20 loop, restored in
+/// I20-r1/F1: it stops at the FIRST non-NotFound head error (immediate
+/// `return Err`), so the "1 = byte-for-byte pre-issue-20" claim holds on the
+/// error path too (N failing heads no longer burn the shared SDK retry quota
+/// against a perma-failing backend). Heads fan out through
+/// [`crate::pool::run_bounded`] only at `concurrency > 1`, and results are
 /// merged by index, so entity order and the vanish-warning text are
 /// deterministic regardless of completion order. Error selection is locked:
 /// with several non-NotFound head failures in one listing, the returned error
 /// is the first one in **listing order** (not completion order); a hard error
 /// still fails the whole listing - no partial entities, no vanished warning
-/// (the warning is built on the success path only). In-flight heads are not
-/// cancelled when a sibling fails: extra completed requests are accepted.
+/// (the warning is built on the success path only). In the POOLED path
+/// in-flight heads are not cancelled when a sibling fails: extra completed
+/// requests are accepted (documented, no-cancellation behavior).
 pub(crate) fn enrich_with_head_mtimes<S: ObjectStore + ?Sized>(
     store: &S,
     listing: Listing,
     concurrency: u32,
 ) -> Result<Listing, Error> {
-    // I20-heads: fan the object-row heads out through the bounded pool; folder
-    // views pass through untouched (never headed). Results come back in
-    // listing order, so walking `listing.entities` in order and returning the
-    // first non-NotFound error yields the listing-order error lock.
-    let object_rows: Vec<&Entity> = listing.entities.iter().filter(|e| !e.is_folder()).collect();
-    let results = crate::pool::run_bounded(concurrency, &object_rows, |e| store.head(&e.key));
+    let mut warnings = listing.warnings;
     let mut entities = Vec::new();
     let mut vanished: Vec<String> = Vec::new();
-    let mut results = results.into_iter();
-    for e in listing.entities {
-        if e.is_folder() {
-            entities.push(e);
-            continue;
-        }
-        match results.next().expect("one head result per object row") {
-            Ok(h) => {
-                let mut e = e;
-                e.mtime_ms = h.mtime_ms;
-                e.etag = h.etag;
-                e.size = h.size;
+    if concurrency <= 1 {
+        // Sequential path (I20-r1/F1): the pre-issue-20 loop verbatim
+        // (recovered from a2fca0a) - folder passthrough, NotFound -> vanished
+        // row, any other head error fails the listing IMMEDIATELY (no further
+        // heads issued). The vanished-warning tail is shared with the pooled
+        // path via `vanished_warning` so nothing is duplicated.
+        for e in listing.entities {
+            if e.is_folder() {
                 entities.push(e);
+                continue;
             }
-            Err(Error::NotFound(_)) => {
-                // Concurrent-delete race between LIST and HEAD: drop the row,
-                // and surface the drop (W70/W79 surface-don't-hide ethos) via
-                // one bounded warning appended below.
-                vanished.push(e.key);
+            match store.head(&e.key) {
+                Ok(h) => {
+                    let mut e = e;
+                    e.mtime_ms = h.mtime_ms;
+                    e.etag = h.etag;
+                    e.size = h.size;
+                    entities.push(e);
+                }
+                Err(Error::NotFound(_)) => {
+                    // Concurrent-delete race between LIST and HEAD: drop the
+                    // row, and surface the drop (W70/W79 surface-don't-hide
+                    // ethos) via one bounded warning appended below.
+                    vanished.push(e.key);
+                }
+                Err(err) => return Err(err),
             }
-            Err(err) => return Err(err),
+        }
+    } else {
+        // I20-heads: fan the object-row heads out through the bounded pool;
+        // folder views pass through untouched (never headed). Results come
+        // back in listing order, so walking `listing.entities` in order and
+        // returning the first non-NotFound error yields the listing-order
+        // error lock. In-flight heads are not cancelled when a sibling fails
+        // (extra completed requests accepted - documented pooled behavior).
+        let object_rows: Vec<&Entity> =
+            listing.entities.iter().filter(|e| !e.is_folder()).collect();
+        let results = crate::pool::run_bounded(concurrency, &object_rows, |e| store.head(&e.key));
+        let mut results = results.into_iter();
+        for e in listing.entities {
+            if e.is_folder() {
+                entities.push(e);
+                continue;
+            }
+            match results.next().expect("one head result per object row") {
+                Ok(h) => {
+                    let mut e = e;
+                    e.mtime_ms = h.mtime_ms;
+                    e.etag = h.etag;
+                    e.size = h.size;
+                    entities.push(e);
+                }
+                Err(Error::NotFound(_)) => {
+                    // Concurrent-delete race between LIST and HEAD: drop the
+                    // row, and surface the drop (W70/W79 surface-don't-hide
+                    // ethos) via one bounded warning appended below.
+                    vanished.push(e.key);
+                }
+                Err(err) => return Err(err),
+            }
         }
     }
-    let mut warnings = listing.warnings;
-    if !vanished.is_empty() {
-        const MAX: usize = 5;
-        let total = vanished.len();
-        let shown: Vec<&str> = vanished.iter().take(MAX).map(|s| s.as_str()).collect();
-        let mut msg = format!(
-            "{} listed key(s) vanished before head (deleted between LIST and HEAD); skipping: ",
-            total
-        );
-        msg.push_str(&shown.join(", "));
-        if total > MAX {
-            msg.push_str(&format!(" and {} more", total - MAX));
-        }
+    if let Some(msg) = vanished_warning(&vanished) {
         warnings.push(msg);
     }
     Ok(Listing { entities, warnings })
+}
+
+/// The shared vanished-row warning tail (MAX = 5 bounded message) used by
+/// both enrichment paths (sequential and pooled) so the text cannot drift
+/// (I20-r1/F1). `None` when nothing vanished.
+fn vanished_warning(vanished: &[String]) -> Option<String> {
+    if vanished.is_empty() {
+        return None;
+    }
+    const MAX: usize = 5;
+    let total = vanished.len();
+    let shown: Vec<&str> = vanished.iter().take(MAX).map(|s| s.as_str()).collect();
+    let mut msg = format!(
+        "{} listed key(s) vanished before head (deleted between LIST and HEAD); skipping: ",
+        total
+    );
+    msg.push_str(&shown.join(", "));
+    if total > MAX {
+        msg.push_str(&format!(" and {} more", total - MAX));
+    }
+    Some(msg)
 }
 
 #[cfg(test)]
@@ -552,6 +600,135 @@ mod tests {
         fn delete(&self, key: &str) -> Result<(), Error> {
             self.inner.delete(key)
         }
+    }
+
+    /// Store whose `head` logs every attempt and fails a specific key with a
+    /// non-NotFound error (I20-r1/F1 short-circuit probe). Combines the
+    /// `HeadLogStore` attempt log with the `KeyFailStore` error injection.
+    struct UnauthorizedHeadLogStore {
+        inner: MemoryStore,
+        log: std::sync::Mutex<Vec<String>>,
+        fail: std::sync::Mutex<std::collections::HashSet<String>>,
+    }
+    impl UnauthorizedHeadLogStore {
+        fn new(inner: MemoryStore) -> Self {
+            Self {
+                inner,
+                log: std::sync::Mutex::new(Vec::new()),
+                fail: std::sync::Mutex::new(std::collections::HashSet::new()),
+            }
+        }
+        fn fail(&self, key: &str) {
+            self.fail.lock().unwrap().insert(key.to_string());
+        }
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+    impl ObjectStore for UnauthorizedHeadLogStore {
+        fn list(&self, prefix: &str) -> Result<Listing, Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<Entity, Error> {
+            self.log.lock().unwrap().push(key.to_string());
+            if self.fail.lock().unwrap().contains(key) {
+                return Err(Error::Unauthorized(format!("denied:{key}")));
+            }
+            self.inner.head(key)
+        }
+        fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime_ms: Option<u64>,
+        ) -> Result<Entity, Error> {
+            self.inner.put_from(key, r, size, mtime_ms)
+        }
+        fn delete(&self, key: &str) -> Result<(), Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    #[test]
+    fn enrich_concurrency_1_stops_at_first_hard_error() {
+        // I20-r1/F1: at concurrency 1 the sequential path must short-circuit
+        // on the FIRST non-NotFound head error (pre-I20 loop shape), instead
+        // of issuing all N heads and then reporting the listing-earliest
+        // error. `a.md`'s head fails with Unauthorized and every attempt is
+        // logged, so the log is the ground truth for how many heads were
+        // issued. RED today: the pooled path issues all heads even at
+        // concurrency 1 (log == [a, b, c]).
+        let store = UnauthorizedHeadLogStore::new(MemoryStore::new());
+        for (key, body, mtime) in [("a.md", "a", 1), ("b.md", "b", 2), ("c.md", "c", 3)] {
+            let mut c = std::io::Cursor::new(body.as_bytes().to_vec());
+            store
+                .inner
+                .put_from(key, &mut c, body.len() as u64, Some(mtime))
+                .unwrap();
+        }
+        store.fail("a.md");
+        let listing = Listing {
+            entities: vec![
+                file("a.md", 1, Some(1)),
+                file("b.md", 1, Some(2)),
+                file("c.md", 1, Some(3)),
+            ],
+            warnings: Vec::new(),
+        };
+        let err = enrich_with_head_mtimes(&store, listing, 1).unwrap_err();
+        assert!(
+            matches!(err, Error::Unauthorized(_)),
+            "a.md's Unauthorized must fail the listing, got {err:?}"
+        );
+        assert_eq!(
+            store.log(),
+            vec!["a.md".to_string()],
+            "sequential path must stop at the first hard error (attempt log: {:?})",
+            store.log()
+        );
+    }
+
+    #[test]
+    fn enrich_parallel_issues_all_heads_on_error() {
+        // I20-r1/F1 pin: the pooled path deliberately does NOT cancel
+        // in-flight heads when a sibling fails - with a.md failing, all
+        // three heads are still issued (documented, accepted behavior), and
+        // the returned error is still the listing-earliest one (I20-heads
+        // error lock). GREEN on arrival; guards against a "fix" that adds
+        // cancellation to the pooled path.
+        let store = UnauthorizedHeadLogStore::new(MemoryStore::new());
+        for (key, body, mtime) in [("a.md", "a", 1), ("b.md", "b", 2), ("c.md", "c", 3)] {
+            let mut c = std::io::Cursor::new(body.as_bytes().to_vec());
+            store
+                .inner
+                .put_from(key, &mut c, body.len() as u64, Some(mtime))
+                .unwrap();
+        }
+        store.fail("a.md");
+        let listing = Listing {
+            entities: vec![
+                file("a.md", 1, Some(1)),
+                file("b.md", 1, Some(2)),
+                file("c.md", 1, Some(3)),
+            ],
+            warnings: Vec::new(),
+        };
+        let err = enrich_with_head_mtimes(&store, listing, 4).unwrap_err();
+        assert!(
+            matches!(err, Error::Unauthorized(_)),
+            "listing-earliest error must win, got {err:?}"
+        );
+        let mut attempted = store.log();
+        attempted.sort();
+        assert_eq!(
+            attempted,
+            vec!["a.md".to_string(), "b.md".to_string(), "c.md".to_string()],
+            "pooled path must issue all heads even when one fails"
+        );
     }
 
     #[test]
