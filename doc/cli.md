@@ -97,6 +97,11 @@ region = "us-west-2"
 # concurrency = 4   # Phase 3 (parallel transfers are not yet applied); an explicit copy of the default is silent
 mtime_tolerance_ms = 1000
 # max_delete = 100
+
+[transfer.retry]
+# max_attempts = 3       # total attempts incl. the initial one; SDK standard default; 1 disables retries
+# base_delay_ms = 1000   # first backoff duration, ms; SDK standard default
+# max_delay_ms = 20000   # backoff ceiling, ms; SDK standard default
 ```
 
 > `[ignore].patterns` is a **Phase 3 feature**: it is parsed and validated
@@ -107,6 +112,14 @@ mtime_tolerance_ms = 1000
 > `[transfer].concurrency` is likewise a **Phase 3 feature** (inert until the
 > pool exists). Setting a value that differs from the default warns on every
 > run; an explicit copy of the default (`4`) is silent.
+
+`[transfer.retry]` is **live** (not Phase 3): the three knobs map directly to
+AWS SDK **standard-mode** retry policy (exponential backoff with jitter, and
+SDK-classified throttling / 5xx / connection-reset retryables), set on the S3
+client at build time. `max_attempts = 1` disables retries entirely. Each key
+is optional; an absent key (or absent section) keeps the SDK-standard defaults
+shown above. `max_attempts` must be >= 1 and `base_delay_ms` <= `max_delay_ms`
+(loud config errors otherwise).
 
 If you want the full populated form (Phase 3, not yet applied), it is shown
 here for reference; copying it as-is will refuse `push`/`pull`/`check` until

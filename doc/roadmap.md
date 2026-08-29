@@ -37,12 +37,13 @@ Tracked on GitHub: #14 (tracking issue) with sub-issues #3-#13 in priority tiers
    the profile)
 3. Concurrency limits + retries with backoff on transient S3 errors
    (`[transfer].concurrency` parses but is inert with a warning, W28/M6;
-   `LocalFs` is already Send/Sync, W82; transfers stay sequential).
-   List-enrichment heads are the request pool's primary consumer: every
-   list-driven plan is currently 1+ ListObjectsV2 pages + N sequential heads
-   (~N x RTT), with only the W117 bounded retry (3 attempts, [100ms, 300ms]
-   fixed backoff) as a stopgap - the "retries with backoff" item is newly
-   load-bearing post-I15 (R2-3) and owns full backoff/jitter/concurrency
+   `LocalFs` is already Send/Sync, W82; transfers stay sequential). The
+   **retries-with-backoff half landed under #8** (I8-retry-sdk below): the
+   SDK standard-mode `[transfer].retry` `RetryConfig` owns retry/backoff/
+   jitter for all ops, and the W117 head stopgap is retired. The remaining
+   work is bounded **concurrency** (follow-up **#20**): list-enrichment heads
+   are the request pool's primary consumer - every list-driven plan is
+   currently 1+ ListObjectsV2 pages + N sequential heads (~N x RTT).
 4. Lock file to prevent concurrent runs on same vault
 5. JSON schema stability for `--json` (parses today; dispatch rejects with
    "not implemented (Phase 3)" + exit 1)
@@ -187,6 +188,7 @@ Record choices here as they are made.
 | 2026-08-29 | I15-r1-size-from-head | W115: `enrich_with_head_mtimes` now takes `size` (plus `mtime_ms` and `etag`) from the same `HeadObject`, so the planned entity is one coherent head snapshot - aligning the W106 `CappedWriter` cap and the W62 head-before-delete size check with the mtime identity the planner just trusted; residual race shrinks to the enrich-head -> get/delete-head window. |
 | 2026-08-29 | I15-r1-notfound-warning | W116: a listed key that vanishes before its head is surfaced (not hidden) as one bounded `Listing.warnings` entry (5 names + "and N more"), matching the W70/W79 surface-don't-hide ethos. |
 | 2026-08-29 | I15-r1-head-retry | W117: `Unavailable`/`Timeout` heads are retried up to 3 attempts ([100ms, 300ms] fixed backoff) before failing closed; a stopgap - full backoff/jitter/concurrency stays Phase 3 item 3's request pool. |
+| 2026-08-29 | I8-retry-sdk | Issue #8 (supersedes **W117** / I15-r1-head-retry): transient-error retry/backoff/jitter for **all** S3 ops is owned by the aws-sdk-s3 client's standard-mode `RetryConfig`, configured from a new `[transfer.retry]` config section (`max_attempts` / `base_delay_ms` / `max_delay_ms`, all optional; absent = SDK standard defaults 3 / 1000 / 20000; `max_attempts = 1` disables retries). The W117 head stopgap is retired: enrichment issues exactly one `head()` per object; post-exhaustion transient errors still fail the listing closed (I15-errors unchanged). Mid-body `get_to` connection loss is a documented accepted gap (I8-midbody) - the SDK cannot retry an already-consumed body, so the download fails per-key and the next run converges (sync is idempotent). Config-only knobs, no per-retry logging. Concurrency deferred to follow-up **#20**. |
 | 2026-08-29 | I15-r1-reserved-prefilter | W118: `S3Store::list` partitions reserved-namespace leftovers (`.vaultsync-check-*` / `.*.vaultsync-tmp-*`) out before any head - no wasted requests and no fail-closed scope creep over junk keys; `build_plan`'s partition stays as a second-line guard for other backends (single `reserved_drops_warning` source of truth). |
 | 2026-08-29 | I15-r1-delete-mtime-arm | W119: `DeleteRemote` freshness also refuses a same-size replacement whose mtime drifted beyond the tolerance between plan and delete (post-W113 the planned mtime is the head/`vaultsync-mtime`, retiring the R-c list-skew rationale); residual race is a same-size, within-tolerance replacement. |
 | 2026-08-28 | PR2-W109 reserved-folder-filter | `partition_reserved_remote_keys` strips one trailing `/` before extracting the final segment, so folder-form keys (`.vaultsync-check-1/`, `a/.name.vaultsync-tmp-1-2/`) are filtered like file keys (r12 L4). |

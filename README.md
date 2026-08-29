@@ -58,8 +58,9 @@ action a plan - or delete files - against a non-existent store).
   later `pull`/`status` sees the uploaded file as in-sync (no pessimistic
   one-time re-download). Accepted cost: N+1 requests per list-driven plan
   (1+ ListObjectsV2 pages + N sequential heads, roughly N x RTT) until Phase
-  3's request pool; a bounded transient retry (W117) covers throttles
-  mid-enrich.
+  3's request pool; transient throttles / 5xx on any op are retried with
+  exponential backoff + jitter by the SDK standard-mode `[transfer].retry`
+  config (I8).
 - **Reserved-namespace leftovers are filtered before any head** (W118):
   `.vaultsync-check-*` / `.*.vaultsync-tmp-*` keys are partitioned out of a
   listing before a `HeadObject` is issued - no wasted requests and no
@@ -84,6 +85,10 @@ action a plan - or delete files - against a non-existent store).
   `[transfer].concurrency` that **differs from the default** warns on every
   run until the pool exists (an explicit copy of the default, `4`, is
   silent - it is behaviorally indistinguishable from omitting the key).
+- **`[transfer].retry` is live (not Phase 3).** The three knobs
+  (`max_attempts` / `base_delay_ms` / `max_delay_ms`) map to the AWS SDK
+  standard-mode retry policy on the S3 client; `max_attempts = 1` disables
+  retries. All optional; absent = SDK standard defaults (3 / 1000 / 20000).
 - **`--follow-symlinks` is inventory-only in v1.** The walker follows
   symlinks and lists them, but push/pull plan any followed *file* symlink as
   `Skip(followed_symlink)` (transfers refuse to open a symlink); only
