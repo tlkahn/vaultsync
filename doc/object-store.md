@@ -73,7 +73,7 @@ Practical options (pick in Phase 2 spike, not earlier):
 
 | Trait | S3 API |
 | ----- | ------ |
-| list | `ListObjectsV2` paginated; folder prefixes derived from keys (no delimiter in the request; `CommonPrefixes` is not used) |
+| list | `ListObjectsV2` paginated; folder prefixes derived from keys (no delimiter in the request; `CommonPrefixes` is not used). ListObjectsV2 cannot return user metadata, so each listed object entity is then enriched via a per-object `HeadObject` (`enrich_with_head_mtimes`): `mtime_ms`/`etag` come from `vaultsync-mtime`, not the upload `LastModified`. Request shape is N+1 (one list cycle + N heads, sequential until Phase 3's request-pool work). A `NotFound` head drops the row (concurrent-delete race); any other head error fails the listing. |
 | head | `HeadObject` |
 | get_to | `GetObject` (stream body into the caller's writer) |
 | put_from | `PutObject` single-PUT via `ByteStream::from_path` (buffered to a disk temp, never a `size`-sized memory buffer); 5 GiB ceiling. Multipart is a post-v1 item. |

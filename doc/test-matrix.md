@@ -17,17 +17,11 @@ endpoint/bucket/credentials.
 | 7 | conflict case | exit 2, nothing clobbered | automated (run_push_conflict_exit_2: exit 2, conflict key not transferred) |
 | 8 | prefix + path-style (R2 row) | objects land under prefix only; path-style works | prefix: done throughout; path-style: done (s3_integ_path_style_toggle) |
 | 9 | `--follow-symlinks` | default counts skipped; follow includes in-vault, skips escaping target with warning; loop-safe | done (local walker tests + CLI on a real tree) |
+| 10 | status-after-push no-op | after a push, `status` on the same vault plans 0 actions (exit 0) | done (`s3_integ_status_converges_after_push`; offline `build_plan_status_converges_after_push_with_s3like_listing`) |
+| 11 | status-after-pull no-op; exact mtimes preserved | pull into a fresh dir restores exact mtimes; `status` there plans 0 actions | done (`s3_integ_pull_then_status_converges`; offline `pull_into_fresh_dir_then_status_converges_with_s3like_listing`) |
 
 R2 row (Cloudflare): **pending** - requires an R2 endpoint/bucket/credentials
 (not provided this session). The custom-endpoint + path-style paths R2 needs
 are already exercised and passing on AWS (`s3_integ_path_style_toggle`,
 `s3_integ_prefix_isolation`); R2 metadata/list/checksum quirks remain to be
 verified here before ticking the row.
-
-## Known limitation (documented in `src/store/s3.rs`)
-
-`list` uses each object's `LastModified` (ListObjectsV2 does not return user
-metadata), so after a push many unmodified files can appear "remote newer" by
-seconds-of-granularity and a later `pull` may re-download them. Bytes are
-correct and downloads apply the true client mtime from `get_to` metadata.
-A per-object `head` in `list` (to surface client mtimes in plans) is post-v1.
