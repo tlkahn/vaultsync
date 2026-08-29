@@ -100,8 +100,8 @@ mtime_tolerance_ms = 1000
 
 [transfer.retry]
 # max_attempts = 3       # total attempts incl. the initial one; SDK standard default; 1 disables retries
-# base_delay_ms = 1000   # first backoff duration, ms; SDK standard default
-# max_delay_ms = 20000   # backoff ceiling, ms; SDK standard default
+# base_delay_ms = 1000   # first backoff scale, ms (full jitter: realized delay is uniform in [0, this]); SDK standard default
+# max_delay_ms = 20000   # pre-jitter backoff ceiling, ms; SDK standard default
 ```
 
 > `[ignore].patterns` is a **Phase 3 feature**: it is parsed and validated
