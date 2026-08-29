@@ -529,7 +529,8 @@ fn s3_integ_e2e_push_pull() {
         let plan = vaultsync::build_plan(&local, s, Mode::Push, &PlanOpts::default())
             .map_err(|e| format!("{e}"))?
             .plan;
-        let rep = vaultsync::exec::execute_plan(&local, s, &plan, Mode::Push, &PlanOpts::default());
+        let rep =
+            vaultsync::exec::execute_plan(&local, s, &plan, Mode::Push, &PlanOpts::default(), 1);
         assert!(rep.failed.is_empty(), "push failures: {:?}", rep.failed);
 
         // wipe the source, pull into a fresh dir
@@ -540,7 +541,7 @@ fn s3_integ_e2e_push_pull() {
             .map_err(|e| format!("{e}"))?
             .plan;
         let rep2 =
-            vaultsync::exec::execute_plan(&ldst, s, &plan2, Mode::Pull, &PlanOpts::default());
+            vaultsync::exec::execute_plan(&ldst, s, &plan2, Mode::Pull, &PlanOpts::default(), 1);
         assert!(rep2.failed.is_empty(), "pull failures: {:?}", rep2.failed);
 
         // byte- and mtime-compare each expected file
@@ -588,7 +589,8 @@ fn s3_integ_status_converges_after_push() {
             "push plan must plan the seeded uploads: {:?}",
             plan.actions
         );
-        let rep = vaultsync::exec::execute_plan(&local, s, &plan, Mode::Push, &PlanOpts::default());
+        let rep =
+            vaultsync::exec::execute_plan(&local, s, &plan, Mode::Push, &PlanOpts::default(), 1);
         assert!(rep.failed.is_empty(), "push failures: {:?}", rep.failed);
         assert_eq!(
             rep.executed,
@@ -675,7 +677,8 @@ fn s3_integ_pull_then_status_converges() {
         let plan = vaultsync::build_plan(&local, s, Mode::Push, &PlanOpts::default())
             .map_err(|e| format!("{e}"))?
             .plan;
-        let rep = vaultsync::exec::execute_plan(&local, s, &plan, Mode::Push, &PlanOpts::default());
+        let rep =
+            vaultsync::exec::execute_plan(&local, s, &plan, Mode::Push, &PlanOpts::default(), 1);
         assert!(rep.failed.is_empty(), "push failures: {:?}", rep.failed);
 
         // wipe local, pull into a fresh dir
@@ -686,7 +689,7 @@ fn s3_integ_pull_then_status_converges() {
             .map_err(|e| format!("{e}"))?
             .plan;
         let rep2 =
-            vaultsync::exec::execute_plan(&ldst, s, &plan2, Mode::Pull, &PlanOpts::default());
+            vaultsync::exec::execute_plan(&ldst, s, &plan2, Mode::Pull, &PlanOpts::default(), 1);
         assert!(rep2.failed.is_empty(), "pull failures: {:?}", rep2.failed);
 
         // exact mtimes restored (existing feature must hold)

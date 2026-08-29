@@ -18,9 +18,6 @@
 /// order after the scope joins. A worker panic propagates out of `scope`
 /// (the first panic, after all workers are joined) exactly as a panic in a
 /// sequential loop would.
-// Cycle 3 only: consumed by `exec` (cycle 4) and `store::mod` enrichment
-// (cycle 5); remove this expect when the first consumer lands.
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn run_bounded<T, R>(concurrency: u32, items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R>
 where
     T: Sync,

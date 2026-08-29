@@ -1527,7 +1527,7 @@ mod tests {
             plan.actions
         );
         let rep =
-            crate::exec::execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default());
+            crate::exec::execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default(), 1);
         assert!(rep.failed.is_empty(), "push failures: {:?}", rep.failed);
         assert_eq!(
             rep.executed,
@@ -1582,7 +1582,8 @@ mod tests {
         let plan = crate::build_plan(&ldst, &store, Mode::Pull, &PlanOpts::default())
             .unwrap()
             .plan;
-        let rep = crate::exec::execute_plan(&ldst, &store, &plan, Mode::Pull, &PlanOpts::default());
+        let rep =
+            crate::exec::execute_plan(&ldst, &store, &plan, Mode::Pull, &PlanOpts::default(), 1);
         assert!(rep.failed.is_empty(), "pull failures: {:?}", rep.failed);
         // byte-identical + exact mtime restored (existing feature must hold)
         for (rel, bytes) in &files {

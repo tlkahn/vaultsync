@@ -42,33 +42,55 @@ pub struct ExecFailure {
 /// `opts` carries the resolved `mtime_tolerance_ms` used for the upload-side
 /// re-verification (W2, PR2 A-H2/B-M1) and, later, the pull destination
 /// freshness guard (W13).
+///
+/// I20: `concurrency` bounds how many keys each pass runs in flight (workers =
+/// `min(concurrency, items)`); `concurrency <= 1` runs the sequential loop on
+/// the caller's thread (I20-one). The four passes still run strictly in order
+/// (downloads, uploads, DeleteRemote, DeleteLocal); per-key guards are
+/// unchanged and now execute concurrently inside the pool (R3.3, W13/W22,
+/// W62/W119, W39). Report assembly happens after each pass in plan order, so
+/// `failed` stays deterministic regardless of completion order.
 pub fn execute_plan(
     local: &LocalFs,
     store: &dyn ObjectStore,
     plan: &Plan,
     mode: Mode,
     opts: &crate::plan::PlanOpts,
+    concurrency: u32,
 ) -> ExecReport {
     let mut rep = ExecReport::default();
     if mode == Mode::Status {
         return rep;
     }
 
-    // Pass 1: downloads (pull).
-    for a in plan
+    // Pass 1: downloads (pull). I20: fan out through the bounded pool; the
+    // report is assembled in plan order after the pass joins.
+    let downloads: Vec<&crate::plan::Action> = plan
         .actions
         .iter()
         .filter(|a| a.kind == ActionKind::Download)
-    {
-        match exec_download(local, store, a, opts.mtime_tolerance_ms) {
+        .collect();
+    let results = crate::pool::run_bounded(concurrency, &downloads, |a| {
+        exec_download(local, store, a, opts.mtime_tolerance_ms)
+    });
+    for (a, r) in downloads.iter().zip(results) {
+        match r {
             Ok(()) => rep.executed += 1,
             Err(e) => fail(&mut rep, &a.key, e),
         }
     }
 
-    // Pass 2: uploads (push).
-    for a in plan.actions.iter().filter(|a| a.kind == ActionKind::Upload) {
-        match exec_upload(local, store, a, opts.mtime_tolerance_ms) {
+    // Pass 2: uploads (push), fanned out through the bounded pool (I20).
+    let uploads: Vec<&crate::plan::Action> = plan
+        .actions
+        .iter()
+        .filter(|a| a.kind == ActionKind::Upload)
+        .collect();
+    let results = crate::pool::run_bounded(concurrency, &uploads, |a| {
+        exec_upload(local, store, a, opts.mtime_tolerance_ms)
+    });
+    for (a, r) in uploads.iter().zip(results) {
+        match r {
             Ok(()) => rep.executed += 1,
             Err(e) => fail(&mut rep, &a.key, e),
         }
@@ -91,34 +113,25 @@ pub fn execute_plan(
     // R-c list-skew rationale is retired; no in-tree backend systematically
     // false-fails). The residual race is a same-size replacement whose mtime
     // is within tolerance between plan and delete.
-    for a in plan
+    let delete_remote: Vec<&crate::plan::Action> = plan
         .actions
         .iter()
         .filter(|a| a.kind == ActionKind::DeleteRemote)
-    {
+        .collect();
+    let results = crate::pool::run_bounded(concurrency, &delete_remote, |a| {
         let Some(planned_remote) = &a.remote else {
-            fail(
-                &mut rep,
-                &a.key,
-                Error::Other(format!(
-                    "delete-remote planned without remote entity: {}",
-                    a.key
-                )),
-            );
-            continue;
+            return Err(Error::Other(format!(
+                "delete-remote planned without remote entity: {}",
+                a.key
+            )));
         };
         match store.head(&a.key) {
             Ok(cur) => {
                 if cur.size != planned_remote.size {
-                    fail(
-                        &mut rep,
-                        &a.key,
-                        Error::Other(format!(
-                            "remote changed since plan for {}; not deleting",
-                            a.key
-                        )),
-                    );
-                    continue;
+                    return Err(Error::Other(format!(
+                        "remote changed since plan for {}; not deleting",
+                        a.key
+                    )));
                 }
                 // W119/R1-M2: post-W113 the planned `mtime_ms` IS the head/
                 // `vaultsync-mtime` value (the old R-c list-skew rationale is
@@ -129,56 +142,50 @@ pub fn execute_plan(
                 if let (Some(planned_m), Some(cur_m)) = (planned_remote.mtime_ms, cur.mtime_ms)
                     && planned_m.abs_diff(cur_m) > opts.mtime_tolerance_ms
                 {
-                    fail(
-                        &mut rep,
-                        &a.key,
-                        Error::Other(format!(
-                            "remote changed since plan for {}; not deleting",
-                            a.key
-                        )),
-                    );
-                    continue;
+                    return Err(Error::Other(format!(
+                        "remote changed since plan for {}; not deleting",
+                        a.key
+                    )));
                 }
             }
             Err(Error::NotFound(_)) => {
                 // goal state already achieved (W10 idempotent-delete arm)
-                rep.executed += 1;
-                continue;
+                return Ok(());
             }
-            Err(e) => {
-                fail(&mut rep, &a.key, e);
-                continue;
-            }
+            Err(e) => return Err(e),
         }
         match store.delete(&a.key) {
-            Ok(()) => rep.executed += 1,
+            Ok(()) => Ok(()),
             // W10: head is best-effort; a delete-time NotFound still means
             // the goal state was reached.
-            Err(Error::NotFound(_)) => rep.executed += 1,
+            Err(Error::NotFound(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    });
+    for (a, r) in delete_remote.iter().zip(results) {
+        match r {
+            Ok(()) => rep.executed += 1,
             Err(e) => fail(&mut rep, &a.key, e),
         }
     }
     let mut deleted_keys: Vec<String> = Vec::new();
-    for a in plan
+    // Pass 4: local deletes, fanned out through the bounded pool (I20).
+    let delete_local: Vec<&crate::plan::Action> = plan
         .actions
         .iter()
         .filter(|a| a.kind == ActionKind::DeleteLocal)
-    {
+        .collect();
+    let results = crate::pool::run_bounded(concurrency, &delete_local, |a| {
         // R4-L1/W39: a `pull --delete` re-verifies local freshness before
         // removing the file (symmetric to upload R3.3 / download W13). The
         // planned local entity is the truth the walk recorded; `a.local` is
         // always `Some` for DeleteLocal - a missing one is a per-key error,
         // never an unguarded delete.
         let Some(planned_local) = &a.local else {
-            fail(
-                &mut rep,
-                &a.key,
-                Error::Other(format!(
-                    "delete-local planned without local entity: {}",
-                    a.key
-                )),
-            );
-            continue;
+            return Err(Error::Other(format!(
+                "delete-local planned without local entity: {}",
+                a.key
+            )));
         };
         match local.delete_file_guarded(
             &a.key,
@@ -186,16 +193,21 @@ pub fn execute_plan(
             planned_local.mtime_ms,
             opts.mtime_tolerance_ms,
         ) {
-            Ok(()) => {
-                rep.executed += 1;
-                deleted_keys.push(a.key.clone());
-            }
+            Ok(()) => Ok(()),
             Err(Error::NotFound(_)) => {
                 // W32: the goal state (file absent) is achieved, so count a
                 // no-op delete as reaching it and keep the empty-dir cleanup
                 // pass active for this key's ancestor chain. (The guarded
                 // delete reports NotFound before any freshness check,
                 // matching the old delete_file contract.)
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    });
+    for (a, r) in delete_local.iter().zip(results) {
+        match r {
+            Ok(()) => {
                 rep.executed += 1;
                 deleted_keys.push(a.key.clone());
             }
@@ -515,7 +527,7 @@ mod tests {
         let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default())
             .unwrap()
             .plan;
-        let rep = execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default());
+        let rep = execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default(), 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert_eq!(rep.executed, 1);
         let e = store.head("a.md").unwrap();
@@ -552,7 +564,7 @@ mod tests {
             .plan;
         // drift the file 3000 ms after the plan captured its mtime
         set_mtime_ms(&p, base + 3000);
-        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Push, &opts);
+        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Push, &opts, 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep.failed);
         assert_eq!(rep.executed, 1, "{:?}", rep);
     }
@@ -578,7 +590,7 @@ mod tests {
             .plan;
         let link = plan.actions.iter().find(|a| a.key == "link.md").unwrap();
         assert_eq!(link.kind, ActionKind::Skip, "link.md must be planned skip");
-        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Push, &opts);
+        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Push, &opts, 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep.failed);
         assert!(
             matches!(store.head("link.md").unwrap_err(), Error::NotFound(_)),
@@ -605,7 +617,7 @@ mod tests {
         let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
             .unwrap()
             .plan;
-        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default(), 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert_eq!(rep.executed, 1, "{:?}", rep);
         let p = dir.join(&key);
@@ -626,7 +638,7 @@ mod tests {
         let plan = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
             .unwrap()
             .plan;
-        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default(), 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert_eq!(std::fs::read(dir.join("n/b.md")).unwrap(), b"remote-bytes");
         let got = mtime_ms(&dir.join("n/b.md"));
@@ -649,7 +661,7 @@ mod tests {
         let plan = crate::build_plan(&local, &store, Mode::Push, &opts)
             .unwrap()
             .plan;
-        let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts);
+        let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts, 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert!(matches!(
             store.head("gone.md").unwrap_err(),
@@ -683,7 +695,7 @@ mod tests {
         // the files vanish before execution (pre-cleaned by another process)
         std::fs::remove_file(dir.join("n/gone.md")).unwrap();
         std::fs::remove_file(dir.join("n/sub/x.md")).unwrap();
-        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &opts);
+        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &opts, 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         // both `sub` and `n` are now empty -> removed bottom-up even though
         // every delete was a NotFound no-op
@@ -717,7 +729,7 @@ mod tests {
         let link = plan.actions.iter().find(|a| a.key == "link.md").unwrap();
         assert_eq!(link.kind, ActionKind::Skip, "{:?}", link);
         assert_eq!(link.reason, "followed_symlink");
-        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &opts);
+        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &opts, 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep.failed);
         // the link survives (never unlinked); `real.md` is a genuine local
         // extra and IS deleted by pull --delete - only the link is protected.
@@ -752,7 +764,7 @@ mod tests {
         // swap the leaf for a symlink after planning
         std::fs::remove_file(dir.join("gone.md")).unwrap();
         std::os::unix::fs::symlink(outside.join("victim"), dir.join("gone.md")).unwrap();
-        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &opts);
+        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &opts, 1);
         assert!(
             rep.failed.iter().any(|fl| fl.key == "gone.md"),
             "gone.md not failed: {:?}",
@@ -795,7 +807,7 @@ mod tests {
         );
         // user edits the file after planning (size drift)
         std::fs::write(dir.join("gone.md"), "abcdefghij").unwrap();
-        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &opts);
+        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &opts, 1);
         assert!(
             rep.failed.iter().any(|fl| fl.key == "gone.md"),
             "gone.md not failed: {:?}",
@@ -827,7 +839,7 @@ mod tests {
         let plan = crate::build_plan(&local, &store, Mode::Pull, &opts)
             .unwrap()
             .plan;
-        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &opts);
+        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &opts, 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert!(!dir.join("gone.md").exists());
     }
@@ -848,7 +860,7 @@ mod tests {
         let plan = crate::build_plan(&local, &store, Mode::Pull, &opts)
             .unwrap()
             .plan;
-        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &opts);
+        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &opts, 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert!(!dir.join("n/gone.md").exists());
         // both `sub` and `n` are now empty -> removed bottom-up; root stays.
@@ -888,7 +900,7 @@ mod tests {
                 .iter()
                 .any(|a| a.key == "n/gone.md" && a.kind == ActionKind::DeleteLocal)
         );
-        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &opts);
+        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &opts, 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert!(
             dir.join("attachments").exists(),
@@ -920,7 +932,7 @@ mod tests {
         let plan = crate::build_plan(&local, &store, Mode::Pull, &opts)
             .unwrap()
             .plan;
-        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &opts);
+        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &opts, 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert!(!dir.join("a/b/c").exists(), "deepest ancestor not removed");
         assert!(!dir.join("a/b").exists(), "middle ancestor not removed");
@@ -957,7 +969,7 @@ mod tests {
                 .iter()
                 .any(|a| a.key == "n/gone.md" && a.kind == ActionKind::DeleteLocal)
         );
-        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &opts);
+        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &opts, 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert!(
             dir.join("n/keep.md").exists(),
@@ -986,7 +998,7 @@ mod tests {
             .plan;
         // the file vanishes before execution (pre-cleaned by another process)
         std::fs::remove_file(dir.join("n/sub/gone.md")).unwrap();
-        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &opts);
+        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &opts, 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert!(
             !dir.join("n/sub").exists(),
@@ -1028,7 +1040,7 @@ mod tests {
         );
         // replace the object with different-size content after planning
         put_str(&store, "gone.md", "replacement-bytes-xyz", Some(200));
-        let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts);
+        let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts, 1);
         assert!(
             rep.failed.iter().any(|fl| fl.key == "gone.md"),
             "gone.md not failed: {:?}",
@@ -1074,7 +1086,7 @@ mod tests {
         // replace the remote in place with same-size content drifted far
         // beyond the tolerance (mtime + 60_000ms).
         put_str(&store, "old.md", "xyz", Some(100 + 60_000));
-        let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts);
+        let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts, 1);
         assert!(
             rep.failed.iter().any(|fl| fl.key == "old.md"),
             "old.md not failed: {:?}",
@@ -1115,7 +1127,7 @@ mod tests {
                 .any(|a| a.key == "old.md" && a.kind == ActionKind::DeleteRemote)
         );
         put_str(&store, "old.md", "xyz", Some(100 + 500));
-        let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts);
+        let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts, 1);
         assert!(
             rep.failed.is_empty(),
             "delete should succeed: {:?}",
@@ -1140,7 +1152,7 @@ mod tests {
         let plan = crate::build_plan(&local, &store, Mode::Push, &opts)
             .unwrap()
             .plan;
-        let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts);
+        let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts, 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert!(matches!(
             store.head("gone.md").unwrap_err(),
@@ -1164,7 +1176,7 @@ mod tests {
         let plan = crate::build_plan(&local, &store, Mode::Push, &opts)
             .unwrap()
             .plan;
-        let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts);
+        let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts, 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         let log = store.log();
         let put = log.iter().position(|l| l == "put_from:a.md");
@@ -1174,6 +1186,320 @@ mod tests {
             put.unwrap() < del.unwrap(),
             "delete ran before transfer: {log:?}"
         );
+    }
+
+    /// Store wrapper that gauges the max number of concurrent `get_to` calls
+    /// (I20 cycle 4 overlap probe - gauges, never wall-clock).
+    struct GaugedGetStore {
+        inner: MemoryStore,
+        in_flight: std::sync::atomic::AtomicUsize,
+        max_in_flight: std::sync::atomic::AtomicUsize,
+    }
+    impl GaugedGetStore {
+        fn new() -> Self {
+            GaugedGetStore {
+                inner: MemoryStore::new(),
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                max_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn max_in_flight(&self) -> usize {
+            self.max_in_flight.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    impl ObjectStore for GaugedGetStore {
+        fn list(&self, prefix: &str) -> Result<Listing, Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<Entity, Error> {
+            self.inner.head(key)
+        }
+        fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            let cur = self
+                .in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            self.max_in_flight
+                .fetch_max(cur, std::sync::atomic::Ordering::SeqCst);
+            std::thread::yield_now();
+            let r = self.inner.get_to(key, w);
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            r
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime: Option<u64>,
+        ) -> Result<Entity, Error> {
+            self.inner.put_from(key, r, size, mtime)
+        }
+        fn delete(&self, key: &str) -> Result<(), Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// Store wrapper that shuffles completion order via a key-hash sleep and
+    /// can poison specific keys' `get_to` (I20 cycle 4 determinism/isolation
+    /// probes).
+    struct ShuffleStore {
+        inner: MemoryStore,
+        poison: std::sync::Mutex<std::collections::HashSet<String>>,
+    }
+    impl ShuffleStore {
+        fn new() -> Self {
+            ShuffleStore {
+                inner: MemoryStore::new(),
+                poison: std::sync::Mutex::new(std::collections::HashSet::new()),
+            }
+        }
+        fn poison(&self, key: &str) {
+            self.poison.lock().unwrap().insert(key.to_string());
+        }
+        fn sleep_for(&self, key: &str) {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            use std::hash::{Hash as _, Hasher as _};
+            key.hash(&mut h);
+            std::thread::sleep(std::time::Duration::from_micros(h.finish() % 3000));
+        }
+    }
+    impl ObjectStore for ShuffleStore {
+        fn list(&self, prefix: &str) -> Result<Listing, Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<Entity, Error> {
+            self.inner.head(key)
+        }
+        fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            self.sleep_for(key);
+            if self.poison.lock().unwrap().contains(key) {
+                return Err(Error::Other(format!("poisoned:{key}")));
+            }
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime: Option<u64>,
+        ) -> Result<Entity, Error> {
+            self.inner.put_from(key, r, size, mtime)
+        }
+        fn delete(&self, key: &str) -> Result<(), Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    #[test]
+    fn exec_parallel_downloads_overlap() {
+        // I20 cycle 4: a 16-key pull at concurrency 4 fans out - the
+        // max-in-flight `get_to` gauge must exceed 1 (real overlap) and stay
+        // <= 4; bytes land correctly and the report equals the concurrency-1
+        // report exactly.
+        let store = GaugedGetStore::new();
+        for i in 0..16 {
+            put_str(
+                &store.inner,
+                &format!("n{i:02}.md"),
+                &format!("body-{i:02}"),
+                Some(1_000 + i),
+            );
+        }
+        let dir4 = TempDir::new("vaultsync-exec");
+        let local4 = LocalFs::new(dir4.path());
+        let opts = PlanOpts::default();
+        let plan = crate::build_plan(&local4, &store, Mode::Pull, &opts)
+            .unwrap()
+            .plan;
+        let rep4 = execute_plan(&local4, &store, &plan, Mode::Pull, &opts, 4);
+        assert!(
+            store.max_in_flight() > 1,
+            "downloads must overlap at concurrency 4 (max in-flight {})",
+            store.max_in_flight()
+        );
+        assert!(store.max_in_flight() <= 4);
+        assert_eq!(rep4.failed, Vec::<ExecFailure>::new(), "{:?}", rep4.failed);
+        assert_eq!(rep4.executed, 16);
+        for i in 0..16 {
+            let body = std::fs::read(dir4.join(format!("n{i:02}.md"))).unwrap();
+            assert_eq!(body, format!("body-{i:02}").as_bytes());
+        }
+        let dir1 = TempDir::new("vaultsync-exec");
+        let local1 = LocalFs::new(dir1.path());
+        let rep1 = execute_plan(&local1, &store, &plan, Mode::Pull, &opts, 1);
+        assert_eq!(rep4, rep1);
+    }
+
+    #[test]
+    fn exec_report_is_deterministic_under_pool() {
+        // I20 cycle 4: the same plan executed twice at concurrency 8 on a
+        // completion-order-shuffling store yields identical ExecReports, and
+        // identical to the concurrency-1 report (`failed` in plan order).
+        let store = ShuffleStore::new();
+        for i in 0..24 {
+            put_str(
+                &store.inner,
+                &format!("k{i:02}.md"),
+                &format!("x{i}"),
+                Some(5000 + i),
+            );
+        }
+        store.poison("k03.md");
+        store.poison("k17.md");
+        let dir1 = TempDir::new("vaultsync-exec");
+        let opts = PlanOpts::default();
+        let plan = crate::build_plan(&LocalFs::new(dir1.path()), &store, Mode::Pull, &opts)
+            .unwrap()
+            .plan;
+        let rep1 = execute_plan(
+            &LocalFs::new(dir1.path()),
+            &store,
+            &plan,
+            Mode::Pull,
+            &opts,
+            1,
+        );
+        let dir8a = TempDir::new("vaultsync-exec");
+        let rep8a = execute_plan(
+            &LocalFs::new(dir8a.path()),
+            &store,
+            &plan,
+            Mode::Pull,
+            &opts,
+            8,
+        );
+        let dir8b = TempDir::new("vaultsync-exec");
+        let rep8b = execute_plan(
+            &LocalFs::new(dir8b.path()),
+            &store,
+            &plan,
+            Mode::Pull,
+            &opts,
+            8,
+        );
+        assert_eq!(rep8a, rep8b, "pooled runs must be deterministic");
+        assert_eq!(rep8a, rep1, "pooled report must equal the sequential one");
+        assert_eq!(
+            rep1.failed
+                .iter()
+                .map(|f| f.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["k03.md", "k17.md"],
+            "failed keys in plan order"
+        );
+    }
+
+    #[test]
+    fn exec_parallel_failure_isolation() {
+        // I20 cycle 4: one poisoned key among 15 healthy at concurrency 4
+        // yields exactly one `failed` entry naming that key, 15 - 1 executed,
+        // and a message identical to the sequential run.
+        let store = ShuffleStore::new();
+        for i in 0..15 {
+            put_str(
+                &store.inner,
+                &format!("f{i:02}.md"),
+                &format!("x{i}"),
+                Some(1000 + i),
+            );
+        }
+        store.poison("f07.md");
+        let dir = TempDir::new("vaultsync-exec");
+        let local = LocalFs::new(dir.path());
+        let opts = PlanOpts::default();
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts)
+            .unwrap()
+            .plan;
+        let rep4 = execute_plan(&local, &store, &plan, Mode::Pull, &opts, 4);
+        assert_eq!(rep4.failed.len(), 1, "{:?}", rep4.failed);
+        assert_eq!(rep4.failed[0].key, "f07.md");
+        assert_eq!(rep4.failed[0].message, "poisoned:f07.md");
+        assert_eq!(rep4.executed, 14);
+        // Sequential comparison on a fresh empty dir: same plan, same store.
+        let dir1 = TempDir::new("vaultsync-exec");
+        let local1 = LocalFs::new(dir1.path());
+        let rep1 = execute_plan(&local1, &store, &plan, Mode::Pull, &opts, 1);
+        assert_eq!(rep4, rep1);
+    }
+
+    #[test]
+    fn exec_parallel_guards_hold() {
+        // I20 cycle 4: at concurrency 4, a post-plan local edit still fails
+        // the upload key via R3.3 and a post-plan remote replacement still
+        // fails the DeleteRemote key via W62; neighbors unaffected.
+        let dir = TempDir::new("vaultsync-exec");
+        std::fs::write(dir.join("a.md"), "abc").unwrap();
+        std::fs::write(dir.join("ok.md"), "stable").unwrap();
+        let local = LocalFs::new(dir.path());
+        let store = MemoryStore::new();
+        put_str(&store, "gone.md", "x", Some(5_000));
+        let opts = PlanOpts {
+            delete: true,
+            ..Default::default()
+        };
+        let plan = crate::build_plan(&local, &store, Mode::Push, &opts)
+            .unwrap()
+            .plan;
+        // post-plan edits: grow a.md (R3.3), replace gone.md remotely (W62).
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("a.md"))
+            .unwrap();
+        use std::io::Write as _;
+        f.write_all(b"defghijklmnop").unwrap();
+        drop(f);
+        put_str(&store, "gone.md", "xx", Some(5_000)); // size drift 1 -> 2
+        let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts, 4);
+        assert!(
+            rep.failed.iter().any(|fl| fl.key == "a.md"),
+            "a.md must fail via R3.3: {:?}",
+            rep.failed
+        );
+        assert!(
+            rep.failed
+                .iter()
+                .any(|fl| fl.key == "gone.md" && fl.message.contains("changed since plan")),
+            "gone.md must fail via W62: {:?}",
+            rep.failed
+        );
+        assert_eq!(rep.failed.len(), 2, "{:?}", rep.failed);
+        // neighbors unaffected: ok.md uploaded, gone.md not deleted.
+        assert!(store.head("ok.md").is_ok(), "ok.md must upload");
+        assert_eq!(rep.executed, 1, "only ok.md executed: {:?}", rep);
+        assert_eq!(get_bytes(&store, "ok.md"), b"stable");
+    }
+
+    #[test]
+    fn exec_concurrency_1_byte_for_byte() {
+        // I20-one/I20-deletes: transfers strictly before deletes in the op log
+        // at both concurrency 1 and 4 - the pool must not reorder passes.
+        for concurrency in [1u32, 4] {
+            let dir = TempDir::new("vaultsync-exec");
+            std::fs::write(dir.join("a.md"), "hello").unwrap();
+            let local = LocalFs::new(dir.path());
+            let store = RecordingStore::new();
+            store.seed("gone.md", "x");
+            let opts = PlanOpts {
+                delete: true,
+                ..Default::default()
+            };
+            let plan = crate::build_plan(&local, &store, Mode::Push, &opts)
+                .unwrap()
+                .plan;
+            let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts, concurrency);
+            assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
+            let log = store.log();
+            let put = log.iter().position(|l| l == "put_from:a.md");
+            let del = log.iter().position(|l| l == "delete:gone.md");
+            assert!(put.is_some() && del.is_some(), "log: {log:?}");
+            assert!(
+                put.unwrap() < del.unwrap(),
+                "delete ran before transfer: {log:?}"
+            );
+        }
     }
 
     #[test]
@@ -1193,7 +1519,7 @@ mod tests {
             .plan;
         let before_c = store.head("c.md").unwrap();
         let before_a = store.head("a.md").unwrap();
-        let rep = execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default());
+        let rep = execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default(), 1);
         assert_eq!(rep.executed, 0, "no transfers expected");
         assert_eq!(rep.failed, Vec::<ExecFailure>::new());
         // nothing mutated
@@ -1219,7 +1545,7 @@ mod tests {
         use std::io::Write as _;
         f.write_all(b"defghijklmnop").unwrap();
         drop(f);
-        let rep = execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default());
+        let rep = execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default(), 1);
         assert!(
             rep.failed.iter().any(|fl| fl.key == "a.md"),
             "a.md not failed: {:?}",
@@ -1295,7 +1621,7 @@ mod tests {
             .unwrap()
             .plan;
         let rep =
-            crate::exec::execute_plan(&local, &wrapper, &plan, Mode::Pull, &PlanOpts::default());
+            crate::exec::execute_plan(&local, &wrapper, &plan, Mode::Pull, &PlanOpts::default(), 1);
         assert!(
             rep.failed.iter().any(|fl| fl.key == "bad.md"),
             "bad.md not failed: {:?}",
@@ -1395,7 +1721,7 @@ mod tests {
             .unwrap()
             .plan;
         let rep =
-            crate::exec::execute_plan(&local, &wrapper, &plan, Mode::Pull, &PlanOpts::default());
+            crate::exec::execute_plan(&local, &wrapper, &plan, Mode::Pull, &PlanOpts::default(), 1);
         assert!(
             rep.failed.iter().any(|fl| fl.key == "big.md"),
             "big.md not failed: {:?}",
@@ -1440,7 +1766,7 @@ mod tests {
             }],
             stats: crate::plan::PlanStats::default(),
         };
-        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default(), 1);
         assert!(
             rep.failed.iter().any(|fl| {
                 fl.key == "a.md"
@@ -1470,7 +1796,7 @@ mod tests {
             .plan;
         // remote vanishes between plan and execute
         store.delete("a/b/c.md").unwrap();
-        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default(), 1);
         assert!(
             rep.failed.iter().any(|fl| fl.key == "a/b/c.md"),
             "a/b/c.md not failed: {:?}",
@@ -1501,7 +1827,7 @@ mod tests {
             .unwrap()
             .plan;
         store.delete("keep/sub/x.md").unwrap();
-        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default(), 1);
         assert!(
             rep.failed.iter().any(|fl| fl.key == "keep/sub/x.md"),
             "keep/sub/x.md not failed: {:?}",
@@ -1539,7 +1865,7 @@ mod tests {
         // user edits the destination after planning (size changes)
         std::fs::write(&p, "user-edit-since-plan-123").unwrap();
         let rep =
-            crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+            crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default(), 1);
         assert!(
             rep.failed.iter().any(|fl| fl.key == "a.md"),
             "a.md not failed: {:?}",
@@ -1580,7 +1906,7 @@ mod tests {
         // a regular file appears at the destination after planning
         std::fs::write(dir.join("b.md"), "editor-saved-since-plan").unwrap();
         let rep =
-            crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+            crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default(), 1);
         assert!(
             rep.failed.iter().any(|fl| fl.key == "b.md"),
             "b.md not failed: {:?}",
@@ -1622,7 +1948,7 @@ mod tests {
         // user edits the local file after planning (size changes)
         std::fs::write(&p, "user-edit-since-plan-123").unwrap();
         let rep =
-            crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+            crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default(), 1);
         assert!(
             rep.failed.iter().any(|fl| fl.key == "a.md"),
             "a.md not failed: {:?}",
@@ -1657,7 +1983,7 @@ mod tests {
         let p = dir.join("b.md");
         std::fs::write(&p, "editor-saved-since-plan").unwrap();
         let rep =
-            crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+            crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default(), 1);
         assert!(
             rep.failed.iter().any(|fl| fl.key == "b.md"),
             "b.md not failed: {:?}",
@@ -1681,7 +2007,7 @@ mod tests {
             .unwrap()
             .plan;
         let rep =
-            crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+            crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default(), 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep.failed);
         assert_eq!(std::fs::read(dir.join("b.md")).unwrap(), b"remote-bytes");
         assert_no_tmp_leftovers(dir.path());
@@ -1703,7 +2029,7 @@ mod tests {
             .plan;
         std::fs::remove_file(&p).unwrap();
         let rep =
-            crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+            crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default(), 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep.failed);
         assert_eq!(std::fs::read(&p).unwrap(), b"remote-new-body");
     }
@@ -1750,7 +2076,7 @@ mod tests {
         std::fs::remove_file(&p).unwrap();
         std::os::unix::fs::symlink(outside.join("secret"), &p).unwrap();
         let rep =
-            crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+            crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default(), 1);
         assert!(
             rep.failed.iter().any(|fl| fl.key == "a.md"),
             "a.md not failed: {:?}",
@@ -1788,7 +2114,7 @@ mod tests {
             "symlink skipped by walk -> remote-only"
         );
         let rep =
-            crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+            crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default(), 1);
         let fl = rep
             .failed
             .iter()
@@ -1819,7 +2145,7 @@ mod tests {
             .plan;
         // remote vanishes between plan and execute
         store.delete("a.md").unwrap();
-        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default());
+        let rep = execute_plan(&local, &store, &plan, Mode::Pull, &PlanOpts::default(), 1);
         assert!(
             rep.failed.iter().any(|fl| fl.key == "a.md"),
             "a.md not failed: {:?}",
@@ -1858,7 +2184,7 @@ mod tests {
         // lock the parent `a` (read+traverse, no write) after planning so the
         // file delete still succeeds but the empty-dir removal fails EACCES
         std::fs::set_permissions(dir.join("a"), std::fs::Permissions::from_mode(0o555)).unwrap();
-        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &opts);
+        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &opts, 1);
         // restore perms so TempDir drop can remove the tree
         std::fs::set_permissions(dir.join("a"), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
@@ -1891,7 +2217,7 @@ mod tests {
             .plan;
         // remote vanishes before execution -> the planned delete sees NotFound
         store.delete("gone.md").unwrap();
-        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Push, &opts);
+        let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Push, &opts, 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep.failed);
         assert_eq!(rep.executed, 1, "{:?}", rep);
     }
@@ -1914,7 +2240,7 @@ mod tests {
         use std::io::Write as _;
         f.write_all(b"aaaaaaaaaa").unwrap();
         drop(f);
-        let rep = execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default());
+        let rep = execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default(), 1);
         assert_eq!(rep.executed, 1, "only ok.md");
         assert_eq!(rep.failed.len(), 1);
         assert_eq!(rep.failed[0].key, "bad.md");
@@ -1932,7 +2258,7 @@ mod tests {
         let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default())
             .unwrap()
             .plan;
-        let rep = execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default());
+        let rep = execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default(), 1);
         assert_eq!(rep.executed, 0);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new());
         // nothing uploaded as file `K`
@@ -1950,7 +2276,7 @@ mod tests {
         let plan = crate::build_plan(&local, &store, Mode::Status, &PlanOpts::default())
             .unwrap()
             .plan;
-        let rep = execute_plan(&local, &store, &plan, Mode::Status, &PlanOpts::default());
+        let rep = execute_plan(&local, &store, &plan, Mode::Status, &PlanOpts::default(), 1);
         assert_eq!(rep.executed, 0);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new());
         // no upload of a.md, no download of b.md
