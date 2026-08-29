@@ -3098,4 +3098,170 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn execute_plan_with_progress_status_emits_no_events() {
+        // PR 28 r1 F9(a): `Mode::Status` emits zero progress events at the
+        // executor boundary - no PassStart/KeyDone/PassEnd and no terminal
+        // RunEnd - and the report stays the empty default. Mutation-checked:
+        // removing the `if mode == Mode::Status { return rep; }` early
+        // return turns this pin RED (events would appear).
+        let dir = TempDir::new("vaultsync-exec");
+        std::fs::write(dir.join("a.md"), "hello").unwrap();
+        let store = MemoryStore::new();
+        put_str(&store, "b.md", "remote", Some(100));
+        let local = LocalFs::new(dir.path());
+        let plan = crate::build_plan(&local, &store, Mode::Status, &PlanOpts::default())
+            .unwrap()
+            .plan;
+        assert!(!plan.actions.is_empty(), "plan must be non-empty");
+        let prog = RecordingProgress::new();
+        let rep = execute_plan_with_progress(
+            &local,
+            &store,
+            &plan,
+            Mode::Status,
+            &PlanOpts::default(),
+            1,
+            &prog,
+        );
+        assert_eq!(rep, ExecReport::default(), "{:?}", rep);
+        assert!(
+            prog.events().is_empty(),
+            "Status mode must emit no events: {:?}",
+            prog.events()
+        );
+    }
+
+    #[test]
+    fn execute_plan_with_progress_passes_bracket_in_plan_order() {
+        // PR 28 r1 F9(b): multi-pass bracketing order at the executor
+        // boundary. A push --delete plan with an upload AND a remote-only
+        // delete emits exactly one Upload bracket, then exactly one
+        // DeleteRemote bracket (strict pass ordering, no cross-pass
+        // interleave), and one terminal RunEnd as the final event.
+        // Mutation-checked: emitting the delete bracket before the upload, or
+        // dropping a PassEnd, turns this pin RED.
+        let dir = TempDir::new("vaultsync-exec");
+        std::fs::write(dir.join("a.md"), "hello").unwrap();
+        let store = MemoryStore::new();
+        put_str(&store, "gone.md", "x", Some(100));
+        let local = LocalFs::new(dir.path());
+        let opts = PlanOpts {
+            delete: true,
+            ..Default::default()
+        };
+        let plan = crate::build_plan(&local, &store, Mode::Push, &opts)
+            .unwrap()
+            .plan;
+        assert!(plan.actions.iter().any(|a| a.kind == ActionKind::Upload));
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| a.kind == ActionKind::DeleteRemote)
+        );
+        let prog = RecordingProgress::new();
+        let rep = execute_plan_with_progress(&local, &store, &plan, Mode::Push, &opts, 1, &prog);
+        assert_eq!(rep.executed, 2, "one upload + one delete: {:?}", rep);
+        let evs = prog.events();
+        // exactly one of each bracket endpoint
+        let count = |p: fn(&ProgressEvent) -> bool| evs.iter().filter(|e| p(e)).count();
+        assert_eq!(
+            count(|e| matches!(
+                e,
+                ProgressEvent::PassStart {
+                    kind: PassKind::Upload,
+                    ..
+                }
+            )),
+            1
+        );
+        assert_eq!(
+            count(|e| matches!(
+                e,
+                ProgressEvent::PassEnd {
+                    kind: PassKind::Upload
+                }
+            )),
+            1
+        );
+        assert_eq!(
+            count(|e| matches!(
+                e,
+                ProgressEvent::PassStart {
+                    kind: PassKind::DeleteRemote,
+                    ..
+                }
+            )),
+            1
+        );
+        assert_eq!(
+            count(|e| matches!(
+                e,
+                ProgressEvent::PassEnd {
+                    kind: PassKind::DeleteRemote
+                }
+            )),
+            1
+        );
+        // each bracket is well-formed (start before end)
+        let ps_u = evs
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    ProgressEvent::PassStart {
+                        kind: PassKind::Upload,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let pe_u = evs
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    ProgressEvent::PassEnd {
+                        kind: PassKind::Upload
+                    }
+                )
+            })
+            .unwrap();
+        let ps_d = evs
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    ProgressEvent::PassStart {
+                        kind: PassKind::DeleteRemote,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let pe_d = evs
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    ProgressEvent::PassEnd {
+                        kind: PassKind::DeleteRemote
+                    }
+                )
+            })
+            .unwrap();
+        assert!(ps_u < pe_u && ps_d < pe_d, "brackets well-formed: {evs:?}");
+        assert!(
+            pe_u < ps_d,
+            "upload pass must end before the delete pass starts: {evs:?}"
+        );
+        assert_eq!(
+            evs.last(),
+            Some(&ProgressEvent::RunEnd {
+                executed: 2,
+                failed: 0
+            })
+        );
+    }
 }
