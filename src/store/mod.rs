@@ -374,22 +374,27 @@ mod tests {
     }
 
     /// Store wrapper that gauges the max number of concurrent `head` calls
-    /// (I20 cycle 5 overlap probe - gauges, never wall-clock).
+    /// (I20 cycle 5 / I17-gauges: Condvar rendezvous, never wall-clock /
+    /// never `yield_now`).
     struct GaugedHeadStore {
         inner: MemoryStore,
-        in_flight: std::sync::atomic::AtomicUsize,
-        max_in_flight: std::sync::atomic::AtomicUsize,
+        rendezvous: crate::testutil::OverlapRendezvous,
     }
     impl GaugedHeadStore {
-        fn new() -> Self {
+        /// `n_workers` is the concurrency under test (pool size); the
+        /// rendezvous target is 2 (any real overlap).
+        fn new(n_workers: usize) -> Self {
             GaugedHeadStore {
                 inner: MemoryStore::new(),
-                in_flight: std::sync::atomic::AtomicUsize::new(0),
-                max_in_flight: std::sync::atomic::AtomicUsize::new(0),
+                rendezvous: crate::testutil::OverlapRendezvous::new(
+                    2,
+                    n_workers,
+                    std::time::Duration::from_secs(5),
+                ),
             }
         }
         fn max_in_flight(&self) -> usize {
-            self.max_in_flight.load(std::sync::atomic::Ordering::SeqCst)
+            self.rendezvous.max_in_flight()
         }
     }
     impl ObjectStore for GaugedHeadStore {
@@ -397,16 +402,9 @@ mod tests {
             self.inner.list(prefix)
         }
         fn head(&self, key: &str) -> Result<Entity, Error> {
-            let cur = self
-                .in_flight
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                + 1;
-            self.max_in_flight
-                .fetch_max(cur, std::sync::atomic::Ordering::SeqCst);
-            std::thread::yield_now();
+            self.rendezvous.enter();
             let r = self.inner.head(key);
-            self.in_flight
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            self.rendezvous.leave();
             r
         }
         fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
@@ -471,13 +469,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "yield_now overlap gauge flaky under full-suite scheduling (pre-existing; observed on the pristine baseline); reliability deferred to issue #17 - run via --ignored"]
     fn enrich_heads_bounded_parallel() {
-        // I20 cycle 5: a 32-object enrichment at concurrency 4 fans out - the
-        // max-in-flight `head` gauge must exceed 1 (real overlap), stay <= 4,
+        // I20 cycle 5 / I17-gauges (W157): a 32-object enrichment at
+        // concurrency 4 fans out - the max-in-flight `head` gauge must exceed
+        // 1 (real overlap via Condvar rendezvous, not yield_now), stay <= 4,
         // and the enriched listing (order included) must equal the
         // concurrency-1 result exactly.
-        let store = GaugedHeadStore::new();
+        let store = GaugedHeadStore::new(4);
         for i in 0..32 {
             let mut c = std::io::Cursor::new(b"x".to_vec());
             store
@@ -501,17 +499,20 @@ mod tests {
     fn enrich_parallel_vanished_warning_order_stable() {
         // I20 cycle 5: vanished keys interleaved with healthy ones - the
         // bounded warning names them in listing order, identical across runs
-        // and identical to the concurrency-1 result.
-        let store = GaugedHeadStore::new();
+        // and identical to the concurrency-1 result. Uses MemoryStore (not
+        // GaugedHeadStore): this test is an order/determinism pin, not an
+        // overlap gauge, and the Condvar rendezvous would deadlock on the
+        // concurrency-1 leg (single-threaded enter never hits target=2).
+        let store = MemoryStore::new();
         let mut entities = Vec::new();
         let mut c = std::io::Cursor::new(b"a".to_vec());
-        store.inner.put_from("a.md", &mut c, 1, Some(100)).unwrap();
+        store.put_from("a.md", &mut c, 1, Some(100)).unwrap();
         entities.push(file("a.md", 1, Some(9_999_999)));
         for i in 0..7 {
             entities.push(file(&format!("gone-{i}.md"), 5, Some(9_999_999)));
         }
         let mut c = std::io::Cursor::new(b"z".to_vec());
-        store.inner.put_from("z.md", &mut c, 1, Some(200)).unwrap();
+        store.put_from("z.md", &mut c, 1, Some(200)).unwrap();
         entities.push(file("z.md", 1, Some(9_999_999)));
         let listing = Listing {
             entities,
