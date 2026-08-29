@@ -17,12 +17,13 @@
 //! plans compare client mtimes, not upload `LastModified`.
 //!
 //! Cost (accepted, I15): a list-driven plan costs 1+ ListObjectsV2 page
-//! requests plus N HeadObject requests (N = remote objects under the prefix),
-//! latency ~ N x RTT. Sequential heads until Phase 3's request-pool work
-//! (I15-concurrency; see roadmap decision log). Head failures are fail-closed
-//! except a NotFound drop (I15-errors): a NotFound head (object deleted
-//! between LIST and HEAD) drops the row; any other head error fails the
-//! listing.
+//! requests plus N HeadObject requests (N = remote objects under the prefix).
+//! Since issue 20 the N heads fan out through the same bounded pool as the
+//! transfer passes, capped by `[transfer].concurrency` (I20-heads; `1` =
+//! sequential). Wall-clock is ~ (N / concurrency) x RTT rather than N x RTT.
+//! Head failures are fail-closed except a NotFound drop (I15-errors): a
+//! NotFound head (object deleted between LIST and HEAD) drops the row; any
+//! other head error fails the listing.
 //!
 //! Streaming: `get_to` streams the object body to the caller's writer;
 //! `put_from` buffers the reader to a temp file on disk and streams that file
@@ -100,9 +101,13 @@ impl S3Store {
         // be cheap and idempotent, and test binaries constructing many
         // stores must not re-scan the OS temp dir on every call.
         reap_stale_upload_temps_once();
-        // W48: a current-thread runtime matches the one-`block_on`-at-a-time
-        // sync architecture (each call `block_on`s once); a multi-thread
-        // runtime would add worker threads with no parallelization benefit.
+        // W48 / I20-w48: keep a current-thread runtime. Issue 20 cycle 2
+        // measured concurrent `block_on` from the std worker pool on ONE
+        // current-thread runtime: futures complete correctly AND overlap in
+        // wall-clock (`concurrent_block_on_{completes,overlaps}`). A
+        // multi-thread runtime (+ `rt-multi-thread`) is therefore not
+        // required - the pool supplies concurrency; this runtime multiplexes
+        // the in-flight `block_on` calls.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

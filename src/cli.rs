@@ -1106,8 +1106,10 @@ mod tests {
 
     #[test]
     fn parse_yes_rejected_until_phase3() {
-        // `--yes` / `--max-delete` / `--concurrency` are Phase 3 rails; until
-        // then they are unknown flags.
+        // `--yes` / `--max-delete` stay Phase 3 rails (unknown until those
+        // land). `--concurrency` is rejected too, but for a different reason:
+        // the knob is config-only (`[transfer].concurrency`, live since
+        // issue 20) - there is deliberately no CLI flag.
         for tok in ["--yes", "--max-delete=5", "--concurrency=4"] {
             let mut args = a();
             args.push("push".into());
