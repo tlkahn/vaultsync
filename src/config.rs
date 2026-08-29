@@ -239,9 +239,11 @@ pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings,
 /// Resolve + validate `[transfer.retry]` (I8): each absent field falls back
 /// to the AWS SDK standard-mode default (per-field, not all-or-nothing); an
 /// absent section resolves to the full default. Validation is loud (W56
-/// ethos) and names the offending config key(s): `max_attempts >= 1` (1
-/// deliberately disables retries, matching `RetryConfig::disabled()`) and
-/// `base_delay_ms <= max_delay_ms`.
+/// ethos) and names the offending config key(s), in order:
+/// `max_attempts >= 1` (1 deliberately disables retries, matching
+/// `RetryConfig::disabled()`); `base_delay_ms >= 1` and `max_delay_ms >= 1`
+/// (SDK requires non-zero backoffs; checked before the base>max rule so a
+/// lone zero names the right key); then `base_delay_ms <= max_delay_ms`.
 fn resolve_retry(transfer: Option<&TransferConfig>) -> Result<RetrySettings, Error> {
     let r = transfer.and_then(|t| t.retry.as_ref());
     let max_attempts = r
