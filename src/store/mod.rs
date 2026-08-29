@@ -99,9 +99,6 @@ pub trait ObjectStore {
 /// `warnings` are preserved verbatim; only `mtime_ms` and `etag` are
 /// overridden from the head result (`size` stays as listed - a mid-list
 /// rewrite race is out of scope, and `plan()` tolerates either value).
-// W113: the `#[allow(dead_code)]` below exists only because the production
-// caller (`S3Store::list`) lands in W113; it is removed in that same commit.
-#[allow(dead_code)]
 pub(crate) fn enrich_with_head_mtimes<S: ObjectStore + ?Sized>(
     store: &S,
     listing: Listing,
