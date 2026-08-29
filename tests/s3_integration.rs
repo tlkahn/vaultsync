@@ -38,19 +38,24 @@ fn unique_num() -> u64 {
 /// Skip-or-require decision for the bucket env gate (I6-sentinel, issue #6).
 /// Pure function so it is unit-testable without mutating process env
 /// (edition 2024 makes `std::env::set_var` unsafe; parallel tests would race
-/// on env anyway). Returns `Ok(Some(bucket))` to run, `Ok(None)` to skip
-/// (caller prints the `[skip]` note), `Err(msg)` when require mode is on and
-/// the bucket is missing - the caller panics with the message.
+/// on env anyway). An unset OR empty/whitespace-only value counts as missing:
+/// in GitHub Actions a deleted repo variable expands to `""`, which must hit
+/// the same sentinel path rather than failing later with an opaque
+/// "failed to construct request" from the S3 client. Returns
+/// `Ok(Some(bucket))` to run, `Ok(None)` to skip (caller prints the `[skip]`
+/// note), `Err(msg)` when require mode is on and the bucket is missing - the
+/// caller panics with the message.
 fn bucket_or_skip(
     bucket: Option<String>,
     require: bool,
     name: &str,
 ) -> Result<Option<String>, String> {
-    match (bucket, require) {
-        (Some(b), _) => Ok(Some(b)),
-        (None, false) => Ok(None),
-        (None, true) => Err(format!(
-            "{name}: VAULTSYNC_TEST_S3_BUCKET is unset but \
+    let missing = bucket.as_deref().map(str::trim).unwrap_or("").is_empty();
+    match (missing, require) {
+        (false, _) => Ok(bucket),
+        (true, false) => Ok(None),
+        (true, true) => Err(format!(
+            "{name}: VAULTSYNC_TEST_S3_BUCKET is unset or empty but \
              VAULTSYNC_TEST_S3_REQUIRE=1 - refusing to silently skip"
         )),
     }
@@ -616,6 +621,18 @@ fn bucket_or_skip_sentinel_unit() {
         bucket_or_skip(None, false, "t").unwrap(),
         None,
         "bucket missing, require off: skip"
+    );
+    // Empty string counts as missing (break-test finding: a deleted GitHub
+    // repo variable expands to "", not to an unset var).
+    assert_eq!(
+        bucket_or_skip(Some(String::new()), false, "t").unwrap(),
+        None,
+        "bucket empty, require off: skip"
+    );
+    let err = bucket_or_skip(Some(String::new()), true, "t").unwrap_err();
+    assert!(
+        err.contains("VAULTSYNC_TEST_S3_BUCKET") && err.contains("VAULTSYNC_TEST_S3_REQUIRE"),
+        "bucket empty, require on: loud failure naming both vars: {err}"
     );
     let err = bucket_or_skip(None, true, "t").unwrap_err();
     assert!(
