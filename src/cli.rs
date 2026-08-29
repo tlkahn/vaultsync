@@ -8,8 +8,10 @@
 //!   accepted **before or after** the subcommand (clap `global = true`).
 //! - `--json` parses in Phase 2 but dispatch rejects it as "not implemented"
 //!   (schema stability is Phase 3).
-//! - `--yes` / `--max-delete` / `--concurrency` are rejected as unknown until
-//!   Phase 3 (delete-safety rails are Phase 3).
+//! - `--yes` / `--max-delete` are rejected as unknown until Phase 3
+//!   (delete-safety rails are Phase 3). `--concurrency` stays rejected as
+//!   unknown: the knob is config-only (`[transfer].concurrency`, live since
+//!   issue 20 - it bounds transfer passes and list-enrichment heads).
 //! - Every parse error includes usage (clap does this natively).
 
 use std::ffi::OsString;
@@ -294,6 +296,7 @@ pub fn run_with_io(
     cmd: Command,
     store: &dyn ObjectStore,
     tolerance_ms: u64,
+    concurrency: u32,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
@@ -394,6 +397,7 @@ pub fn run_with_io(
                 dry_run,
                 follow_symlinks,
                 verbose,
+                concurrency,
             };
             dispatch_plan(&vault, store, Mode::Push, &opts, &flags, out, err)
         }
@@ -421,6 +425,7 @@ pub fn run_with_io(
                 dry_run,
                 follow_symlinks,
                 verbose,
+                concurrency,
             };
             dispatch_plan(&vault, store, Mode::Pull, &opts, &flags, out, err)
         }
@@ -454,11 +459,13 @@ fn print_walk_warnings(local: &crate::local::LocalFs, follow: bool, err: &mut dy
 
 /// Push/pull value flags bundled so `dispatch_plan` stays under clippy's
 /// 7-argument limit (W18/B-L9) while keeping the dry-run/verbosity/symlink
-/// plumbing in one place.
+/// plumbing in one place. `concurrency` rides along (I20: resolved
+/// `[transfer].concurrency`, bounds the transfer passes; 1 = sequential).
 struct PlanFlags {
     dry_run: bool,
     follow_symlinks: bool,
     verbose: u8,
+    concurrency: u32,
 }
 
 /// Build a plan and dispatch push/pull execution.
@@ -496,7 +503,10 @@ fn dispatch_plan(
             if flags.dry_run {
                 if is_clean(plan) { 0 } else { 2 }
             } else {
-                let report = crate::exec::execute_plan(&local, store, plan, mode, opts, 1);
+                // I20: `[transfer].concurrency` bounds the transfer passes
+                // (1 = sequential).
+                let report =
+                    crate::exec::execute_plan(&local, store, plan, mode, opts, flags.concurrency);
                 for w in &report.warnings {
                     let _ = writeln!(err, "warning: {w}");
                 }
@@ -645,7 +655,8 @@ fn run_with_settings(
     let store: Box<dyn ObjectStore> = if settings.store.bucket.is_empty() {
         Box::new(MemoryStore::new())
     } else {
-        match crate::store::s3::S3Store::new(&settings.store, &settings.retry, 1) {
+        match crate::store::s3::S3Store::new(&settings.store, &settings.retry, settings.concurrency)
+        {
             Ok(s) => Box::new(s),
             Err(e) => {
                 let _ = writeln!(err, "error: {e}");
@@ -666,20 +677,6 @@ fn run_with_settings_store(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
-    // W28/M6: `[transfer].concurrency` is a Phase 3 feature (inert until the
-    // pool exists). An explicitly-set value that DIVERGES from the default is
-    // warned every run; an explicit copy of the default is silent (R5-M3 - it
-    // is behaviorally indistinguishable from omitting the key, so the
-    // documented example config must not warn on every run).
-    if settings.concurrency_explicitly_set
-        && settings.concurrency != crate::config::DEFAULT_CONCURRENCY
-    {
-        let _ = writeln!(
-            err,
-            "warning: [transfer].concurrency = {} is a Phase 3 feature and is not yet applied; transfers stay sequential",
-            settings.concurrency
-        );
-    }
     // W25/M3: `[ignore].patterns` is a Phase 3 feature (parsed but not yet
     // applied). A mutating command that would silently not apply it must
     // refuse loudly; `status` (read-only) warns and proceeds with the plan.
@@ -714,7 +711,14 @@ fn run_with_settings_store(
     // Merge the config vault_root into the command when --vault was unset.
     let cmd = resolve_vault_from_config(cmd, settings);
 
-    run_with_io(cmd, store, settings.mtime_tolerance_ms, out, err)
+    run_with_io(
+        cmd,
+        store,
+        settings.mtime_tolerance_ms,
+        settings.concurrency,
+        out,
+        err,
+    )
 }
 
 /// Entry point used by `main`: args from env, config load, store dispatch,
@@ -748,7 +752,7 @@ pub fn run_from_env() -> i32 {
     // help/version need no config and must not fail on a bad config file.
     if matches!(cmd, Command::Help | Command::Version) {
         // help/version need no tolerance; the value is unused for these.
-        return run_with_io(cmd, &MemoryStore::new(), 0, &mut out, &mut err);
+        return run_with_io(cmd, &MemoryStore::new(), 0, 1, &mut out, &mut err);
     }
 
     // Load + resolve config.
@@ -809,7 +813,6 @@ mod tests {
             concurrency: 4,
             retry: crate::config::RetrySettings::default(),
             ignore_patterns: Vec::new(),
-            concurrency_explicitly_set: false,
         };
         // explicit --vault wins over the config root
         let cli_explicit = Command::status(PathBuf::from("/cli/vault"));
@@ -1172,7 +1175,7 @@ mod tests {
     fn run_tol(cmd: Command, store: &dyn ObjectStore, tolerance_ms: u64) -> (i32, String, String) {
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_with_io(cmd, store, tolerance_ms, &mut out, &mut err);
+        let code = run_with_io(cmd, store, tolerance_ms, 1, &mut out, &mut err);
         (
             code,
             String::from_utf8(out).unwrap(),
@@ -1402,7 +1405,6 @@ mod tests {
             concurrency: 4,
             retry: crate::config::RetrySettings::default(),
             ignore_patterns: Vec::new(),
-            concurrency_explicitly_set: false,
         }
     }
 
@@ -1484,42 +1486,13 @@ mod tests {
     }
 
     #[test]
-    fn run_does_not_warn_on_explicit_default_concurrency() {
-        // R5-M3: copying `concurrency = 4` (== DEFAULT_CONCURRENCY) into the
-        // config is behaviorally indistinguishable from omitting the key, so
-        // it must be silent - otherwise the documented example warns on every
-        // run including `status`. Fails today (warns on any explicitly-set
-        // value regardless of whether it diverges).
+    fn run_silent_on_configured_concurrency() {
+        // I20-cli: `[transfer].concurrency` is live (issue 20); an explicitly
+        // set value (8) must NOT warn - no "Phase 3"/"concurrency" text on
+        // stderr - and the run proceeds. RED today: the W28/M6 warning fires
+        // for a divergent explicit value.
         let dir = TempDir::new("vaultsync-cli-test");
         let mut settings = no_store_settings(dir.path());
-        settings.concurrency_explicitly_set = true;
-        settings.concurrency = crate::config::DEFAULT_CONCURRENCY;
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let code = run_with_settings(
-            Command::status(dir.path().into()),
-            &settings,
-            &mut out,
-            &mut err,
-        );
-        let err = String::from_utf8(err).unwrap();
-        assert_eq!(code, 0);
-        assert!(
-            !err.to_lowercase().contains("concurrency"),
-            "explicit-default concurrency warned: {err}"
-        );
-    }
-
-    #[test]
-    fn run_warns_on_configured_concurrency() {
-        // W28/M6 amended for R5-M3: an explicitly-set value that DIVERGES from
-        // the default (`concurrency = 8`) is inert until Phase 3 (the pool
-        // does not exist); warn on stderr every run, exit 0. An explicit copy
-        // of the default stays silent (see
-        // run_does_not_warn_on_explicit_default_concurrency).
-        let dir = TempDir::new("vaultsync-cli-test");
-        let mut settings = no_store_settings(dir.path());
-        settings.concurrency_explicitly_set = true;
         settings.concurrency = 8;
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -1532,29 +1505,8 @@ mod tests {
         let err = String::from_utf8(err).unwrap();
         assert_eq!(code, 0);
         assert!(
-            err.to_lowercase().contains("concurrency") && err.to_lowercase().contains("phase 3"),
-            "expected inert-concurrency warning: {err}"
-        );
-    }
-
-    #[test]
-    fn run_does_not_warn_without_configured_concurrency() {
-        // W28/M6: only an explicitly-set value warns; the default must not.
-        let dir = TempDir::new("vaultsync-cli-test");
-        let settings = no_store_settings(dir.path()); // flag false
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let code = run_with_settings(
-            Command::status(dir.path().into()),
-            &settings,
-            &mut out,
-            &mut err,
-        );
-        let err = String::from_utf8(err).unwrap();
-        assert_eq!(code, 0);
-        assert!(
-            !err.to_lowercase().contains("concurrency"),
-            "spurious concurrency warning: {err}"
+            !err.to_lowercase().contains("concurrency") && !err.to_lowercase().contains("phase 3"),
+            "concurrency must be live and silent: {err}"
         );
     }
 

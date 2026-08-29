@@ -110,10 +110,6 @@ pub struct Settings {
     /// is surfaced loudly - never silently applied - so a user copying the
     /// cli.md example is not let to believe patterns are in effect.
     pub ignore_patterns: Vec<String>,
-    /// True when the TOML explicitly set `[transfer].concurrency` (W28/M6):
-    /// inert until Phase 3 (the pool does not exist), so dispatch warns rather
-    /// than silently accepting it.
-    pub concurrency_explicitly_set: bool,
 }
 
 /// Resolved retry policy (I8). Milliseconds at this layer; `Duration`
@@ -232,7 +228,6 @@ pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings,
         .map(|i| i.patterns.clone())
         .unwrap_or_default();
     let retry = resolve_retry(cfg.transfer.as_ref())?;
-    let concurrency_explicitly_set = cfg.transfer.as_ref().and_then(|t| t.concurrency).is_some();
     Ok(Settings {
         vault_root,
         store,
@@ -240,7 +235,6 @@ pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings,
         concurrency,
         retry,
         ignore_patterns,
-        concurrency_explicitly_set,
     })
 }
 
