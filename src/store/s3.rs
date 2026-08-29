@@ -58,7 +58,7 @@ const MAX_SINGLE_PUT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 /// maps to the SDK's own `RetryConfig::standard()` (3 / 1s / 20s), so a
 /// default-config run is a no-op change in flight. Pure builder + getters,
 /// hence unit-testable offline.
-pub fn build_retry_config(retry: &RetrySettings) -> aws_sdk_s3::config::retry::RetryConfig {
+pub(crate) fn build_retry_config(retry: &RetrySettings) -> aws_sdk_s3::config::retry::RetryConfig {
     aws_sdk_s3::config::retry::RetryConfig::standard()
         .with_max_attempts(retry.max_attempts)
         .with_initial_backoff(std::time::Duration::from_millis(retry.base_delay_ms))
