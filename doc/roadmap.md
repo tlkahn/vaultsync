@@ -35,14 +35,18 @@ Tracked on GitHub: #14 (tracking issue) with sub-issues #3-#13 in priority tiers
 2. Ignore patterns + Obsidian default profile (`[ignore].patterns` already
    parses but is unused, W25/M3; remaining work is walker application plus
    the profile)
-3. Concurrency limits + retries with backoff on transient S3 errors
+3. Concurrency limits (bounded request/transfer pool)
    (`[transfer].concurrency` parses but is inert with a warning, W28/M6;
-   `LocalFs` is already Send/Sync, W82; transfers stay sequential).
-   List-enrichment heads are the request pool's primary consumer: every
-   list-driven plan is currently 1+ ListObjectsV2 pages + N sequential heads
-   (~N x RTT), with only the W117 bounded retry (3 attempts, [100ms, 300ms]
-   fixed backoff) as a stopgap - the "retries with backoff" item is newly
-   load-bearing post-I15 (R2-3) and owns full backoff/jitter/concurrency
+   `LocalFs` is already Send/Sync, W82; transfers stay sequential). The
+   **retries-with-backoff half landed under #8** (I8-retry-sdk below): the
+   SDK standard-mode `[transfer.retry]` `RetryConfig` owns retry/backoff/
+   jitter for all ops, and the W117 head stopgap is retired. The remaining
+   work is bounded **concurrency** (follow-up **#20**): list-enrichment heads
+   are the request pool's primary consumer - every list-driven plan is
+   currently 1+ ListObjectsV2 pages + N sequential heads (~N x RTT).
+   (The SDK's client-side retry quota is shared: parallel workers on the
+   same sustained storm burn the same standard-mode token bucket faster,
+   so the quota interaction belongs in the concurrency design notes.)
 4. Lock file to prevent concurrent runs on same vault
 5. JSON schema stability for `--json` (parses today; dispatch rejects with
    "not implemented (Phase 3)" + exit 1)
@@ -187,11 +191,13 @@ Record choices here as they are made.
 | 2026-08-29 | I15-r1-size-from-head | W115: `enrich_with_head_mtimes` now takes `size` (plus `mtime_ms` and `etag`) from the same `HeadObject`, so the planned entity is one coherent head snapshot - aligning the W106 `CappedWriter` cap and the W62 head-before-delete size check with the mtime identity the planner just trusted; residual race shrinks to the enrich-head -> get/delete-head window. |
 | 2026-08-29 | I15-r1-notfound-warning | W116: a listed key that vanishes before its head is surfaced (not hidden) as one bounded `Listing.warnings` entry (5 names + "and N more"), matching the W70/W79 surface-don't-hide ethos. |
 | 2026-08-29 | I15-r1-head-retry | W117: `Unavailable`/`Timeout` heads are retried up to 3 attempts ([100ms, 300ms] fixed backoff) before failing closed; a stopgap - full backoff/jitter/concurrency stays Phase 3 item 3's request pool. |
+| 2026-08-29 | I8-retry-sdk | Issue #8 (supersedes **W117** / I15-r1-head-retry): transient-error retry/backoff/jitter for **all** S3 ops is owned by the aws-sdk-s3 client's standard-mode `RetryConfig`, configured from a new `[transfer.retry]` config section (`max_attempts` / `base_delay_ms` / `max_delay_ms`, all optional; absent = SDK standard defaults 3 / 1000 / 20000; `max_attempts = 1` disables retries). The W117 head stopgap is retired: enrichment issues exactly one `head()` per object; post-exhaustion transient errors still fail the listing closed (I15-errors unchanged). Mid-body `get_to` connection loss is a documented accepted gap (I8-midbody) - the SDK cannot retry an already-consumed body, so the download fails per-key and the next run converges (sync is idempotent). Config-only knobs, no per-retry logging. Concurrency deferred to follow-up **#20**. |
 | 2026-08-29 | I15-r1-reserved-prefilter | W118: `S3Store::list` partitions reserved-namespace leftovers (`.vaultsync-check-*` / `.*.vaultsync-tmp-*`) out before any head - no wasted requests and no fail-closed scope creep over junk keys; `build_plan`'s partition stays as a second-line guard for other backends (single `reserved_drops_warning` source of truth). |
 | 2026-08-29 | I15-r1-delete-mtime-arm | W119: `DeleteRemote` freshness also refuses a same-size replacement whose mtime drifted beyond the tolerance between plan and delete (post-W113 the planned mtime is the head/`vaultsync-mtime`, retiring the R-c list-skew rationale); residual race is a same-size, within-tolerance replacement. |
 | 2026-08-28 | PR2-W109 reserved-folder-filter | `partition_reserved_remote_keys` strips one trailing `/` before extracting the final segment, so folder-form keys (`.vaultsync-check-1/`, `a/.name.vaultsync-tmp-1-2/`) are filtered like file keys (r12 L4). |
 | 2026-08-29 | I6 integration gate design | Issue #6 (branch `ci/issue-6`): no-silent-skip via a `VAULTSYNC_TEST_S3_REQUIRE=1` require-env sentinel (pure `bucket_or_skip` helper, unit-tested without env mutation - edition 2024 makes `set_var` unsafe) over `#[ignore]`/`--ignored` (worse local ergonomics; the suite would never run by default anywhere). CI auth via GitHub OIDC -> least-privilege IAM role (`id-token: write` on the `integration*` jobs only; trust StringLike-matches both the legacy `repo:tlkahn/vaultsync:*` sub and GitHub's new ID-pinned format `repo:tlkahn@335719/vaultsync@1348364460:*` - the old pattern alone missed the new-format token; `s3:ListBucket`/`Get`/`Put`/`Delete` scoped to the dedicated test bucket's `ci/*` prefix; no long-lived keys in secrets; bucket/region/role ARN in repo variables). Sentinel hardening: an empty `VAULTSYNC_TEST_S3_BUCKET` counts as missing (a deleted repo variable expands to `""`, not unset - PR break-test finding). Trigger split (I6-trigger): PR gate runs the suite minus `s3_integ_list_paginates` (the #17 slowness), nightly cron runs the full suite as regression net + leak tripwire; the `--skip` is dropped and the jobs merge when #17 lands. Dedicated test bucket, all objects under `VAULTSYNC_TEST_S3_PREFIX=ci/`, 7-day lifecycle expiry on `ci/vaultsync-itest-*` as the leak backstop; `timeout-minutes: 20` as the hang guard. Plan: doc/plans/issue-6.md. |
 | 2026-08-29 | I5-r1 review fixes (PR18) | PR 18 review round 1 (issuecomment-5461001543): F1 - workflow runs least-privilege (`permissions: contents: read`); F2 - the MSRV value lives in three places (Cargo.toml `rust-version`, `RUSTUP_TOOLCHAIN`, the msrv job name), now cross-commented to bump in one commit; F3 - the msrv job's current redundancy with the pinned toolchain is intentional (forward guard), no action; F4 - Cargo.toml comment dropped the incorrect "stable ships as x.0.0" claim; F5 - issue-5.md's embedded design YAML marked as an as-designed snapshot. F6 (SHA-pinning `actions/checkout` / `Swatinem/rust-cache`) deferred: tag pinning accepted for now; revisit if the threat model tightens or release workflows (the jobs that would need a write token) are added. Plan: doc/plans/pr-18-fix-5461001543.md. |
+| 2026-08-29 | I8-retry-config-owned | Issue #8 (PR21-r1 M1): vaultsync's S3 retry policy is **config-owned** - absent `[transfer.retry]` hard-pins to the SDK standard defaults (3 / 1000 / 20000) deliberately under D-config-only (TOML owns the knobs). Ambient AWS env/profile retry configuration (`AWS_MAX_ATTEMPTS`, `AWS_RETRY_MODE`, profile `max_attempts`/`retry_mode`, incl. `RetrySpec`, e.g. v2.1) is discarded at client build on purpose (`Builder::retry_config` is a store_put replace and `build_retry_config` always starts from `RetryConfig::standard()`), so the next reader does not "fix" the env path. Rejected-for-now alternative (possible follow-up): start from the SDK-loaded retry config and override only explicitly-set TOML fields (analogous to `concurrency_explicitly_set`) if operators ever need AWS-standard retry tuning. |
 
 ## Open decisions
 

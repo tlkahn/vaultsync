@@ -14,6 +14,16 @@ use crate::error::Error;
 pub const DEFAULT_MTIME_TOLERANCE_MS: u64 = 1000;
 pub const DEFAULT_CONCURRENCY: u32 = 4;
 
+/// AWS SDK standard-mode retry defaults (I8-config): the resolved policy when
+/// `[transfer.retry]` is absent or a field is unset mirrors the SDK's own
+/// `RetryConfig::standard()` numbers (3 attempts / 1s initial / 20s max);
+/// absent/unset fields resolve to those values. This does not make a default
+/// run a no-op vs pre-I8 flight: ambient AWS retry env/profile is replaced at
+/// client build on purpose (I8-retry-config-owned).
+pub const DEFAULT_RETRY_MAX_ATTEMPTS: u32 = 3;
+pub const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 1000;
+pub const DEFAULT_RETRY_MAX_DELAY_MS: u64 = 20000;
+
 /// On-disk config mirroring [cli.md]. All sections optional; defaults applied
 /// at resolution time. Unknown keys anywhere in the file are rejected loudly
 /// (W56, B nit): a typo like `mtime_tolerance` (missing `_ms`) or a
@@ -67,6 +77,23 @@ pub struct TransferConfig {
     pub concurrency: Option<u32>,
     #[serde(default)]
     pub mtime_tolerance_ms: Option<u64>,
+    #[serde(default)]
+    pub retry: Option<RetryConfig>,
+}
+
+/// `[transfer.retry]` section (I8). All fields optional; absent section (or
+/// absent field) resolves to the AWS SDK standard-mode defaults at
+/// [`resolve_settings`] time (3 / 1000 / 20000). Unknown keys are rejected
+/// loudly (W56) via `deny_unknown_fields`, matching the sibling sections.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetryConfig {
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+    #[serde(default)]
+    pub base_delay_ms: Option<u64>,
+    #[serde(default)]
+    pub max_delay_ms: Option<u64>,
 }
 
 /// Fully resolved runtime settings (config + CLI + env merged).
@@ -76,6 +103,9 @@ pub struct Settings {
     pub store: StoreSettings,
     pub mtime_tolerance_ms: u64,
     pub concurrency: u32,
+    /// resolved `[transfer.retry]` policy (I8). Milliseconds at this layer;
+    /// `Duration` conversion happens at the S3 boundary.
+    pub retry: RetrySettings,
     /// Parsed non-empty `[ignore].patterns` (W25/M3). A Phase 3 feature that
     /// is surfaced loudly - never silently applied - so a user copying the
     /// cli.md example is not let to believe patterns are in effect.
@@ -84,6 +114,27 @@ pub struct Settings {
     /// inert until Phase 3 (the pool does not exist), so dispatch warns rather
     /// than silently accepting it.
     pub concurrency_explicitly_set: bool,
+}
+
+/// Resolved retry policy (I8). Milliseconds at this layer; `Duration`
+/// conversion is owned by the S3 boundary (`build_retry_config`). `Default`
+/// is the AWS SDK standard-mode default (3 / 1000 / 20000).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetrySettings {
+    /// Total attempts including the initial one (1 = retries disabled).
+    pub max_attempts: u32,
+    pub base_delay_ms: u64,
+    pub max_delay_ms: u64,
+}
+
+impl Default for RetrySettings {
+    fn default() -> Self {
+        Self {
+            max_attempts: DEFAULT_RETRY_MAX_ATTEMPTS,
+            base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
+            max_delay_ms: DEFAULT_RETRY_MAX_DELAY_MS,
+        }
+    }
 }
 
 /// Resolved store connection settings (no credentials - those stay in the AWS
@@ -172,14 +223,62 @@ pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings,
         .as_ref()
         .map(|i| i.patterns.clone())
         .unwrap_or_default();
+    let retry = resolve_retry(cfg.transfer.as_ref())?;
     let concurrency_explicitly_set = cfg.transfer.as_ref().and_then(|t| t.concurrency).is_some();
     Ok(Settings {
         vault_root,
         store,
         mtime_tolerance_ms,
         concurrency,
+        retry,
         ignore_patterns,
         concurrency_explicitly_set,
+    })
+}
+
+/// Resolve + validate `[transfer.retry]` (I8): each absent field falls back
+/// to the AWS SDK standard-mode default (per-field, not all-or-nothing); an
+/// absent section resolves to the full default. Validation is loud (W56
+/// ethos) and names the offending config key(s), in order:
+/// `max_attempts >= 1` (1 deliberately disables retries, matching
+/// `RetryConfig::disabled()`); `base_delay_ms >= 1` and `max_delay_ms >= 1`
+/// (SDK requires non-zero backoffs; checked before the base>max rule so a
+/// lone zero names the right key); then `base_delay_ms <= max_delay_ms`.
+fn resolve_retry(transfer: Option<&TransferConfig>) -> Result<RetrySettings, Error> {
+    let r = transfer.and_then(|t| t.retry.as_ref());
+    let max_attempts = r
+        .and_then(|r| r.max_attempts)
+        .unwrap_or(DEFAULT_RETRY_MAX_ATTEMPTS);
+    let base_delay_ms = r
+        .and_then(|r| r.base_delay_ms)
+        .unwrap_or(DEFAULT_RETRY_BASE_DELAY_MS);
+    let max_delay_ms = r
+        .and_then(|r| r.max_delay_ms)
+        .unwrap_or(DEFAULT_RETRY_MAX_DELAY_MS);
+    if max_attempts == 0 {
+        return Err(Error::Other(format!(
+            "transfer.retry.max_attempts must be >= 1 (1 disables retries), got {max_attempts}"
+        )));
+    }
+    if base_delay_ms == 0 {
+        return Err(Error::Other(format!(
+            "transfer.retry.base_delay_ms must be >= 1 (the SDK requires a non-zero initial backoff), got {base_delay_ms}"
+        )));
+    }
+    if max_delay_ms == 0 {
+        return Err(Error::Other(format!(
+            "transfer.retry.max_delay_ms must be >= 1 (the SDK requires a non-zero max backoff), got {max_delay_ms}"
+        )));
+    }
+    if base_delay_ms > max_delay_ms {
+        return Err(Error::Other(format!(
+            "transfer.retry.base_delay_ms ({base_delay_ms}) must not exceed transfer.retry.max_delay_ms ({max_delay_ms})"
+        )));
+    }
+    Ok(RetrySettings {
+        max_attempts,
+        base_delay_ms,
+        max_delay_ms,
     })
 }
 
@@ -309,6 +408,11 @@ patterns = [".git/", ".trash/", ".DS_Store"]
 [transfer]
 concurrency = 4
 mtime_tolerance_ms = 1000
+
+[transfer.retry]
+max_attempts = 5
+base_delay_ms = 250
+max_delay_ms = 4000
 "#;
         let cfg = parse_config_str(text).unwrap();
         assert_eq!(
@@ -326,6 +430,213 @@ mtime_tolerance_ms = 1000
         let t = cfg.transfer.unwrap();
         assert_eq!(t.concurrency, Some(4));
         assert_eq!(t.mtime_tolerance_ms, Some(1000));
+        let retry = t.retry.unwrap();
+        assert_eq!(retry.max_attempts, Some(5));
+        assert_eq!(retry.base_delay_ms, Some(250));
+        assert_eq!(retry.max_delay_ms, Some(4000));
+    }
+
+    #[test]
+    fn config_parse_retry_section() {
+        // I8-config: `[transfer.retry]` parses into the three optional fields
+        // on `FileConfig.transfer.retry` (defaults applied later at
+        // resolution). RED: `TransferConfig` has no `retry` field yet
+        // (compile failure).
+        let text = r#"
+[transfer.retry]
+max_attempts = 5
+base_delay_ms = 250
+max_delay_ms = 4000
+"#;
+        let cfg = parse_config_str(text).unwrap();
+        let t = cfg.transfer.unwrap();
+        assert_eq!(t.concurrency, None, "concurrency stays unset");
+        let retry = t.retry.unwrap();
+        assert_eq!(retry.max_attempts, Some(5));
+        assert_eq!(retry.base_delay_ms, Some(250));
+        assert_eq!(retry.max_delay_ms, Some(4000));
+    }
+
+    #[test]
+    fn resolve_settings_retry_defaults_sdk_standard() {
+        // I8-config: no `[transfer.retry]` section => the resolved retry
+        // policy is the AWS SDK standard-mode default (3 / 1000 / 20000),
+        // pinned against the DEFAULT_RETRY_* constants. RED:
+        // `Settings.retry` does not exist yet (compile failure).
+        let cfg = FileConfig::default();
+        let s = settings(&cfg).unwrap();
+        assert_eq!(
+            s.retry,
+            RetrySettings {
+                max_attempts: DEFAULT_RETRY_MAX_ATTEMPTS,
+                base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
+                max_delay_ms: DEFAULT_RETRY_MAX_DELAY_MS,
+            },
+            "absent [transfer.retry] resolves to SDK standard defaults"
+        );
+    }
+
+    #[test]
+    fn resolve_settings_retry_partial_fills_defaults() {
+        // I8-config: per-field resolution - setting only `max_attempts`
+        // leaves the delays at their SDK defaults (not all-or-nothing).
+        let text = "[transfer.retry]\nmax_attempts = 5\n";
+        let cfg = parse_config_str(text).unwrap();
+        let s = settings(&cfg).unwrap();
+        assert_eq!(s.retry.max_attempts, 5);
+        assert_eq!(s.retry.base_delay_ms, DEFAULT_RETRY_BASE_DELAY_MS);
+        assert_eq!(s.retry.max_delay_ms, DEFAULT_RETRY_MAX_DELAY_MS);
+    }
+
+    #[test]
+    fn resolve_settings_retry_full_override() {
+        // I8-config: all three set => all three resolved verbatim.
+        let text = "[transfer.retry]\nmax_attempts = 7\nbase_delay_ms = 50\nmax_delay_ms = 5000\n";
+        let cfg = parse_config_str(text).unwrap();
+        let s = settings(&cfg).unwrap();
+        assert_eq!(s.retry.max_attempts, 7);
+        assert_eq!(s.retry.base_delay_ms, 50);
+        assert_eq!(s.retry.max_delay_ms, 5000);
+    }
+
+    #[test]
+    fn resolve_settings_retry_rejects_zero_max_attempts() {
+        // I8-validation (W56 loud-config ethos): max_attempts = 0 is invalid
+        // (the SDK requires >= 1; 1 disables retries, 0 is meaningless). Reject
+        // with an error naming the config key. RED: resolves with no error.
+        let text = "[transfer.retry]\nmax_attempts = 0\n";
+        let cfg = parse_config_str(text).unwrap();
+        let err = settings(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transfer.retry.max_attempts"),
+            "must name transfer.retry.max_attempts: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_settings_retry_allows_max_attempts_1() {
+        // I8-config: max_attempts = 1 is valid and deliberately disables
+        // retries (matches `RetryConfig::disabled()` semantics) - must not be
+        // rejected with the zero rule.
+        let text = "[transfer.retry]\nmax_attempts = 1\n";
+        let cfg = parse_config_str(text).unwrap();
+        let s = settings(&cfg).unwrap();
+        assert_eq!(s.retry.max_attempts, 1);
+    }
+
+    #[test]
+    fn resolve_settings_retry_rejects_base_above_max() {
+        // I8-validation (W56): base_delay_ms > max_delay_ms is self-
+        // contradictory; reject with an error naming both keys.
+        let text = "[transfer.retry]\nbase_delay_ms = 5000\nmax_delay_ms = 1000\n";
+        let cfg = parse_config_str(text).unwrap();
+        let err = settings(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transfer.retry.base_delay_ms")
+                && msg.contains("transfer.retry.max_delay_ms"),
+            "must name both keys: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_settings_retry_rejects_lone_delay_against_default_counterpart() {
+        // I8-validation (PR21-r2 L5 / W144): per-field defaults mean validation
+        // runs against the filled mix (cli.md W136). A lone max_delay_ms = 500
+        // fails against default base 1000; a lone base_delay_ms = 30000 fails
+        // against default max 20000. Both must name both keys (same surface as
+        // the both-set base>max error).
+        // Mutation-checked: removing the base>max branch flips this RED.
+        let text = "[transfer.retry]\nmax_delay_ms = 500\n";
+        let cfg = parse_config_str(text).unwrap();
+        let err = settings(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transfer.retry.base_delay_ms")
+                && msg.contains("transfer.retry.max_delay_ms"),
+            "lone max_delay_ms = 500 must fail naming both keys against default base: {msg}"
+        );
+
+        let text = "[transfer.retry]\nbase_delay_ms = 30000\n";
+        let cfg = parse_config_str(text).unwrap();
+        let err = settings(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transfer.retry.base_delay_ms")
+                && msg.contains("transfer.retry.max_delay_ms"),
+            "lone base_delay_ms = 30000 must fail naming both keys against default max: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_settings_retry_rejects_zero_base_delay() {
+        // I8-validation (W130, M2): the SDK requires a non-zero initial
+        // backoff, so `base_delay_ms = 0` must be rejected naming
+        // transfer.retry.base_delay_ms.
+        // RED: resolves fine today (0 <= 20000 default max).
+        let text = "[transfer.retry]\nmax_attempts = 5\nbase_delay_ms = 0\nmax_delay_ms = 20000\n";
+        let cfg = parse_config_str(text).unwrap();
+        let err = settings(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transfer.retry.base_delay_ms") && msg.contains(">= 1"),
+            "must name base_delay_ms with a non-zero reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_settings_retry_rejects_zero_max_delay() {
+        // I8-validation (W130, M2): the SDK requires a non-zero max backoff.
+        // Two sub-cases per the reviewer's example.
+        // RED (lone max_delay_ms = 0): today errors via the base>max rule
+        // naming both keys with the wrong reason; a max_delay_ms = 0 alone
+        // with the default base (1000) must instead name max_delay_ms with a
+        // non-zero reason.
+        let text = "[transfer.retry]\nmax_attempts = 5\nmax_delay_ms = 0\n";
+        let cfg = parse_config_str(text).unwrap();
+        let err = settings(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transfer.retry.max_delay_ms") && msg.contains(">= 1"),
+            "must name max_delay_ms with a non-zero reason: {msg}"
+        );
+
+        // RED (base and max both 0): resolves today (0 <= 0); must error.
+        let text = "[transfer.retry]\nmax_attempts = 5\nbase_delay_ms = 0\nmax_delay_ms = 0\n";
+        let cfg = parse_config_str(text).unwrap();
+        let err = settings(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transfer.retry.base_delay_ms") && msg.contains(">= 1"),
+            "must name base_delay_ms first for the both-zero case: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_settings_retry_allows_equal_base_and_max() {
+        // I8-validation (W130, M2 boundary pin): base == max with both > 0
+        // is valid (reviewer: "equal base==max with both > 0 is fine").
+        let text = "[transfer.retry]\nmax_attempts = 5\nbase_delay_ms = 500\nmax_delay_ms = 500\n";
+        let cfg = parse_config_str(text).unwrap();
+        let s = settings(&cfg).unwrap();
+        assert_eq!(s.retry.base_delay_ms, 500);
+        assert_eq!(s.retry.max_delay_ms, 500);
+    }
+
+    #[test]
+    fn config_unknown_retry_key_rejected() {
+        // W56 (B nit): an unknown key inside `[transfer.retry]` (here a
+        // `max_attemps` typo, missing the second `t`) is a loud parse error
+        // naming the key, matching `config_unknown_transfer_key_rejected`.
+        // RED: `RetryConfig` does not exist yet (compile failure).
+        let text = "[transfer.retry]\nmax_attemps = 3\n";
+        let err = parse_config_str(text).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("max_attemps"),
+            "unknown retry key not named in: {msg}"
+        );
     }
 
     #[test]

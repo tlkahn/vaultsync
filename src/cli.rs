@@ -645,7 +645,7 @@ fn run_with_settings(
     let store: Box<dyn ObjectStore> = if settings.store.bucket.is_empty() {
         Box::new(MemoryStore::new())
     } else {
-        match crate::store::s3::S3Store::new(&settings.store) {
+        match crate::store::s3::S3Store::new(&settings.store, &settings.retry) {
             Ok(s) => Box::new(s),
             Err(e) => {
                 let _ = writeln!(err, "error: {e}");
@@ -807,6 +807,7 @@ mod tests {
             },
             mtime_tolerance_ms: 1000,
             concurrency: 4,
+            retry: crate::config::RetrySettings::default(),
             ignore_patterns: Vec::new(),
             concurrency_explicitly_set: false,
         };
@@ -1399,6 +1400,7 @@ mod tests {
             },
             mtime_tolerance_ms: 1000,
             concurrency: 4,
+            retry: crate::config::RetrySettings::default(),
             ignore_patterns: Vec::new(),
             concurrency_explicitly_set: false,
         }

@@ -97,7 +97,17 @@ region = "us-west-2"
 # concurrency = 4   # Phase 3 (parallel transfers are not yet applied); an explicit copy of the default is silent
 mtime_tolerance_ms = 1000
 # max_delete = 100
+
+[transfer.retry]
+# max_attempts = 3       # total attempts incl. the initial one; SDK standard default; 1 disables retries
+# base_delay_ms = 1000   # first backoff scale, ms (full jitter: realized delay is uniform in [0, this]); SDK standard default
+# max_delay_ms = 20000   # pre-jitter backoff ceiling, ms; SDK standard default
 ```
+
+> `[transfer.retry]` defaults are filled **per field**, so validation runs
+> against the filled mix: a lone `max_delay_ms = 500` fails because the
+> resolved base stays 1000, and a lone `base_delay_ms = 30000` fails against
+> the default max 20000. Set both when tightening either bound.
 
 > `[ignore].patterns` is a **Phase 3 feature**: it is parsed and validated
 > but not yet applied. A `push`/`pull`/`check` run refuses loudly when it is
@@ -107,6 +117,25 @@ mtime_tolerance_ms = 1000
 > `[transfer].concurrency` is likewise a **Phase 3 feature** (inert until the
 > pool exists). Setting a value that differs from the default warns on every
 > run; an explicit copy of the default (`4`) is silent.
+
+`[transfer.retry]` is **live** (not Phase 3): the three knobs map directly to
+AWS SDK **standard-mode** retry policy (exponential backoff with jitter, and
+SDK-classified throttling / 5xx / connection-reset retryables), set on the S3
+client at build time. `max_attempts = 1` disables retries entirely. Each key
+is optional; an absent key (or absent section) keeps the SDK-standard defaults
+shown above. `max_attempts` must be >= 1 and `base_delay_ms` <= `max_delay_ms`
+(loud config errors otherwise); both delays must be >= 1 (the SDK requires
+non-zero backoffs). The SDK's client-side **retry quota** (standard-mode
+token bucket) also applies: under sustained failure with no interleaved
+successes the SDK may stop retrying before `max_attempts` is reached (a
+retryable error then fails on the first attempt), and retries remain silent
+(no log line).
+
+vaultsync's retry policy is **config-owned**: `AWS_MAX_ATTEMPTS`,
+`AWS_RETRY_MODE`, and profile `max_attempts` / `retry_mode` do **not** apply
+to the S3 client vaultsync builds - the resolved `[transfer.retry]` policy
+replaces the ambient AWS retry configuration at client build, whether or not
+the section is present.
 
 If you want the full populated form (Phase 3, not yet applied), it is shown
 here for reference; copying it as-is will refuse `push`/`pull`/`check` until
