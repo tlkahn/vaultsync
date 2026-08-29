@@ -521,8 +521,27 @@ fn s3_integ_status_converges_after_push() {
         let plan = vaultsync::build_plan(&local, s, Mode::Push, &PlanOpts::default())
             .map_err(|e| format!("{e}"))?
             .plan;
+        // W120/R1-M3: assert the push plan actually planned the seeded uploads
+        // (a vacuous pass on an empty push would hide regressions).
+        assert_eq!(
+            plan.stats.upload,
+            files.len() as u32,
+            "push plan must plan the seeded uploads: {:?}",
+            plan.actions
+        );
         let rep = vaultsync::exec::execute_plan(&local, s, &plan, Mode::Push, &PlanOpts::default());
         assert!(rep.failed.is_empty(), "push failures: {:?}", rep.failed);
+        assert_eq!(
+            rep.executed,
+            files.len() as u32,
+            "push must execute exactly the seeded uploads: {:?}",
+            rep
+        );
+        // per-key size sanity: each upload landed with the true byte count.
+        for (rel, bytes) in &files {
+            let h = s.head(rel).map_err(|e| format!("{e}"))?.size;
+            assert_eq!(h, bytes.len() as u64, "uploaded {rel} size wrong");
+        }
 
         let status = vaultsync::build_plan(&local, s, Mode::Status, &PlanOpts::default())
             .map_err(|e| format!("{e}"))?

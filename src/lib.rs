@@ -1517,9 +1517,33 @@ mod tests {
         let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default())
             .unwrap()
             .plan;
+        // W120/R1-M3: assert the push plan actually planned the seeded
+        // uploads (a vacuous pass on an empty push would hide regressions).
+        assert_eq!(
+            plan.stats.upload,
+            files.len() as u32,
+            "push plan must plan the seeded uploads: {:?}",
+            plan.actions
+        );
         let rep =
             crate::exec::execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default());
         assert!(rep.failed.is_empty(), "push failures: {:?}", rep.failed);
+        assert_eq!(
+            rep.executed,
+            files.len() as u32,
+            "push must execute exactly the seeded uploads: {:?}",
+            rep
+        );
+        // per-key size sanity: each upload landed with the true byte count.
+        for (rel, bytes) in &files {
+            let h = store.head(rel).unwrap();
+            assert_eq!(
+                h.size,
+                bytes.len() as u64,
+                "uploaded {rel} size wrong: {:?}",
+                h
+            );
+        }
         // status after push must plan 0 mutating actions (issue acceptance 1)
         let status = crate::build_plan(&local, &store, Mode::Status, &PlanOpts::default())
             .unwrap()
