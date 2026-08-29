@@ -218,6 +218,14 @@ pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings,
         .as_ref()
         .and_then(|t| t.concurrency)
         .unwrap_or(DEFAULT_CONCURRENCY);
+    // I20-config (W56 loud-config ethos, matching the I8 retry validation
+    // shape): concurrency >= 1 - 0 is invalid (a run that can never transfer
+    // is meaningless); 1 is valid (the dedicated sequential path, I20-one).
+    if concurrency == 0 {
+        return Err(Error::Other(format!(
+            "transfer.concurrency must be >= 1 (1 = sequential), got {concurrency}"
+        )));
+    }
     let ignore_patterns = cfg
         .ignore
         .as_ref()
@@ -523,6 +531,32 @@ max_delay_ms = 4000
         let cfg = parse_config_str(text).unwrap();
         let s = settings(&cfg).unwrap();
         assert_eq!(s.retry.max_attempts, 1);
+    }
+
+    #[test]
+    fn resolve_settings_rejects_zero_concurrency() {
+        // I20-config (W56 loud-config ethos, matching the I8 retry validation
+        // shape): concurrency = 0 is invalid - a run that can never transfer
+        // is meaningless. Reject with an error naming the config key. RED:
+        // resolves with no error today.
+        let text = "[transfer]\nconcurrency = 0\n";
+        let cfg = parse_config_str(text).unwrap();
+        let err = settings(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transfer.concurrency"),
+            "must name transfer.concurrency: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_settings_allows_concurrency_1() {
+        // I20-config: concurrency = 1 is valid (the dedicated sequential
+        // path, I20-one) - must not be rejected with the zero rule.
+        let text = "[transfer]\nconcurrency = 1\n";
+        let cfg = parse_config_str(text).unwrap();
+        let s = settings(&cfg).unwrap();
+        assert_eq!(s.concurrency, 1);
     }
 
     #[test]
