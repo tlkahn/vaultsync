@@ -27,26 +27,41 @@ Exit criteria: push/pull a sample vault including nested folders and a binary at
 
 ## Phase 3 - Hardening
 
-1. `--delete` safety (`--yes`, `--max-delete`, confirm prompt)
-2. Ignore patterns + Obsidian default profile
-3. Concurrency limits, retries with backoff on transient S3 errors
-4. Multipart upload above the 5 GiB single-PUT ceiling (get/put already
-   stream: `get_to` streams the body; `put_from` buffers to a disk temp and
-   streams it - never a size-sized memory buffer; the ceiling is rejected
-   client-side before buffering, W80)
-5. Lock file to prevent concurrent runs on same vault
-6. JSON schema stability for `--json`
-7. Integration test optional gate in CI
-8. Head-on-list (or HEAD-sample on size-equal candidates) so list-driven plans
+Tracked on GitHub: #14 (tracking issue) with sub-issues #3-#13 in priority tiers.
+
+1. `--delete` safety (`--yes`, `--max-delete`, confirm prompt); today those
+   flags are rejected as unknown at parse time and the help text carries the
+   permanent-`--delete`-no-confirmation warning until this lands
+2. Ignore patterns + Obsidian default profile (`[ignore].patterns` already
+   parses but is unused, W25/M3; remaining work is walker application plus
+   the profile)
+3. Concurrency limits + retries with backoff on transient S3 errors
+   (`[transfer].concurrency` parses but is inert with a warning, W28/M6;
+   `LocalFs` is already Send/Sync, W82; transfers stay sequential)
+4. Lock file to prevent concurrent runs on same vault
+5. JSON schema stability for `--json` (parses today; dispatch rejects with
+   "not implemented (Phase 3)" + exit 1)
+6. Integration test optional gate in CI
+7. Head-on-list (or HEAD-sample on size-equal candidates) so list-driven plans
    see client mtimes instead of upload `LastModified` (PR2 A-M1 follow-up)
-9. CI: pin the toolchain and verify MSRV 1.85 (A-L9); set
-   `VAULTSYNC_TEST_S3_BUCKET` in CI so the env-gated suite genuinely runs,
-   and consider `#[ignore]` + `--ignored` or a CI sentinel so a silent skip
-   cannot look green (B-L7 hardening)
-10. Consider anchoring a relative `vault_root` to the config file's directory
-    instead of the cwd (PR2 B-L10) - breaking-change review
-11. Cloudflare R2 endpoint matrix row (still pending; the path-style toggle
+8. CI: pin the toolchain and verify MSRV 1.85 (A-L9; `rust-version = "1.85"`
+   is already pinned in Cargo.toml, Slice 10 - what remains is the CI
+   workflow); set `VAULTSYNC_TEST_S3_BUCKET` in CI so the env-gated suite
+   genuinely runs, and consider `#[ignore]` + `--ignored` or a CI sentinel so
+   a silent skip cannot look green (B-L7 hardening)
+9. Consider anchoring a relative `vault_root` to the config file's directory
+   instead of the cwd (PR2 B-L10) - breaking-change review
+10. Cloudflare R2 endpoint matrix row (still pending; the path-style toggle
     test exercises both flavors there, PR2 A-M8/W12)
+11. Walker depth: recursion is unbounded; add a depth cap or iterative walk
+    before executor-era deep trees (re-deferred from the Phase 2 checklist,
+    L3)
+
+Streaming note (landed, no Phase 3 work): `get_to` streams the body;
+`put_from` buffers to a disk temp and streams it via `ByteStream::from_path` -
+never a size-sized memory buffer; the 5 GiB single-PUT ceiling is rejected
+client-side before buffering (W80). Multipart upload above the ceiling is
+post-v1 (see the post-v1 table).
 
 Exit criteria: daily-driver usable for single-user backup (`push --delete` from trusted machine).
 
@@ -67,7 +82,7 @@ Exit criteria: daily-driver usable for single-user backup (`push --delete` from 
 | Azure Blob / GCS backends | Same `ObjectStore` trait |
 | Obsidian community plugin | Thin: shell out or embed; no logic fork |
 | Watch mode / launchd helper | Wrapper around CLI |
-| Multipart upload tuning | When large video/PDF users appear |
+| Multipart upload above the 5 GiB single-PUT ceiling | Post-v1 per W80 + cli.md/object-store.md; support + tuning when large video/PDF users appear; until then oversized objects are rejected client-side before buffering |
 | Checksum mode (`--checksum`) | Content equality beyond mtime/size |
 | Conflict copies | `file.conflict.<ts>.md` optional policy |
 | Trash-based local deletes | Optional safer local delete behind `--delete` |
@@ -160,6 +175,7 @@ Record choices here as they are made.
 | 2026-08-28 | PR2-W106 download-size-cap | `exec_download` caps the store's `get_to` stream at the planned remote size (crate-private `CappedWriter`, `WriteZero` past the cap), so a remote object replaced after the plan with a larger body is refused mid-stream before the extra bytes reach disk; `a.remote` is now required on Download rows (r12 M1). |
 | 2026-08-28 | PR2-W107 finalize-temp-guard | `finalize_write` refuses a temp that is no longer a regular file (symlink swap or node replacement) before re-opening it by path, removes the temp, and fails the key with the observed type; the rustdoc drops the false "provably harmless" claim (r12 M2). |
 | 2026-08-28 | PR2-W108 temp-owner-only | Download temp siblings are created owner-only `0600` like upload buffers (W14), via a shared `create_new_owner_only` helper used by both sides so the policy cannot drift again (r12 L1). |
+| 2026-08-29 | I15-head-on-list | Issue #15 fix (W111-W113): `list` now enriches each listed object entity's `mtime`/`etag` via a per-object `HeadObject` (`enrich_with_head_mtimes`), so list-driven plans compare client mtimes instead of upload `LastModified`. I15-approach chose **Option 1** (per-object head in `list`, preserving exact-mtime restoration and the stateless design) over **Option 2** (a local state cache - cuts against statelessness) and **Option 3** (converges without a head, but sacrifices exact-mtime restoration, a verified feature). I15-errors: fail-closed - a `NotFound` head drops the row (concurrent-delete race), any other head error fails the listing (W61 ethos, `pull --delete` safety). I15-concurrency: sequential heads for now; bounded concurrency / batching deferred to Phase 3's request-pool work. Supersedes PR2-defer-head-on-list. Accepted cost: 1+ ListObjectsV2 page requests plus N HeadObject requests (N = remote objects under the prefix) per list-driven plan. |
 | 2026-08-28 | PR2-W109 reserved-folder-filter | `partition_reserved_remote_keys` strips one trailing `/` before extracting the final segment, so folder-form keys (`.vaultsync-check-1/`, `a/.name.vaultsync-tmp-1-2/`) are filtered like file keys (r12 L4). |
 
 ## Open decisions
