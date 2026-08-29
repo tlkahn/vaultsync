@@ -240,7 +240,13 @@ fn s3_integ_put_get_head_delete_roundtrip() {
 fn s3_integ_list_paginates() {
     // Seed >1000 keys (S3 pages at 1000) concurrently, confirm list returns all.
     let n = 1050usize;
-    with_store("paginate", |s| {
+    // Issue #17 (I17-conc): run the body through `with_store_conc` at K = 32,
+    // NOT `with_store` (hardcoded concurrency 1). This is the live proof of
+    // I20-heads: the enriched-list head fan-out (enrich_with_head_mtimes +
+    // S3Store concurrency) must bring the 1050-head pass from ~O(N x RTT)
+    // down to ~O((N/K) x RTT). Phase 0 row A measured the conc=1 baseline
+    // stalling past ~380s in the body list alone; row B is this run.
+    with_store_conc("paginate", 32, |s| {
         // TEMP [17] (issue #17 Phase 0, removed before merge): finer-grain
         // seed/list timings so the live diagnosis can separate seed cost from
         // the enriched-list head cost.
