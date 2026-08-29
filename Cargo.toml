@@ -2,10 +2,12 @@
 name = "vaultsync"
 version = "0.1.0"
 edition = "2024"
-# MSRV: the aws-sdk-s3/aws-config 1.x line now declares rust-version = "1.94.1"
-# (effectively 1.95.0, since stable rust ships as x.0.0), so the final dep
-# tree's true floor is 1.95. Verified by the `msrv` CI job against this exact
-# declaration (issue 5).
+# MSRV: the locked aws-sdk-s3/aws-config 1.x tree declares rust-version =
+# "1.94.1"; 1.95 (the pinned toolchain, rust-toolchain.toml) satisfies that
+# floor. The `msrv` CI job verifies this declaration empirically against the
+# locked dep tree (issue 5). Coupling: `.github/workflows/ci.yml`
+# (`RUSTUP_TOOLCHAIN` and the `msrv` job name) must be updated in the same
+# commit as any bump of this value.
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 description = "Minimal, Unix-style sync of a plain directory (Obsidian vault) to object storage"
