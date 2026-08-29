@@ -85,6 +85,15 @@ fn with_store<F>(name: &str, f: F)
 where
     F: FnOnce(&S3Store) -> Result<(), String>,
 {
+    with_store_conc(name, 1, f);
+}
+
+/// [`with_store`] with a non-default `[transfer].concurrency` (issue 20 cycle
+/// 9: integration coverage for the parallel pool against real S3).
+fn with_store_conc<F>(name: &str, concurrency: u32, f: F)
+where
+    F: FnOnce(&S3Store) -> Result<(), String>,
+{
     let bucket = match bucket_or_skip(
         std::env::var("VAULTSYNC_TEST_S3_BUCKET").ok(),
         require_mode(),
@@ -115,7 +124,7 @@ where
         prefix,
         path_style,
     };
-    let store = S3Store::new(&settings, &RetrySettings::default(), 1)
+    let store = S3Store::new(&settings, &RetrySettings::default(), concurrency)
         .map_err(|e| format!("S3Store::new: {e}"));
     let store = match store {
         Ok(s) => s,
@@ -708,6 +717,79 @@ fn s3_integ_pull_then_status_converges() {
         assert_eq!(status.stats.upload, 0, "uploads: {:?}", status.actions);
         assert_eq!(status.stats.download, 0, "downloads: {:?}", status.actions);
         assert_eq!(status.stats.conflict, 0, "conflicts: {:?}", status.actions);
+        Ok(())
+    });
+}
+
+#[test]
+fn s3_integ_parallel_pull_correct() {
+    // Issue 20 acceptance (I20 cycle 9): pull 16 objects at concurrency 4
+    // against real S3 - bytes and applied mtimes correct key-for-key.
+    with_store_conc("parpull", 4, |s| {
+        let fixed = 1_600_000_000_123u64;
+        let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+        for i in 0..16 {
+            let key = format!("n{i:02}.md");
+            let body = format!("body-{i:02}-{}\n", "x".repeat(i)).into_bytes();
+            put_bytes(s, &key, &body, Some(fixed + i as u64))?;
+            files.push((key, body));
+        }
+        let dst = TestDir::new("dst");
+        let ldst = LocalFs::new(dst.path());
+        let plan = vaultsync::build_plan(&ldst, s, Mode::Pull, &PlanOpts::default())
+            .map_err(|e| format!("{e}"))?
+            .plan;
+        let rep =
+            vaultsync::exec::execute_plan(&ldst, s, &plan, Mode::Pull, &PlanOpts::default(), 4);
+        assert!(rep.failed.is_empty(), "pull failures: {:?}", rep.failed);
+        assert_eq!(rep.executed, 16);
+        for (i, (key, bytes)) in files.iter().enumerate() {
+            let got = std::fs::read(dst.join(key)).map_err(|e| format!("{key}: {e}"))?;
+            assert_eq!(&got, bytes, "byte mismatch for {key}");
+            let gm = mtime_ms(&dst.join(key));
+            let expected = fixed + i as u64;
+            assert!(
+                gm.abs_diff(expected) < 2000,
+                "{key} mtime {gm} != {expected}"
+            );
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn s3_integ_parallel_push_correct() {
+    // Issue 20 acceptance (I20 cycle 9): push 16 local files at concurrency
+    // 4 against real S3 - head each: size + `vaultsync-mtime` metadata intact.
+    with_store_conc("parpush", 4, |s| {
+        let fixed = 1_600_000_000_123u64;
+        let src = TestDir::new("src");
+        let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+        for i in 0..16 {
+            let key = format!("n{i:02}.md");
+            let body = format!("body-{i:02}-{}\n", "x".repeat(i)).into_bytes();
+            let path = src.join(&key);
+            std::fs::write(&path, &body).unwrap();
+            set_mtime(&path, fixed + i as u64);
+            files.push((key, body));
+        }
+        let local = LocalFs::new(src.path());
+        let plan = vaultsync::build_plan(&local, s, Mode::Push, &PlanOpts::default())
+            .map_err(|e| format!("{e}"))?
+            .plan;
+        let rep =
+            vaultsync::exec::execute_plan(&local, s, &plan, Mode::Push, &PlanOpts::default(), 4);
+        assert!(rep.failed.is_empty(), "push failures: {:?}", rep.failed);
+        assert_eq!(rep.executed, 16);
+        for (i, (key, body)) in files.iter().enumerate() {
+            let e = s.head(key).map_err(|e| format!("head {key}: {e}"))?;
+            assert_eq!(e.size, body.len() as u64, "size mismatch for {key}");
+            assert_eq!(
+                e.mtime_ms,
+                Some(fixed + i as u64),
+                "vaultsync-mtime metadata for {key}"
+            );
+        }
         Ok(())
     });
 }
