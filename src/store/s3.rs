@@ -17,12 +17,13 @@
 //! plans compare client mtimes, not upload `LastModified`.
 //!
 //! Cost (accepted, I15): a list-driven plan costs 1+ ListObjectsV2 page
-//! requests plus N HeadObject requests (N = remote objects under the prefix),
-//! latency ~ N x RTT. Sequential heads until Phase 3's request-pool work
-//! (I15-concurrency; see roadmap decision log). Head failures are fail-closed
-//! except a NotFound drop (I15-errors): a NotFound head (object deleted
-//! between LIST and HEAD) drops the row; any other head error fails the
-//! listing.
+//! requests plus N HeadObject requests (N = remote objects under the prefix).
+//! Since issue 20 the N heads fan out through the same bounded pool as the
+//! transfer passes, capped by `[transfer].concurrency` (I20-heads; `1` =
+//! sequential). Wall-clock is ~ (N / concurrency) x RTT rather than N x RTT.
+//! Head failures are fail-closed except a NotFound drop (I15-errors): a
+//! NotFound head (object deleted between LIST and HEAD) drops the row; any
+//! other head error fails the listing.
 //!
 //! Streaming: `get_to` streams the object body to the caller's writer;
 //! `put_from` buffers the reader to a temp file on disk and streams that file
@@ -73,6 +74,9 @@ pub struct S3Store {
     /// Vault-relative prefix with a trailing `/` (may be empty).
     prefix: String,
     rt: tokio::runtime::Runtime,
+    /// I20-heads: bound on concurrent `head` calls issued by `list`
+    /// enrichment (same `[transfer].concurrency` knob; `1` = sequential).
+    concurrency: u32,
 }
 
 impl S3Store {
@@ -81,7 +85,15 @@ impl S3Store {
     /// `retry` carries the resolved `[transfer.retry]` policy (I8); absent
     /// `[transfer]`-derived policy is kept out of `[store]`-derived
     /// `StoreSettings` so existing store literals stay untouched.
-    pub fn new(settings: &StoreSettings, retry: &RetrySettings) -> Result<S3Store, Error> {
+    /// `concurrency` caps the `list`-enrichment heads (I20-heads) - the
+    /// current-thread runtime (W48, confirmed under concurrent `block_on` in
+    /// issue 20 cycle 2) is unchanged; the cap is applied by the caller-side
+    /// worker pool.
+    pub fn new(
+        settings: &StoreSettings,
+        retry: &RetrySettings,
+        concurrency: u32,
+    ) -> Result<S3Store, Error> {
         // W88/r10-L2: best-effort reap of stale upload temp buffers left by a
         // crashed run in the shared temp dir. Conservative 24h age; every
         // error is swallowed (hygiene, not an operation the user can act on).
@@ -89,9 +101,13 @@ impl S3Store {
         // be cheap and idempotent, and test binaries constructing many
         // stores must not re-scan the OS temp dir on every call.
         reap_stale_upload_temps_once();
-        // W48: a current-thread runtime matches the one-`block_on`-at-a-time
-        // sync architecture (each call `block_on`s once); a multi-thread
-        // runtime would add worker threads with no parallelization benefit.
+        // W48 / I20-w48: keep a current-thread runtime. Issue 20 cycle 2
+        // measured concurrent `block_on` from the std worker pool on ONE
+        // current-thread runtime: futures complete correctly AND overlap in
+        // wall-clock (`concurrent_block_on_{completes,overlaps}`). A
+        // multi-thread runtime (+ `rt-multi-thread`) is therefore not
+        // required - the pool supplies concurrency; this runtime multiplexes
+        // the in-flight `block_on` calls.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -128,6 +144,7 @@ impl S3Store {
             // public constructor contract must not depend on that.
             prefix: crate::config::normalize_prefix(&settings.prefix),
             rt,
+            concurrency,
         })
     }
 
@@ -546,8 +563,10 @@ impl ObjectStore for S3Store {
         // upload times. Folder views are skipped; a NotFound head drops the
         // row (surfaced as a bounded warning); transient errors are retried
         // by the SDK `RetryConfig` (I8, supersedes the retired W117 stopgap);
-        // any other head error fails the listing (I15-errors).
-        enrich_with_head_mtimes(self, Listing { entities, warnings })
+        // any other head error fails the listing (I15-errors). I20-heads:
+        // the enrichment heads fan out under `self.concurrency` (same
+        // `[transfer].concurrency` cap as the transfer passes).
+        enrich_with_head_mtimes(self, Listing { entities, warnings }, self.concurrency)
     }
 
     fn head(&self, key: &str) -> Result<Entity, Error> {
@@ -734,6 +753,97 @@ mod tests {
     use crate::testutil::TempDir;
 
     #[test]
+    fn s3_store_is_send_sync() {
+        // I20-traits verification: `S3Store` holds a current-thread tokio
+        // `Runtime` and an aws `Client` (W48). This pin proves both are
+        // `Send + Sync` so the scoped worker pool can share `&S3Store` across
+        // threads. Per the issue-20 plan this assertion IS the verification:
+        // if it fails to compile, stop and reassess the runtime shape before
+        // building the pool.
+        fn assert_ss<T: ?Sized + Send + Sync>() {}
+        assert_ss::<S3Store>();
+    }
+
+    #[test]
+    fn concurrent_block_on_completes() {
+        // W48 probe (issue 20, cycle 2): 8 threads concurrently `block_on`
+        // futures on ONE current-thread runtime, each future `tokio::spawn`ing
+        // a chain of timer awaits. All 8 must complete with correct results -
+        // the failure mode ruled out is the current-thread core dropping or
+        // mis-scheduling tasks when `block_on` is entered concurrently. If
+        // this or `concurrent_block_on_overlaps` fails, switch to
+        // `new_multi_thread` (I20-runtime branch) and re-add tokio's
+        // `rt-multi-thread` feature.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let results: Vec<i32> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let rt = &rt;
+                    s.spawn(move || {
+                        rt.block_on(async move {
+                            let v = tokio::spawn(async move {
+                                let mut acc = 0;
+                                for _ in 0..3 {
+                                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                                    acc += 1;
+                                }
+                                acc
+                            })
+                            .await
+                            .unwrap();
+                            v + i
+                        })
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for (i, r) in results.iter().enumerate() {
+            assert_eq!(
+                *r,
+                i as i32 + 3,
+                "thread {i} must produce its own correct result (got {r})"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_block_on_overlaps() {
+        // W48 probe (issue 20, cycle 2): two threads `block_on` a 400ms timer
+        // each on ONE current-thread runtime. Wall-clock well under 800ms
+        // proves real overlap; serialized `block_on` on the single core would
+        // take >= 800ms. Explicitly a probe, not a regression pin: >2x margin
+        // both directions (pass < 600ms, fail >= 800ms).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let start = std::time::Instant::now();
+        std::thread::scope(|s| {
+            let h1 = s.spawn(|| {
+                rt.block_on(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await
+                })
+            });
+            let h2 = s.spawn(|| {
+                rt.block_on(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await
+                })
+            });
+            h1.join().unwrap();
+            h2.join().unwrap();
+        });
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(600),
+            "two 400ms sleeps must overlap on the current-thread runtime (took {elapsed:?}); the core is serializing concurrent block_on calls - switch to new_multi_thread (I20-runtime)"
+        );
+    }
+
+    #[test]
     fn reap_stale_upload_temps_removes_old_leftovers() {
         // r10-L2 (W88): a crash/SIGKILL between buffering and remove_file
         // leaks a full buffered object in the shared temp dir; no cross-run
@@ -802,7 +912,7 @@ mod tests {
             prefix: String::new(),
             path_style: false,
         };
-        let store = S3Store::new(&settings, &RetrySettings::default()).unwrap();
+        let store = S3Store::new(&settings, &RetrySettings::default(), 1).unwrap();
         let mut r = std::io::empty();
         let err = store
             .put_from("a.md", &mut r, 5 * 1024 * 1024 * 1024 + 1, None)
@@ -964,7 +1074,7 @@ mod tests {
                 prefix: input.to_string(),
                 path_style: false,
             };
-            let store = S3Store::new(&settings, &RetrySettings::default()).unwrap();
+            let store = S3Store::new(&settings, &RetrySettings::default(), 1).unwrap();
             assert_eq!(store.prefix, expected, "input {input:?}");
         }
     }

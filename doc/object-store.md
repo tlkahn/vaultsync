@@ -22,7 +22,7 @@ pub struct Listing {
     pub warnings: Vec<String>,  // advisory backend notes (e.g. keys dropped while listing)
 }
 
-pub trait ObjectStore {
+pub trait ObjectStore: Send + Sync {
     fn list(&self, prefix: &str) -> Result<Listing>;   // folders synthesized from key prefixes
     fn head(&self, key: &str) -> Result<Entity>;
     fn get_to(&self, key: &str, w: &mut dyn Write) -> Result<Entity>;   // streaming
@@ -30,6 +30,13 @@ pub trait ObjectStore {
     fn delete(&self, key: &str) -> Result<()>;
 }
 ```
+
+`ObjectStore: Send + Sync` (I20-traits, issue 20 cycle 1): implementations
+must be shareable as `&dyn ObjectStore` across the worker threads of the
+bounded `std::thread` pool, so interior-mutable state uses `Mutex`/`Atomic*`
+(never `Cell`/`RefCell`). This is a compile-time contract pinned by
+`assert_ss`-style tests for `S3Store`, `MemoryStore`, `LocalFs`, and
+`dyn ObjectStore` itself.
 
 `Listing.warnings` carries advisory notes about the listing (e.g. dropped
 non-empty `*/` keys); the CLI prints them (one `warning: ...` line each),
@@ -45,6 +52,16 @@ There is no `content_type` field on `Entity` in v1; Content-Type handling (if
 any) is backend-side only (post-v1 if it becomes a trait concern).
 
 Async shape (`AsyncRead` / `AsyncWrite`) is allowed if the S3 spike selects an async SDK; keep the same streaming responsibility either way.
+
+**D2 (restated):** async lives only inside `store::s3` - `S3Store` owns a
+private `tokio::runtime::Runtime` and `block_on`s per call; planner,
+executor, and CLI stay sync and runtime-free. Runtime flavor is the W48
+current-thread runtime (`Builder::new_current_thread().enable_all()`),
+confirmed under concurrent `block_on` by the issue-20 cycle-2 probe (N
+threads `block_on` the same runtime and overlap in wall-clock), so the
+pool fan-out lives on the caller side (`crate::pool::run_bounded`), not in
+the runtime. No `async` outside `store::s3` without a new roadmap
+decision-log entry.
 
 ## Prefix handling
 
@@ -73,7 +90,7 @@ Practical options (pick in Phase 2 spike, not earlier):
 
 | Trait | S3 API |
 | ----- | ------ |
-| list | `ListObjectsV2` paginated; folder prefixes derived from keys (no delimiter in the request; `CommonPrefixes` is not used). ListObjectsV2 cannot return user metadata, so each listed object entity is then enriched via a per-object `HeadObject` (`enrich_with_head_mtimes`) into one coherent head snapshot: `mtime_ms` comes from `vaultsync-mtime` (falling back to `LastModified`), while `etag` and `size` come from the `HeadObject` (R2-5). The planner ignores etags (`plan_etag_ignored`), so the etag remains an opaque token. Request shape is N+1 (one list cycle + N heads, sequential until Phase 3's request-pool work); transient head errors (`Unavailable`/`Timeout`) are owned by the SDK standard-mode `RetryConfig` configured from `[transfer.retry]` (I8; the old W117 head stopgap is retired) - heads are single-attempt at this boundary (the SDK's shared retry quota can also stop retries before `max_attempts` under a sustained storm). Reserved-namespace leftovers (`.vaultsync-check-*` / `.*.vaultsync-tmp-*`) are partitioned out before any head is issued (W118). A `NotFound` head drops the row (concurrent-delete race, surfaced as a bounded warning); any other head error fails the listing. |
+| list | `ListObjectsV2` paginated; folder prefixes derived from keys (no delimiter in the request; `CommonPrefixes` is not used). ListObjectsV2 cannot return user metadata, so each listed object entity is then enriched via a per-object `HeadObject` (`enrich_with_head_mtimes`) into one coherent head snapshot: `mtime_ms` comes from `vaultsync-mtime` (falling back to `LastModified`), while `etag` and `size` come from the `HeadObject` (R2-5). The planner ignores etags (`plan_etag_ignored`), so the etag remains an opaque token. Request shape is N+1 (one list cycle + N heads); since issue 20 the N heads fan out through the same bounded pool as the transfer passes, capped by `[transfer].concurrency` (I20-heads). With several non-NotFound head errors in one listing the returned error is the listing-earliest one (deterministic). In the POOLED path (`concurrency > 1`) in-flight heads are not cancelled when a sibling fails (extra completed requests accepted). The sequential path (`concurrency = 1`, I20-r1/F1) is the literal pre-issue-20 loop: it stops at the FIRST non-NotFound head error (immediate return, no further heads issued) - the "1 = byte-for-byte pre-issue-20" claim holds on the error path too. Transient head errors (`Unavailable`/`Timeout`) are owned by the SDK standard-mode `RetryConfig` configured from `[transfer.retry]` (I8; the old W117 head stopgap is retired) - heads are single-attempt at this boundary (the SDK's shared retry quota can also stop retries before `max_attempts` under a sustained storm). Reserved-namespace leftovers (`.vaultsync-check-*` / `.*.vaultsync-tmp-*`) are partitioned out before any head is issued (W118). A `NotFound` head drops the row (concurrent-delete race, surfaced as a bounded warning); any other head error fails the listing. |
 | head | `HeadObject` |
 | get_to | `GetObject` (stream body into the caller's writer). Transient errors are owned by the SDK `RetryConfig` from `[transfer.retry]` for the request itself; a **mid-body** connection loss after the response header starts streaming is an accepted gap (I8-midbody) - the SDK cannot retry an already-consumed body, so the download fails per-key (`Unavailable`) and the next run converges (sync is idempotent). |
 | put_from | `PutObject` single-PUT via `ByteStream::from_path` (buffered to a disk temp, never a `size`-sized memory buffer); 5 GiB ceiling. Multipart is a post-v1 item. |

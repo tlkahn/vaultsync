@@ -13,6 +13,14 @@ use crate::error::Error;
 
 pub const DEFAULT_MTIME_TOLERANCE_MS: u64 = 1000;
 pub const DEFAULT_CONCURRENCY: u32 = 4;
+/// I20-r1/F2: the ceiling on `[transfer].concurrency` (config-layer only -
+/// library callers of `execute_plan`/`S3Store::new` are uncapped, and the
+/// pool still clamps workers to `min(concurrency, items)`). Rationale: S3
+/// single-client throughput saturates well below 256 concurrent ops; beyond
+/// that it is OS-thread cost for zero gain, so a larger value is a config
+/// mistake, not a tuning choice - rejected loudly (W56 ethos) rather than
+/// clamped.
+pub const MAX_CONCURRENCY: u32 = 256;
 
 /// AWS SDK standard-mode retry defaults (I8-config): the resolved policy when
 /// `[transfer.retry]` is absent or a field is unset mirrors the SDK's own
@@ -110,10 +118,6 @@ pub struct Settings {
     /// is surfaced loudly - never silently applied - so a user copying the
     /// cli.md example is not let to believe patterns are in effect.
     pub ignore_patterns: Vec<String>,
-    /// True when the TOML explicitly set `[transfer].concurrency` (W28/M6):
-    /// inert until Phase 3 (the pool does not exist), so dispatch warns rather
-    /// than silently accepting it.
-    pub concurrency_explicitly_set: bool,
 }
 
 /// Resolved retry policy (I8). Milliseconds at this layer; `Duration`
@@ -218,13 +222,29 @@ pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings,
         .as_ref()
         .and_then(|t| t.concurrency)
         .unwrap_or(DEFAULT_CONCURRENCY);
+    // I20-config (W56 loud-config ethos, matching the I8 retry validation
+    // shape): concurrency >= 1 - 0 is invalid (a run that can never transfer
+    // is meaningless); 1 is valid (the dedicated sequential path, I20-one).
+    // I20-r1/F2: concurrency > MAX_CONCURRENCY is a config mistake (S3
+    // single-client throughput saturates well below 256 concurrent ops;
+    // beyond that it is OS-thread cost for zero gain), so it is rejected
+    // loudly naming the key and the cap - same shape as the `== 0` arm.
+    if concurrency == 0 {
+        return Err(Error::Other(format!(
+            "transfer.concurrency must be >= 1 (1 = sequential), got {concurrency}"
+        )));
+    }
+    if concurrency > MAX_CONCURRENCY {
+        return Err(Error::Other(format!(
+            "transfer.concurrency must be <= {MAX_CONCURRENCY} (got {concurrency}); values above the cap are OS-thread cost for zero S3 throughput gain"
+        )));
+    }
     let ignore_patterns = cfg
         .ignore
         .as_ref()
         .map(|i| i.patterns.clone())
         .unwrap_or_default();
     let retry = resolve_retry(cfg.transfer.as_ref())?;
-    let concurrency_explicitly_set = cfg.transfer.as_ref().and_then(|t| t.concurrency).is_some();
     Ok(Settings {
         vault_root,
         store,
@@ -232,7 +252,6 @@ pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings,
         concurrency,
         retry,
         ignore_patterns,
-        concurrency_explicitly_set,
     })
 }
 
@@ -523,6 +542,61 @@ max_delay_ms = 4000
         let cfg = parse_config_str(text).unwrap();
         let s = settings(&cfg).unwrap();
         assert_eq!(s.retry.max_attempts, 1);
+    }
+
+    #[test]
+    fn resolve_settings_rejects_zero_concurrency() {
+        // I20-config (W56 loud-config ethos, matching the I8 retry validation
+        // shape): concurrency = 0 is invalid - a run that can never transfer
+        // is meaningless. Reject with an error naming the config key. RED:
+        // resolves with no error today.
+        let text = "[transfer]\nconcurrency = 0\n";
+        let cfg = parse_config_str(text).unwrap();
+        let err = settings(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transfer.concurrency"),
+            "must name transfer.concurrency: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_settings_rejects_concurrency_above_max() {
+        // I20-r1/F2 (W56 loud-config ethos): concurrency above the
+        // `MAX_CONCURRENCY` ceiling is a config mistake, not a tuning choice
+        // (S3 single-client throughput saturates well below 256 concurrent
+        // ops; beyond that it is OS-thread cost for zero gain). Reject with
+        // an error naming the config key AND the cap value. RED today:
+        // resolves with no error (only the `== 0` check exists).
+        let text = "[transfer]\nconcurrency = 257\n";
+        let cfg = parse_config_str(text).unwrap();
+        let err = settings(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transfer.concurrency"),
+            "must name transfer.concurrency: {msg}"
+        );
+        assert!(msg.contains("256"), "must name the cap value 256: {msg}");
+    }
+
+    #[test]
+    fn resolve_settings_allows_concurrency_at_max() {
+        // I20-r1/F2 boundary pin: concurrency = 256 (the `MAX_CONCURRENCY`
+        // ceiling itself) is valid - guards an off-by-one in the cap check.
+        let text = "[transfer]\nconcurrency = 256\n";
+        let cfg = parse_config_str(text).unwrap();
+        let s = settings(&cfg).unwrap();
+        assert_eq!(s.concurrency, 256);
+    }
+
+    #[test]
+    fn resolve_settings_allows_concurrency_1() {
+        // I20-config: concurrency = 1 is valid (the dedicated sequential
+        // path, I20-one) - must not be rejected with the zero rule.
+        let text = "[transfer]\nconcurrency = 1\n";
+        let cfg = parse_config_str(text).unwrap();
+        let s = settings(&cfg).unwrap();
+        assert_eq!(s.concurrency, 1);
     }
 
     #[test]

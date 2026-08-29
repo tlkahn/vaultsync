@@ -9,6 +9,7 @@ pub mod error;
 pub mod exec;
 pub mod local;
 pub mod plan;
+pub(crate) mod pool;
 pub mod store;
 
 use std::path::Path;
@@ -354,7 +355,7 @@ pub(crate) mod testutil {
         /// bigger than any real mtime so the degraded frame is unambiguous).
         upload_time_ms: u64,
         /// Every key the double's `head` delegate has served, in order.
-        head_log: std::cell::RefCell<Vec<String>>,
+        head_log: std::sync::Mutex<Vec<String>>,
         /// Keys whose `head` should answer `Unavailable` (W118 fail-closed
         /// scope-creep probe).
         fail_head_keys: Vec<String>,
@@ -365,7 +366,7 @@ pub(crate) mod testutil {
             S3LikeListStore {
                 inner: crate::store::mock::MemoryStore::new(),
                 upload_time_ms: 9_999_999_999,
-                head_log: std::cell::RefCell::new(Vec::new()),
+                head_log: std::sync::Mutex::new(Vec::new()),
                 fail_head_keys: Vec::new(),
             }
         }
@@ -379,7 +380,7 @@ pub(crate) mod testutil {
         }
         /// Snapshot of every key the double's `head` has served, in order.
         pub(crate) fn head_log(&self) -> Vec<String> {
-            self.head_log.borrow().clone()
+            self.head_log.lock().unwrap().clone()
         }
     }
 
@@ -403,10 +404,12 @@ pub(crate) mod testutil {
                     .push(crate::reserved_drops_warning(&reserved_dropped));
             }
             listing.entities = entities;
-            crate::store::enrich_with_head_mtimes(self, listing)
+            // I20-heads: the test double stays sequential (concurrency 1) so
+            // existing lib tests keep their deterministic head-attempt order.
+            crate::store::enrich_with_head_mtimes(self, listing, 1)
         }
         fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
-            self.head_log.borrow_mut().push(key.to_string());
+            self.head_log.lock().unwrap().push(key.to_string());
             if self.fail_head_keys.iter().any(|k| k == key) {
                 return Err(crate::error::Error::Unavailable(format!(
                     "throttled: {key}"
@@ -1526,7 +1529,7 @@ mod tests {
             plan.actions
         );
         let rep =
-            crate::exec::execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default());
+            crate::exec::execute_plan(&local, &store, &plan, Mode::Push, &PlanOpts::default(), 1);
         assert!(rep.failed.is_empty(), "push failures: {:?}", rep.failed);
         assert_eq!(
             rep.executed,
@@ -1581,7 +1584,8 @@ mod tests {
         let plan = crate::build_plan(&ldst, &store, Mode::Pull, &PlanOpts::default())
             .unwrap()
             .plan;
-        let rep = crate::exec::execute_plan(&ldst, &store, &plan, Mode::Pull, &PlanOpts::default());
+        let rep =
+            crate::exec::execute_plan(&ldst, &store, &plan, Mode::Pull, &PlanOpts::default(), 1);
         assert!(rep.failed.is_empty(), "pull failures: {:?}", rep.failed);
         // byte-identical + exact mtime restored (existing feature must hold)
         for (rel, bytes) in &files {

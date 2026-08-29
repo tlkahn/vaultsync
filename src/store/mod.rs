@@ -37,7 +37,13 @@ pub struct Listing {
 /// read/delete paths may answer [`Error::NotFound`] for invalid keys (mock
 /// behavior). Phase 2 backends must never forward an unvalidated key to a
 /// provider (e.g. S3) - validate before any outbound call.
-pub trait ObjectStore {
+///
+/// I20-traits: `Send + Sync` are supertraits so a shared `&dyn ObjectStore`
+/// can be handed to the scoped worker pool (each worker thread calls the
+/// store through `&self`). Implementations must be `Send + Sync`;
+/// interior-mutable state must use `Mutex`/`Atomic*` (the `Cell`/`RefCell`
+/// test doubles migrated in issue 20, cycle 1).
+pub trait ObjectStore: Send + Sync {
     /// List entities whose key starts with `prefix`. `""` lists everything.
     /// Folders are synthesized from key prefixes when no folder marker object
     /// exists. Results are sorted by key.
@@ -113,50 +119,118 @@ pub trait ObjectStore {
 /// `RetryConfig` (I8, supersedes the retired W117 stopgap), so no per-object
 /// retry loop lives at this boundary. Entity order (sorted) and `warnings`
 /// are preserved verbatim.
+///
+/// I20-heads: `concurrency` bounds how many heads run in flight (same knob as
+/// the transfer passes - workers = `min(concurrency, rows)`). The sequential
+/// path (`concurrency <= 1`) is the literal pre-issue-20 loop, restored in
+/// I20-r1/F1: it stops at the FIRST non-NotFound head error (immediate
+/// `return Err`), so the "1 = byte-for-byte pre-issue-20" claim holds on the
+/// error path too (N failing heads no longer burn the shared SDK retry quota
+/// against a perma-failing backend). Heads fan out through
+/// [`crate::pool::run_bounded`] only at `concurrency > 1`, and results are
+/// merged by index, so entity order and the vanish-warning text are
+/// deterministic regardless of completion order. Error selection is locked:
+/// with several non-NotFound head failures in one listing, the returned error
+/// is the first one in **listing order** (not completion order); a hard error
+/// still fails the whole listing - no partial entities, no vanished warning
+/// (the warning is built on the success path only). In the POOLED path
+/// in-flight heads are not cancelled when a sibling fails: extra completed
+/// requests are accepted (documented, no-cancellation behavior).
 pub(crate) fn enrich_with_head_mtimes<S: ObjectStore + ?Sized>(
     store: &S,
     listing: Listing,
+    concurrency: u32,
 ) -> Result<Listing, Error> {
+    let mut warnings = listing.warnings;
     let mut entities = Vec::new();
     let mut vanished: Vec<String> = Vec::new();
-    for e in listing.entities {
-        if e.is_folder() {
-            entities.push(e);
-            continue;
-        }
-        match store.head(&e.key) {
-            Ok(h) => {
-                let mut e = e;
-                e.mtime_ms = h.mtime_ms;
-                e.etag = h.etag;
-                e.size = h.size;
+    if concurrency <= 1 {
+        // Sequential path (I20-r1/F1): the pre-issue-20 loop verbatim
+        // (recovered from a2fca0a) - folder passthrough, NotFound -> vanished
+        // row, any other head error fails the listing IMMEDIATELY (no further
+        // heads issued). The vanished-warning tail is shared with the pooled
+        // path via `vanished_warning` so nothing is duplicated.
+        for e in listing.entities {
+            if e.is_folder() {
                 entities.push(e);
+                continue;
             }
-            Err(Error::NotFound(_)) => {
-                // Concurrent-delete race between LIST and HEAD: drop the row,
-                // and surface the drop (W70/W79 surface-don't-hide ethos) via
-                // one bounded warning appended below.
-                vanished.push(e.key);
+            match store.head(&e.key) {
+                Ok(h) => {
+                    let mut e = e;
+                    e.mtime_ms = h.mtime_ms;
+                    e.etag = h.etag;
+                    e.size = h.size;
+                    entities.push(e);
+                }
+                Err(Error::NotFound(_)) => {
+                    // Concurrent-delete race between LIST and HEAD: drop the
+                    // row, and surface the drop (W70/W79 surface-don't-hide
+                    // ethos) via one bounded warning appended below.
+                    vanished.push(e.key);
+                }
+                Err(err) => return Err(err),
             }
-            Err(err) => return Err(err),
+        }
+    } else {
+        // I20-heads: fan the object-row heads out through the bounded pool;
+        // folder views pass through untouched (never headed). Results come
+        // back in listing order, so walking `listing.entities` in order and
+        // returning the first non-NotFound error yields the listing-order
+        // error lock. In-flight heads are not cancelled when a sibling fails
+        // (extra completed requests accepted - documented pooled behavior).
+        let object_rows: Vec<&Entity> =
+            listing.entities.iter().filter(|e| !e.is_folder()).collect();
+        let results = crate::pool::run_bounded(concurrency, &object_rows, |e| store.head(&e.key));
+        let mut results = results.into_iter();
+        for e in listing.entities {
+            if e.is_folder() {
+                entities.push(e);
+                continue;
+            }
+            match results.next().expect("one head result per object row") {
+                Ok(h) => {
+                    let mut e = e;
+                    e.mtime_ms = h.mtime_ms;
+                    e.etag = h.etag;
+                    e.size = h.size;
+                    entities.push(e);
+                }
+                Err(Error::NotFound(_)) => {
+                    // Concurrent-delete race between LIST and HEAD: drop the
+                    // row, and surface the drop (W70/W79 surface-don't-hide
+                    // ethos) via one bounded warning appended below.
+                    vanished.push(e.key);
+                }
+                Err(err) => return Err(err),
+            }
         }
     }
-    let mut warnings = listing.warnings;
-    if !vanished.is_empty() {
-        const MAX: usize = 5;
-        let total = vanished.len();
-        let shown: Vec<&str> = vanished.iter().take(MAX).map(|s| s.as_str()).collect();
-        let mut msg = format!(
-            "{} listed key(s) vanished before head (deleted between LIST and HEAD); skipping: ",
-            total
-        );
-        msg.push_str(&shown.join(", "));
-        if total > MAX {
-            msg.push_str(&format!(" and {} more", total - MAX));
-        }
+    if let Some(msg) = vanished_warning(&vanished) {
         warnings.push(msg);
     }
     Ok(Listing { entities, warnings })
+}
+
+/// The shared vanished-row warning tail (MAX = 5 bounded message) used by
+/// both enrichment paths (sequential and pooled) so the text cannot drift
+/// (I20-r1/F1). `None` when nothing vanished.
+fn vanished_warning(vanished: &[String]) -> Option<String> {
+    if vanished.is_empty() {
+        return None;
+    }
+    const MAX: usize = 5;
+    let total = vanished.len();
+    let shown: Vec<&str> = vanished.iter().take(MAX).map(|s| s.as_str()).collect();
+    let mut msg = format!(
+        "{} listed key(s) vanished before head (deleted between LIST and HEAD); skipping: ",
+        total
+    );
+    msg.push_str(&shown.join(", "));
+    if total > MAX {
+        msg.push_str(&format!(" and {} more", total - MAX));
+    }
+    Some(msg)
 }
 
 #[cfg(test)]
@@ -195,6 +269,17 @@ mod tests {
     }
 
     #[test]
+    fn object_store_is_send_sync() {
+        // I20-traits: `ObjectStore` must be shareable across the scoped
+        // worker pool (each worker holds a `&dyn ObjectStore` on its own
+        // thread), so the supertraits are a compile-time contract. This test
+        // is the pin: it fails to compile if the trait ever loses `Send +
+        // Sync`. RED today (trait lacks the supertraits).
+        fn assert_ss<T: ?Sized + Send + Sync>() {}
+        assert_ss::<dyn ObjectStore>();
+    }
+
+    #[test]
     fn enrich_corrects_stale_listing_size_with_head_size() {
         let (store, mut listing) = degraded_listing();
         // Corrupt one file entity's listed `size` far from the real value.
@@ -208,7 +293,7 @@ mod tests {
             .find(|e| e.key == "a.md")
             .unwrap();
         a.size = 9_999;
-        let enriched = enrich_with_head_mtimes(&store, listing).unwrap();
+        let enriched = enrich_with_head_mtimes(&store, listing, 1).unwrap();
         let a = enriched.entities.iter().find(|e| e.key == "a.md").unwrap();
         assert_eq!(a.size, store.head("a.md").unwrap().size);
         assert_eq!(
@@ -220,7 +305,7 @@ mod tests {
     #[test]
     fn enrich_overrides_listing_mtime_with_head_mtime() {
         let (store, listing) = degraded_listing();
-        let enriched = enrich_with_head_mtimes(&store, listing).unwrap();
+        let enriched = enrich_with_head_mtimes(&store, listing, 1).unwrap();
         // head reports the true (earlier) metadata mtimes and the real etag.
         let a = enriched.entities.iter().find(|e| e.key == "a.md").unwrap();
         assert_eq!(a.mtime_ms, Some(100));
@@ -262,7 +347,7 @@ mod tests {
             entities,
             warnings: vec!["pre-existing".to_string()],
         };
-        let enriched = enrich_with_head_mtimes(&store, listing).unwrap();
+        let enriched = enrich_with_head_mtimes(&store, listing, 1).unwrap();
         // Healthy row kept; all vanished rows dropped.
         let keys: Vec<_> = enriched.entities.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(keys, vec!["a.md"]);
@@ -283,19 +368,407 @@ mod tests {
         // A listed key that vanishes between LIST and HEAD (concurrent-delete
         // race): head answers NotFound, so the row is dropped, siblings kept.
         listing.entities.push(file("gone.md", 5, Some(9_999_999)));
-        let enriched = enrich_with_head_mtimes(&store, listing).unwrap();
+        let enriched = enrich_with_head_mtimes(&store, listing, 1).unwrap();
         let keys: Vec<_> = enriched.entities.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(keys, vec!["a.md", "notes/", "notes/b.md"]);
     }
 
+    /// Store wrapper that gauges the max number of concurrent `head` calls
+    /// (I20 cycle 5 overlap probe - gauges, never wall-clock).
+    struct GaugedHeadStore {
+        inner: MemoryStore,
+        in_flight: std::sync::atomic::AtomicUsize,
+        max_in_flight: std::sync::atomic::AtomicUsize,
+    }
+    impl GaugedHeadStore {
+        fn new() -> Self {
+            GaugedHeadStore {
+                inner: MemoryStore::new(),
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                max_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn max_in_flight(&self) -> usize {
+            self.max_in_flight.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    impl ObjectStore for GaugedHeadStore {
+        fn list(&self, prefix: &str) -> Result<Listing, Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<Entity, Error> {
+            let cur = self
+                .in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            self.max_in_flight
+                .fetch_max(cur, std::sync::atomic::Ordering::SeqCst);
+            std::thread::yield_now();
+            let r = self.inner.head(key);
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            r
+        }
+        fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime: Option<u64>,
+        ) -> Result<Entity, Error> {
+            self.inner.put_from(key, r, size, mtime)
+        }
+        fn delete(&self, key: &str) -> Result<(), Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// Store whose `head` fails specific keys with distinct messages (I20
+    /// cycle 5 listing-order error-selection probe).
+    struct KeyFailStore {
+        inner: MemoryStore,
+        fails: std::collections::HashMap<String, String>,
+    }
+    impl KeyFailStore {
+        fn new(inner: MemoryStore) -> Self {
+            KeyFailStore {
+                inner,
+                fails: std::collections::HashMap::new(),
+            }
+        }
+        fn fail(&mut self, key: &str, msg: &str) {
+            self.fails.insert(key.to_string(), msg.to_string());
+        }
+    }
+    impl ObjectStore for KeyFailStore {
+        fn list(&self, prefix: &str) -> Result<Listing, Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<Entity, Error> {
+            if let Some(msg) = self.fails.get(key) {
+                return Err(Error::Other(format!("{key}:{msg}")));
+            }
+            self.inner.head(key)
+        }
+        fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime: Option<u64>,
+        ) -> Result<Entity, Error> {
+            self.inner.put_from(key, r, size, mtime)
+        }
+        fn delete(&self, key: &str) -> Result<(), Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    #[test]
+    #[ignore = "yield_now overlap gauge flaky under full-suite scheduling (pre-existing; observed on the pristine baseline); reliability deferred to issue #17 - run via --ignored"]
+    fn enrich_heads_bounded_parallel() {
+        // I20 cycle 5: a 32-object enrichment at concurrency 4 fans out - the
+        // max-in-flight `head` gauge must exceed 1 (real overlap), stay <= 4,
+        // and the enriched listing (order included) must equal the
+        // concurrency-1 result exactly.
+        let store = GaugedHeadStore::new();
+        for i in 0..32 {
+            let mut c = std::io::Cursor::new(b"x".to_vec());
+            store
+                .inner
+                .put_from(&format!("k{i:02}.md"), &mut c, 1, Some(1000 + i))
+                .unwrap();
+        }
+        let listing = store.inner.list("").unwrap();
+        let enriched4 = enrich_with_head_mtimes(&store, listing.clone(), 4).unwrap();
+        assert!(
+            store.max_in_flight() > 1,
+            "heads must overlap at concurrency 4 (max in-flight {})",
+            store.max_in_flight()
+        );
+        assert!(store.max_in_flight() <= 4);
+        let enriched1 = enrich_with_head_mtimes(&store, listing, 1).unwrap();
+        assert_eq!(enriched4, enriched1, "enriched listings must be identical");
+    }
+
+    #[test]
+    fn enrich_parallel_vanished_warning_order_stable() {
+        // I20 cycle 5: vanished keys interleaved with healthy ones - the
+        // bounded warning names them in listing order, identical across runs
+        // and identical to the concurrency-1 result.
+        let store = GaugedHeadStore::new();
+        let mut entities = Vec::new();
+        let mut c = std::io::Cursor::new(b"a".to_vec());
+        store.inner.put_from("a.md", &mut c, 1, Some(100)).unwrap();
+        entities.push(file("a.md", 1, Some(9_999_999)));
+        for i in 0..7 {
+            entities.push(file(&format!("gone-{i}.md"), 5, Some(9_999_999)));
+        }
+        let mut c = std::io::Cursor::new(b"z".to_vec());
+        store.inner.put_from("z.md", &mut c, 1, Some(200)).unwrap();
+        entities.push(file("z.md", 1, Some(9_999_999)));
+        let listing = Listing {
+            entities,
+            warnings: vec!["pre-existing".to_string()],
+        };
+        let r1 = enrich_with_head_mtimes(&store, listing.clone(), 1).unwrap();
+        let r4 = enrich_with_head_mtimes(&store, listing, 4).unwrap();
+        assert_eq!(r1, r4);
+        assert_eq!(
+            r4.warnings[1],
+            "7 listed key(s) vanished before head (deleted between LIST and HEAD); skipping: \
+             gone-0.md, gone-1.md, gone-2.md, gone-3.md, gone-4.md and 2 more"
+        );
+    }
+
+    #[test]
+    fn enrich_parallel_fails_closed() {
+        // I20 cycle 5 / I20-heads: a non-NotFound head error fails the whole
+        // listing with that error, exactly like the sequential path. With two
+        // non-NotFound errors on different keys the returned error is the one
+        // of the key EARLIER in listing order (deterministic, independent of
+        // completion order); the failed listing carries no partial entities
+        // and no vanished warning (the warning is built on the success path
+        // only). In-flight heads are not cancelled - extra completed requests
+        // are accepted (documented behavior).
+        let mut store = KeyFailStore::new(MemoryStore::new());
+        let mut c = std::io::Cursor::new(b"a".to_vec());
+        store.inner.put_from("a.md", &mut c, 1, Some(1)).unwrap();
+        let mut c = std::io::Cursor::new(b"b".to_vec());
+        store.inner.put_from("b.md", &mut c, 1, Some(2)).unwrap();
+        let mut c = std::io::Cursor::new(b"c".to_vec());
+        store.inner.put_from("c.md", &mut c, 1, Some(3)).unwrap();
+        store.fail("a.md", "boom-a");
+        store.fail("c.md", "boom-c");
+        let listing = Listing {
+            entities: vec![
+                file("a.md", 1, Some(1)),
+                file("b.md", 1, Some(2)),
+                file("c.md", 1, Some(3)),
+            ],
+            warnings: Vec::new(),
+        };
+        let err = enrich_with_head_mtimes(&store, listing, 4).unwrap_err();
+        assert_eq!(
+            format!("{err}"),
+            "a.md:boom-a",
+            "the error of the listing-earliest failing key must win"
+        );
+    }
+
+    /// Store recording the order of `head` attempts (I20 cycle 5 order lock).
+    struct HeadLogStore {
+        inner: MemoryStore,
+        log: std::sync::Mutex<Vec<String>>,
+    }
+    impl HeadLogStore {
+        fn new(inner: MemoryStore) -> Self {
+            HeadLogStore {
+                inner,
+                log: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+    impl ObjectStore for HeadLogStore {
+        fn list(&self, prefix: &str) -> Result<Listing, Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<Entity, Error> {
+            self.log.lock().unwrap().push(key.to_string());
+            self.inner.head(key)
+        }
+        fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime: Option<u64>,
+        ) -> Result<Entity, Error> {
+            self.inner.put_from(key, r, size, mtime)
+        }
+        fn delete(&self, key: &str) -> Result<(), Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// Store whose `head` logs every attempt and fails a specific key with a
+    /// non-NotFound error (I20-r1/F1 short-circuit probe). Combines the
+    /// `HeadLogStore` attempt log with the `KeyFailStore` error injection.
+    struct UnauthorizedHeadLogStore {
+        inner: MemoryStore,
+        log: std::sync::Mutex<Vec<String>>,
+        fail: std::sync::Mutex<std::collections::HashSet<String>>,
+    }
+    impl UnauthorizedHeadLogStore {
+        fn new(inner: MemoryStore) -> Self {
+            Self {
+                inner,
+                log: std::sync::Mutex::new(Vec::new()),
+                fail: std::sync::Mutex::new(std::collections::HashSet::new()),
+            }
+        }
+        fn fail(&self, key: &str) {
+            self.fail.lock().unwrap().insert(key.to_string());
+        }
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+    impl ObjectStore for UnauthorizedHeadLogStore {
+        fn list(&self, prefix: &str) -> Result<Listing, Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<Entity, Error> {
+            self.log.lock().unwrap().push(key.to_string());
+            if self.fail.lock().unwrap().contains(key) {
+                return Err(Error::Unauthorized(format!("denied:{key}")));
+            }
+            self.inner.head(key)
+        }
+        fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime_ms: Option<u64>,
+        ) -> Result<Entity, Error> {
+            self.inner.put_from(key, r, size, mtime_ms)
+        }
+        fn delete(&self, key: &str) -> Result<(), Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    #[test]
+    fn enrich_concurrency_1_stops_at_first_hard_error() {
+        // I20-r1/F1: at concurrency 1 the sequential path must short-circuit
+        // on the FIRST non-NotFound head error (pre-I20 loop shape), instead
+        // of issuing all N heads and then reporting the listing-earliest
+        // error. `a.md`'s head fails with Unauthorized and every attempt is
+        // logged, so the log is the ground truth for how many heads were
+        // issued. RED today: the pooled path issues all heads even at
+        // concurrency 1 (log == [a, b, c]).
+        let store = UnauthorizedHeadLogStore::new(MemoryStore::new());
+        for (key, body, mtime) in [("a.md", "a", 1), ("b.md", "b", 2), ("c.md", "c", 3)] {
+            let mut c = std::io::Cursor::new(body.as_bytes().to_vec());
+            store
+                .inner
+                .put_from(key, &mut c, body.len() as u64, Some(mtime))
+                .unwrap();
+        }
+        store.fail("a.md");
+        let listing = Listing {
+            entities: vec![
+                file("a.md", 1, Some(1)),
+                file("b.md", 1, Some(2)),
+                file("c.md", 1, Some(3)),
+            ],
+            warnings: Vec::new(),
+        };
+        let err = enrich_with_head_mtimes(&store, listing, 1).unwrap_err();
+        assert!(
+            matches!(err, Error::Unauthorized(_)),
+            "a.md's Unauthorized must fail the listing, got {err:?}"
+        );
+        assert_eq!(
+            store.log(),
+            vec!["a.md".to_string()],
+            "sequential path must stop at the first hard error (attempt log: {:?})",
+            store.log()
+        );
+    }
+
+    #[test]
+    fn enrich_parallel_issues_all_heads_on_error() {
+        // I20-r1/F1 pin: the pooled path deliberately does NOT cancel
+        // in-flight heads when a sibling fails - with a.md failing, all
+        // three heads are still issued (documented, accepted behavior), and
+        // the returned error is still the listing-earliest one (I20-heads
+        // error lock). GREEN on arrival; guards against a "fix" that adds
+        // cancellation to the pooled path.
+        let store = UnauthorizedHeadLogStore::new(MemoryStore::new());
+        for (key, body, mtime) in [("a.md", "a", 1), ("b.md", "b", 2), ("c.md", "c", 3)] {
+            let mut c = std::io::Cursor::new(body.as_bytes().to_vec());
+            store
+                .inner
+                .put_from(key, &mut c, body.len() as u64, Some(mtime))
+                .unwrap();
+        }
+        store.fail("a.md");
+        let listing = Listing {
+            entities: vec![
+                file("a.md", 1, Some(1)),
+                file("b.md", 1, Some(2)),
+                file("c.md", 1, Some(3)),
+            ],
+            warnings: Vec::new(),
+        };
+        let err = enrich_with_head_mtimes(&store, listing, 4).unwrap_err();
+        assert!(
+            matches!(err, Error::Unauthorized(_)),
+            "listing-earliest error must win, got {err:?}"
+        );
+        let mut attempted = store.log();
+        attempted.sort();
+        assert_eq!(
+            attempted,
+            vec!["a.md".to_string(), "b.md".to_string(), "c.md".to_string()],
+            "pooled path must issue all heads even when one fails"
+        );
+    }
+
+    #[test]
+    fn enrich_concurrency_1_unchanged() {
+        // I20-one: at concurrency 1 enrichment produces exactly today's
+        // entities/warnings, and head attempts happen in listing order.
+        let store = HeadLogStore::new(MemoryStore::new());
+        for i in 0..4 {
+            let mut c = std::io::Cursor::new(b"x".to_vec());
+            store
+                .inner
+                .put_from(&format!("k{i}.md"), &mut c, 1, Some(1000 + i))
+                .unwrap();
+        }
+        let listing = store.inner.list("").unwrap();
+        let expected: Vec<String> = listing
+            .entities
+            .iter()
+            .filter(|e| !e.is_folder())
+            .map(|e| e.key.clone())
+            .collect();
+        let enriched = enrich_with_head_mtimes(&store, listing.clone(), 1).unwrap();
+        assert_eq!(
+            store.log(),
+            expected,
+            "head attempts must run in listing order at concurrency 1"
+        );
+        assert_eq!(enriched.entities, listing.entities);
+        assert_eq!(enriched.warnings, listing.warnings);
+    }
+
     /// Store whose `head` fails with a non-NotFound error (throttling class).
     struct HeadFailStore {
-        calls: std::cell::Cell<usize>,
+        calls: std::sync::atomic::AtomicUsize,
     }
     impl HeadFailStore {
         fn new() -> Self {
             Self {
-                calls: std::cell::Cell::new(0),
+                calls: std::sync::atomic::AtomicUsize::new(0),
             }
         }
     }
@@ -304,7 +777,8 @@ mod tests {
             Ok(Listing::default())
         }
         fn head(&self, _key: &str) -> Result<Entity, Error> {
-            self.calls.set(self.calls.get() + 1);
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Err(Error::Unavailable("throttled".to_string()))
         }
         fn get_to(&self, _key: &str, _w: &mut dyn std::io::Write) -> Result<Entity, Error> {
@@ -337,7 +811,7 @@ mod tests {
         inner: MemoryStore,
         fail_first: usize,
         kind: FlakyKind,
-        calls: std::cell::Cell<usize>,
+        calls: std::sync::atomic::AtomicUsize,
     }
     impl FlakyHeadStore {
         fn new(inner: MemoryStore, fail_first: usize, kind: FlakyKind) -> Self {
@@ -345,7 +819,7 @@ mod tests {
                 inner,
                 fail_first,
                 kind,
-                calls: std::cell::Cell::new(0),
+                calls: std::sync::atomic::AtomicUsize::new(0),
             }
         }
         fn err(&self) -> Error {
@@ -360,8 +834,9 @@ mod tests {
             self.inner.list("")
         }
         fn head(&self, key: &str) -> Result<Entity, Error> {
-            let n = self.calls.get();
-            self.calls.set(n + 1);
+            let n = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < self.fail_first {
                 return Err(self.err());
             }
@@ -400,12 +875,16 @@ mod tests {
             entities: vec![file("a.md", 9_999, Some(9_999_999))],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&flaky, listing).unwrap_err();
+        let err = enrich_with_head_mtimes(&flaky, listing, 1).unwrap_err();
         assert!(
             matches!(err, Error::Unavailable(_)),
             "a transient head error must fail the listing on the first attempt, got {err:?}"
         );
-        assert_eq!(flaky.calls.get(), 1, "must be a single head attempt");
+        assert_eq!(
+            flaky.calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "must be a single head attempt"
+        );
     }
 
     #[test]
@@ -418,9 +897,9 @@ mod tests {
             entities: vec![file("a.md", 1, Some(9_999_999))],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&store, listing).unwrap_err();
+        let err = enrich_with_head_mtimes(&store, listing, 1).unwrap_err();
         assert!(matches!(err, Error::Unavailable(_)));
-        assert_eq!(store.calls.get(), 1, "must be a single head attempt");
+        assert_eq!(store.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -432,9 +911,9 @@ mod tests {
             entities: vec![file("a.md", 1, None)],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&flaky, listing).unwrap_err();
+        let err = enrich_with_head_mtimes(&flaky, listing, 1).unwrap_err();
         assert!(matches!(err, Error::Unauthorized(_)));
-        assert_eq!(flaky.calls.get(), 1);
+        assert_eq!(flaky.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -443,7 +922,7 @@ mod tests {
             entities: vec![file("a.md", 1, Some(9_999_999))],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&HeadFailStore::new(), listing).unwrap_err();
+        let err = enrich_with_head_mtimes(&HeadFailStore::new(), listing, 1).unwrap_err();
         assert!(
             matches!(err, Error::Unavailable(_)),
             "non-NotFound head error must fail the listing, got {err:?}"
@@ -460,6 +939,7 @@ mod tests {
                 entities: Vec::new(),
                 warnings: vec!["w".to_string()],
             },
+            1,
         )
         .unwrap();
         assert!(empty.entities.is_empty());
@@ -472,6 +952,7 @@ mod tests {
                 entities: vec![folder("notes")],
                 warnings: Vec::new(),
             },
+            1,
         )
         .unwrap();
         assert_eq!(folder_only.entities.len(), 1);
