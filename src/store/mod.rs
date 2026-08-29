@@ -101,7 +101,12 @@ pub trait ObjectStore {
 /// Folder views are skipped (not objects; `head` on a folder key is NotFound
 /// by contract - see the `ObjectStore::list` doc). A `NotFound` head drops the
 /// row (a genuine concurrent-delete race; planning against a vanished object
-/// would be worse). Any *other* head error fails the whole listing (I15-errors,
+/// would be worse) and is surfaced, not hidden, as one bounded warning in
+/// `Listing.warnings` (W70/W79 surface-don't-hide; see W116). Note that
+/// folder views synthesized before enrichment can survive their children -
+/// all objects under a prefix deleted between LIST and HEAD leaves a stale
+/// folder view - which is benign because folders plan as Skip and are never
+/// delete targets. Any *other* head error fails the whole listing (I15-errors,
 /// fail-closed - never plan against a knowingly-degraded remote view, matching
 /// the W61 ethos and `pull --delete` safety). Entity order (sorted) and
 /// `warnings` are preserved verbatim.
@@ -110,6 +115,7 @@ pub(crate) fn enrich_with_head_mtimes<S: ObjectStore + ?Sized>(
     listing: Listing,
 ) -> Result<Listing, Error> {
     let mut entities = Vec::new();
+    let mut vanished: Vec<String> = Vec::new();
     for e in listing.entities {
         if e.is_folder() {
             entities.push(e);
@@ -124,15 +130,30 @@ pub(crate) fn enrich_with_head_mtimes<S: ObjectStore + ?Sized>(
                 entities.push(e);
             }
             Err(Error::NotFound(_)) => {
-                // Concurrent-delete race between LIST and HEAD: drop the row.
+                // Concurrent-delete race between LIST and HEAD: drop the row,
+                // and surface the drop (W70/W79 surface-don't-hide ethos) via
+                // one bounded warning appended below.
+                vanished.push(e.key);
             }
             Err(err) => return Err(err),
         }
     }
-    Ok(Listing {
-        entities,
-        warnings: listing.warnings,
-    })
+    let mut warnings = listing.warnings;
+    if !vanished.is_empty() {
+        const MAX: usize = 5;
+        let total = vanished.len();
+        let shown: Vec<&str> = vanished.iter().take(MAX).map(|s| s.as_str()).collect();
+        let mut msg = format!(
+            "{} listed key(s) vanished before head (deleted between LIST and HEAD); skipping: ",
+            total
+        );
+        msg.push_str(&shown.join(", "));
+        if total > MAX {
+            msg.push_str(&format!(" and {} more", total - MAX));
+        }
+        warnings.push(msg);
+    }
+    Ok(Listing { entities, warnings })
 }
 
 #[cfg(test)]
@@ -218,6 +239,39 @@ mod tests {
         let keys: Vec<_> = enriched.entities.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(keys, vec!["a.md", "notes/", "notes/b.md"]);
         assert_eq!(enriched.warnings, vec!["warn-1".to_string()]);
+    }
+
+    #[test]
+    fn enrich_warns_bounded_when_rows_vanish_before_head() {
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"a".to_vec());
+        store.put_from("a.md", &mut c, 1, Some(100)).unwrap();
+        // Seven listed keys that no longer exist (deleted between LIST and
+        // HEAD) plus one healthy key. The drop is surfaced as a single
+        // bounded warning naming the first 5 + "and N more" (W79 ethos).
+        let vanished: Vec<Entity> = (0..7)
+            .map(|i| file(&format!("gone-{i}.md"), 5, Some(9_999_999)))
+            .collect();
+        let mut entities = Vec::new();
+        entities.push(file("a.md", 1, Some(9_999_999)));
+        entities.extend(vanished);
+        let listing = Listing {
+            entities,
+            warnings: vec!["pre-existing".to_string()],
+        };
+        let enriched = enrich_with_head_mtimes(&store, listing).unwrap();
+        // Healthy row kept; all vanished rows dropped.
+        let keys: Vec<_> = enriched.entities.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["a.md"]);
+        // Exactly one appended warning, bounded to 5 names + "and 2 more";
+        // pre-existing warning preserved verbatim (append, not replace).
+        assert_eq!(enriched.warnings.len(), 2);
+        assert_eq!(enriched.warnings[0], "pre-existing");
+        assert_eq!(
+            enriched.warnings[1],
+            "7 listed key(s) vanished before head (deleted between LIST and HEAD); skipping: \
+             gone-0.md, gone-1.md, gone-2.md, gone-3.md, gone-4.md and 2 more"
+        );
     }
 
     #[test]
