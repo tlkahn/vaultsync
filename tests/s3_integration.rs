@@ -238,16 +238,22 @@ fn s3_integ_put_get_head_delete_roundtrip() {
 #[test]
 fn s3_integ_list_paginates() {
     // Seed >1000 keys (S3 pages at 1000) concurrently, confirm list returns all.
-    // Issue #17 (I17-conc): run through `with_store_conc` at K = 32, NOT
-    // `with_store` (hardcoded concurrency 1) - live proof of I20-heads at the
-    // scale that motivated it. Harness cleanup uses unenriched list_object_keys
-    // + parallel deletes so the full test stays under the CI budget.
+    // Issue #17 (I17-conc) + P30-paginate-sub-30s: run through `with_store_conc`
+    // at K = 128 (not `with_store` / concurrency 1) - live proof of I20-heads at
+    // the scale that motivated it. Seed fan-out is independent of store K and
+    // is set to 64 so put RTT is not the wall-clock floor. K swept 32 -> 64 ->
+    // 128: K=64 already crossed <30s but occasional totals sat near/over the
+    // bar (~28-33s); K=128 holds ~18-24s with margin. Harness cleanup uses
+    // unenriched list_object_keys + parallel deletes under the same K.
+    // DeleteObjects / put fast-path / coverage split were not needed.
     let n = 1050usize;
-    with_store_conc("paginate", 32, |s| {
+    let seed_workers = 64usize;
+    let store_k = 128u32;
+    with_store_conc("paginate", store_k, |s| {
         std::thread::scope(|scope| {
-            for t in 0..16 {
+            for t in 0..seed_workers {
                 scope.spawn(move || {
-                    for i in (t..n).step_by(16) {
+                    for i in (t..n).step_by(seed_workers) {
                         put_bytes(s, &format!("p/obj-{i:05}.dat"), b"x", Some(i as u64)).unwrap();
                     }
                 });
