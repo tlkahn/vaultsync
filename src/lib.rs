@@ -354,7 +354,7 @@ pub(crate) mod testutil {
         /// bigger than any real mtime so the degraded frame is unambiguous).
         upload_time_ms: u64,
         /// Every key the double's `head` delegate has served, in order.
-        head_log: std::cell::RefCell<Vec<String>>,
+        head_log: std::sync::Mutex<Vec<String>>,
         /// Keys whose `head` should answer `Unavailable` (W118 fail-closed
         /// scope-creep probe).
         fail_head_keys: Vec<String>,
@@ -365,7 +365,7 @@ pub(crate) mod testutil {
             S3LikeListStore {
                 inner: crate::store::mock::MemoryStore::new(),
                 upload_time_ms: 9_999_999_999,
-                head_log: std::cell::RefCell::new(Vec::new()),
+                head_log: std::sync::Mutex::new(Vec::new()),
                 fail_head_keys: Vec::new(),
             }
         }
@@ -379,7 +379,7 @@ pub(crate) mod testutil {
         }
         /// Snapshot of every key the double's `head` has served, in order.
         pub(crate) fn head_log(&self) -> Vec<String> {
-            self.head_log.borrow().clone()
+            self.head_log.lock().unwrap().clone()
         }
     }
 
@@ -406,7 +406,7 @@ pub(crate) mod testutil {
             crate::store::enrich_with_head_mtimes(self, listing)
         }
         fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
-            self.head_log.borrow_mut().push(key.to_string());
+            self.head_log.lock().unwrap().push(key.to_string());
             if self.fail_head_keys.iter().any(|k| k == key) {
                 return Err(crate::error::Error::Unavailable(format!(
                     "throttled: {key}"

@@ -191,6 +191,15 @@ impl ObjectStore for MemoryStore {
 mod tests {
     use super::*;
 
+    #[test]
+    fn memory_store_is_send_sync() {
+        // I20-traits: `MemoryStore` is `Mutex`-backed (already `Send +
+        // Sync`); the pin locks the property so the pool can share it across
+        // worker threads.
+        fn assert_ss<T: ?Sized + Send + Sync>() {}
+        assert_ss::<MemoryStore>();
+    }
+
     fn new_store() -> MemoryStore {
         MemoryStore::new()
     }

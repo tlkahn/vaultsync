@@ -734,6 +734,18 @@ mod tests {
     use crate::testutil::TempDir;
 
     #[test]
+    fn s3_store_is_send_sync() {
+        // I20-traits verification: `S3Store` holds a current-thread tokio
+        // `Runtime` and an aws `Client` (W48). This pin proves both are
+        // `Send + Sync` so the scoped worker pool can share `&S3Store` across
+        // threads. Per the issue-20 plan this assertion IS the verification:
+        // if it fails to compile, stop and reassess the runtime shape before
+        // building the pool.
+        fn assert_ss<T: ?Sized + Send + Sync>() {}
+        assert_ss::<S3Store>();
+    }
+
+    #[test]
     fn reap_stale_upload_temps_removes_old_leftovers() {
         // r10-L2 (W88): a crash/SIGKILL between buffering and remove_file
         // leaks a full buffered object in the shared temp dir; no cross-run

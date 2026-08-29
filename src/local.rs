@@ -1388,6 +1388,15 @@ mod tests {
     use super::*;
     use crate::testutil::TempDir;
 
+    #[test]
+    fn local_fs_is_send_sync() {
+        // I20-traits: `LocalFs` is `Mutex`-based (W82) so the scoped worker
+        // pool can share it across threads; the pin locks W82's intent as a
+        // compile-time contract.
+        fn assert_ss<T: ?Sized + Send + Sync>() {}
+        assert_ss::<LocalFs>();
+    }
+
     fn keys(fs: &LocalFs) -> Vec<String> {
         fs.list().unwrap().iter().map(|e| e.key.clone()).collect()
     }

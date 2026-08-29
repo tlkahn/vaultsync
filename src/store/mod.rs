@@ -37,7 +37,13 @@ pub struct Listing {
 /// read/delete paths may answer [`Error::NotFound`] for invalid keys (mock
 /// behavior). Phase 2 backends must never forward an unvalidated key to a
 /// provider (e.g. S3) - validate before any outbound call.
-pub trait ObjectStore {
+///
+/// I20-traits: `Send + Sync` are supertraits so a shared `&dyn ObjectStore`
+/// can be handed to the scoped worker pool (each worker thread calls the
+/// store through `&self`). Implementations must be `Send + Sync`;
+/// interior-mutable state must use `Mutex`/`Atomic*` (the `Cell`/`RefCell`
+/// test doubles migrated in issue 20, cycle 1).
+pub trait ObjectStore: Send + Sync {
     /// List entities whose key starts with `prefix`. `""` lists everything.
     /// Folders are synthesized from key prefixes when no folder marker object
     /// exists. Results are sorted by key.
@@ -195,6 +201,17 @@ mod tests {
     }
 
     #[test]
+    fn object_store_is_send_sync() {
+        // I20-traits: `ObjectStore` must be shareable across the scoped
+        // worker pool (each worker holds a `&dyn ObjectStore` on its own
+        // thread), so the supertraits are a compile-time contract. This test
+        // is the pin: it fails to compile if the trait ever loses `Send +
+        // Sync`. RED today (trait lacks the supertraits).
+        fn assert_ss<T: ?Sized + Send + Sync>() {}
+        assert_ss::<dyn ObjectStore>();
+    }
+
+    #[test]
     fn enrich_corrects_stale_listing_size_with_head_size() {
         let (store, mut listing) = degraded_listing();
         // Corrupt one file entity's listed `size` far from the real value.
@@ -290,12 +307,12 @@ mod tests {
 
     /// Store whose `head` fails with a non-NotFound error (throttling class).
     struct HeadFailStore {
-        calls: std::cell::Cell<usize>,
+        calls: std::sync::atomic::AtomicUsize,
     }
     impl HeadFailStore {
         fn new() -> Self {
             Self {
-                calls: std::cell::Cell::new(0),
+                calls: std::sync::atomic::AtomicUsize::new(0),
             }
         }
     }
@@ -304,7 +321,8 @@ mod tests {
             Ok(Listing::default())
         }
         fn head(&self, _key: &str) -> Result<Entity, Error> {
-            self.calls.set(self.calls.get() + 1);
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Err(Error::Unavailable("throttled".to_string()))
         }
         fn get_to(&self, _key: &str, _w: &mut dyn std::io::Write) -> Result<Entity, Error> {
@@ -337,7 +355,7 @@ mod tests {
         inner: MemoryStore,
         fail_first: usize,
         kind: FlakyKind,
-        calls: std::cell::Cell<usize>,
+        calls: std::sync::atomic::AtomicUsize,
     }
     impl FlakyHeadStore {
         fn new(inner: MemoryStore, fail_first: usize, kind: FlakyKind) -> Self {
@@ -345,7 +363,7 @@ mod tests {
                 inner,
                 fail_first,
                 kind,
-                calls: std::cell::Cell::new(0),
+                calls: std::sync::atomic::AtomicUsize::new(0),
             }
         }
         fn err(&self) -> Error {
@@ -360,8 +378,9 @@ mod tests {
             self.inner.list("")
         }
         fn head(&self, key: &str) -> Result<Entity, Error> {
-            let n = self.calls.get();
-            self.calls.set(n + 1);
+            let n = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < self.fail_first {
                 return Err(self.err());
             }
@@ -405,7 +424,11 @@ mod tests {
             matches!(err, Error::Unavailable(_)),
             "a transient head error must fail the listing on the first attempt, got {err:?}"
         );
-        assert_eq!(flaky.calls.get(), 1, "must be a single head attempt");
+        assert_eq!(
+            flaky.calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "must be a single head attempt"
+        );
     }
 
     #[test]
@@ -420,7 +443,7 @@ mod tests {
         };
         let err = enrich_with_head_mtimes(&store, listing).unwrap_err();
         assert!(matches!(err, Error::Unavailable(_)));
-        assert_eq!(store.calls.get(), 1, "must be a single head attempt");
+        assert_eq!(store.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -434,7 +457,7 @@ mod tests {
         };
         let err = enrich_with_head_mtimes(&flaky, listing).unwrap_err();
         assert!(matches!(err, Error::Unauthorized(_)));
-        assert_eq!(flaky.calls.get(), 1);
+        assert_eq!(flaky.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[test]
