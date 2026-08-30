@@ -1262,6 +1262,24 @@ fn walk(
         // an invalid name must not abort the walk (P1r7-special-node-key).
         if ft.is_dir() {
             let key = format!("{}/", path_to_key(rel)?);
+            // W220 (issue 45): the control-plane directory `.vaultsync/`
+            // (first path segment exactly `.vaultsync`) is never walked or
+            // uploaded - the local cache lives there. Reserved-namespace
+            // stays FIRST and independent (D-filter-order): counted in
+            // `skipped_temp_files` (the reserved bucket), never as an ignore
+            // drop, and never recursed into. Nested `notes/.vaultsync/` is a
+            // normal user folder (first segment `notes`).
+            // W220 (issue 45): the control-plane directory `.vaultsync/`
+            // (first path segment exactly `.vaultsync`) is never walked or
+            // uploaded - the local cache lives there. Reserved-namespace
+            // stays FIRST and independent (D-filter-order): counted in
+            // `skipped_temp_files` (the reserved bucket), never as an ignore
+            // drop, and never recursed into. Nested `notes/.vaultsync/` is a
+            // normal user folder (first segment `notes`).
+            if crate::local::is_vaultsync_control_plane_key(&key) {
+                report.skipped_temp_files += 1;
+                continue;
+            }
             // D-prune (issue #32): a directory whose vault-relative key
             // matches an ignore pattern is pruned - no folder entity, no
             // recursion into it (descendants are never enumerated, so
@@ -1286,10 +1304,16 @@ fn walk(
                 report.skipped_temp_files += 1;
             } else {
                 let key = path_to_key(rel)?;
-                // Issue #32: a file whose vault-relative key matches an
-                // ignore pattern is skipped and counted (D-report: each
-                // ignored file counts 1).
-                if opts.ignore.matches(&key) {
+                // W220 (issue 45): a control-plane FILE whose key's first
+                // segment is `.vaultsync` (e.g. a stray `.vaultsync` file at
+                // the vault root) is skipped too - same rule as the
+                // directory prune, so the control plane never uploads.
+                if crate::local::is_vaultsync_control_plane_key(&key) {
+                    report.skipped_temp_files += 1;
+                } else if opts.ignore.matches(&key) {
+                    // Issue #32: a file whose vault-relative key matches an
+                    // ignore pattern is skipped and counted (D-report: each
+                    // ignored file counts 1).
                     report.skipped_ignored += 1;
                 } else if let Some(e) = file_entity(&path, &key)? {
                     out.push(e);
@@ -2797,6 +2821,43 @@ mod tests {
         let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(keys, vec!["note.md"], "check leftover listed: {keys:?}");
         assert_eq!(rep.skipped_temp_files, 1);
+    }
+
+    #[test]
+    fn walk_prunes_control_plane_directory() {
+        // W220 (issue 45): the control-plane directory `.vaultsync/` (first
+        // path segment exactly `.vaultsync`) is never walked or uploaded -
+        // the local cache lives there. Its contents (a cached manifest) must
+        // not be listed, and the prune is counted in the reserved bucket
+        // (`skipped_temp_files`), not as ignore drops. A nested
+        // `notes/.vaultsync/` user folder is NOT control-plane and stays
+        // listed (first-segment-only rule).
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::create_dir_all(dir.join(".vaultsync/cache")).unwrap();
+        std::fs::write(dir.join(".vaultsync/cache/manifest-v1.json"), "{}").unwrap();
+        std::fs::write(dir.join(".vaultsync/other.txt"), "tool-state").unwrap();
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join("notes/a.md"), "real").unwrap();
+        std::fs::create_dir_all(dir.join("notes/.vaultsync")).unwrap();
+        std::fs::write(dir.join("notes/.vaultsync/x"), "user-file").unwrap();
+        let fs = LocalFs::new(dir.path());
+        let (ents, rep) = fs.list_report().unwrap();
+        let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "notes/",
+                "notes/.vaultsync/",
+                "notes/.vaultsync/x",
+                "notes/a.md"
+            ],
+            "control-plane files listed: {keys:?}"
+        );
+        assert!(
+            rep.skipped_temp_files >= 1,
+            "control-plane prune must count in the reserved bucket: {rep:?}"
+        );
+        assert_eq!(rep.skipped_ignored, 0, "not an ignore: {rep:?}");
     }
 
     #[test]
