@@ -372,7 +372,13 @@ pub fn run_with_io(
                 ..Default::default()
             };
             let local = crate::local::LocalFs::with_follow(&vault, follow_symlinks);
-            match crate::build_plan(&local, store, Mode::Status, &opts) {
+            match crate::build_plan(
+                &local,
+                store,
+                Mode::Status,
+                &opts,
+                &crate::IgnoreSet::empty(),
+            ) {
                 Ok(report) => {
                     // H1 (W99): build_plan + store-listing warnings surface
                     // here, at the CLI layer - library code never writes to
@@ -531,7 +537,7 @@ fn dispatch_plan(
     // the seam).
     let resolved =
         crate::progress::resolve_progress_mode(flags.progress, std::io::stderr().is_terminal());
-    match crate::build_plan(&local, store, mode, opts) {
+    match crate::build_plan(&local, store, mode, opts, &crate::IgnoreSet::empty()) {
         Ok(report) => {
             // H1 (W99): build_plan + store-listing warnings surface here, at
             // the CLI layer - library code never writes to stderr.

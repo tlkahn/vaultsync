@@ -22,9 +22,11 @@ use crate::error::Error;
 /// Construct once with [`IgnoreSet::from_patterns`], then query repeatedly
 /// with [`IgnoreSet::matches`]. No re-parsing happens after construction.
 ///
-/// This issue ships only the pure matcher (issue #30); application - walk
-/// prune (#32), remote filter (#33), W25 retirement (#34) - is later epic #9
-/// work that filters entity lists through this type before planning.
+/// Pure matcher (issue #30). Application seams that filter entity lists
+/// through this type: local walk prune via [`crate::local::LocalFs::with_ignore`]
+/// (issue #32) and remote listing filter in [`crate::build_plan`] (issue #33).
+/// `[ignore]` CLI wiring / W25 retirement (#34) still wires real patterns from
+/// settings into those seams.
 #[derive(Debug, Clone)]
 pub struct IgnoreSet {
     rules: Vec<Rule>,
@@ -60,6 +62,14 @@ struct SegmentGlob {
 }
 
 impl IgnoreSet {
+    /// Empty matcher (matches nothing). Equivalent to
+    /// [`IgnoreSet::from_patterns`] `(&[])` without the `Result`. Preferred
+    /// default at `build_plan` call sites that do not care (e.g. until #34
+    /// wires real patterns from settings).
+    pub fn empty() -> Self {
+        IgnoreSet { rules: Vec::new() }
+    }
+
     /// Compile `patterns` into a reusable matcher.
     ///
     /// Empty input is valid (matches nothing). On an invalid pattern,
