@@ -583,11 +583,12 @@ patterns = [".git/"]
     #[test]
     fn resolve_absent_ignore_does_not_populate_user_field() {
         // Issue #31 (D-w25-seq, W194): the sequencing invariant - absent
-        // `[ignore]` leaves the user-only field empty (so W25/M3 never trips
-        // on the built-in default profile) while the resolved field carries
-        // the built-ins. A future mistaken merge of the two fields fails
-        // loudly here (mutation-checked: reverting `resolve_ignore` to the
-        // W186 `ignore_patterns.clone()` baseline flips this RED).
+        // `[ignore]` leaves the user-only field empty while the resolved
+        // field carries the built-ins (so the default profile can apply
+        // without a user-written pattern). A future mistaken merge of the
+        // two fields fails loudly here (mutation-checked: reverting
+        // `resolve_ignore` to the W186 `ignore_patterns.clone()` baseline
+        // flips this RED).
         let cfg = FileConfig::default();
         let s = settings(&cfg).unwrap();
         assert!(s.ignore_patterns.is_empty(), "user field must stay empty");
@@ -772,10 +773,10 @@ patterns = [".git/"]
     fn resolve_default_profile_is_obsidian() {
         // Issue #31 (D3/D-w25-seq): absent `[ignore]` (or an empty section)
         // resolves the built-in Obsidian default set in constant order on the
-        // *resolved* field, while the user-only field stays empty so W25 never
-        // trips (the critical sequencing hazard). RED: `resolved_ignore_patterns`
-        // mirrors the user list today (W186 baseline), so the six built-ins are
-        // missing.
+        // *resolved* field, while the user-only field stays empty (the
+        // user-vs-resolved split; D-wire compiles the resolved field only).
+        // RED: `resolved_ignore_patterns` mirrors the user list today (W186
+        // baseline), so the six built-ins are missing.
         let expected: Vec<String> = OBSIDIAN_DEFAULT_IGNORE_PATTERNS
             .iter()
             .map(|s| s.to_string())
@@ -785,7 +786,7 @@ patterns = [".git/"]
         let s = settings(&cfg).unwrap();
         assert!(
             s.ignore_patterns.is_empty(),
-            "user field stays empty (W25-safe)"
+            "user field stays empty (raw-only, D-wire)"
         );
         assert_eq!(s.resolved_ignore_patterns, expected);
 
@@ -1285,7 +1286,7 @@ max_delay_ms = 4000
         // W56 (B nit): unknown TOML keys must fail loudly instead of being
         // silently ignored - a `mtime_tolerance` typo (missing `_ms`) must
         // surface as a parse error naming the key, not keep the 1000 default
-        // (consistent with the W25/W28 loud-on-inert-config posture).
+        // (consistent with the loud-on-inert-config posture, W25/W28).
         let text = "[transfer]\nmtime_tolerance = 5000\n";
         let err = parse_config_str(text).unwrap_err();
         let msg = format!("{err}");

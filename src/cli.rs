@@ -1759,7 +1759,7 @@ mod tests {
             ..Default::default()
         };
         crate::config::resolve_settings(&cfg, &crate::config::EnvSnapshot::default())
-            .expect("valid ignore patterns in W25 helpers must resolve")
+            .expect("valid ignore patterns in settings helpers must resolve")
     }
 
     fn settings_profile_none(
@@ -2331,13 +2331,13 @@ mod tests {
 
     #[test]
     fn status_absent_ignore_resolve_does_not_warn_phase3() {
-        // F3/W196 (PR 38 r1): D-w25-seq locked through the CLI gate, not only
-        // at B5. A real TOML-less FileConfig (absent `[ignore]`) resolves to
-        // an empty raw user list + the six Obsidian built-ins; the W25 gate
-        // keys off the raw user field ONLY, so status must stay silent (no
-        // `[ignore].patterns` / Phase-3 text) and produce a normal plan.
-        // GREEN on arrival + mutation-checked: pointing C1 at
-        // `resolved_ignore_patterns` makes this RED.
+        // F3/W196 (PR 38 r1) kept green after the W25 retire (issue #34
+        // D-w25-retire): a real TOML-less FileConfig (absent `[ignore]`)
+        // resolves to an empty raw user list + the six Obsidian built-ins;
+        // status must stay silent (no `[ignore].patterns` / Phase-3 text -
+        // the retired W25 strings must not reappear) and produce a normal
+        // plan. The D-wire compile site reads `resolved_ignore_patterns`,
+        // never the raw user field alone.
         let dir = TempDir::new("vaultsync-cli-test");
         let cfg = crate::config::FileConfig {
             vault_root: Some(dir.path().to_path_buf()),
@@ -2368,12 +2368,12 @@ mod tests {
         assert_eq!(code, 0, "stderr: {err}");
         assert!(
             !err.contains("[ignore].patterns"),
-            "W25 must not warn when only resolved defaults are present: {err}"
+            "retired W25 warning string must not reappear: {err}"
         );
         assert!(out.contains("plan:"), "plan produced: {out}");
 
-        // section present but empty (`[ignore]` with no keys) matches
-        // absent-section at the gate (same as config W188).
+        // section present but empty (`[ignore]` with no keys) resolves
+        // identically (same as config W188).
         let cfg = crate::config::FileConfig {
             vault_root: Some(dir.path().to_path_buf()),
             ignore: Some(crate::config::IgnoreConfig::default()),
@@ -2396,19 +2396,17 @@ mod tests {
         assert_eq!(code2, 0, "stderr: {err2}");
         assert!(
             !err2.contains("[ignore].patterns"),
-            "W25 must not warn for an empty [ignore] section: {err2}"
+            "retired W25 warning string must not reappear for an empty section: {err2}"
         );
     }
 
     #[test]
     fn push_absent_ignore_resolve_does_not_trip_w25() {
-        // F3/W196: the mutating-command branch of C1. With absent `[ignore]`
-        // (raw user field empty, resolved = Obsidian six), push must NOT hit
-        // the W25 Phase-3 refusal - it falls through to the store
-        // requirement and fails there (exit 1, `[store]` message) because no
-        // bucket is configured. GREEN on arrival + mutation-checked: pointing
-        // C1 at `resolved_ignore_patterns` makes this RED (W25 refusal
-        // replaces the store error).
+        // F3/W196 kept green after the W25 retire (issue #34 D-w25-retire):
+        // with absent `[ignore]` (raw user field empty, resolved = Obsidian
+        // six), push must not emit the retired Phase-3 refusal - it falls
+        // through to the store requirement and fails there (exit 1,
+        // `[store]` message) because no bucket is configured.
         let dir = TempDir::new("vaultsync-cli-test");
         let cfg = crate::config::FileConfig {
             vault_root: Some(dir.path().to_path_buf()),
@@ -2434,11 +2432,11 @@ mod tests {
         assert_eq!(code, 1, "stderr: {err}");
         assert!(
             !err.contains("[ignore].patterns"),
-            "W25 must not refuse push when only resolved defaults are present: {err}"
+            "retired W25 refusal string must not reappear: {err}"
         );
         assert!(
             err.contains("[store]") || err.contains("store.bucket"),
-            "failure must be the store requirement, not W25: {err}"
+            "failure must be the store requirement: {err}"
         );
     }
 

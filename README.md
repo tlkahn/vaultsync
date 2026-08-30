@@ -29,8 +29,10 @@ collision/mtime/case policies, `--follow-symlinks`, and an env-gated S3
 integration suite. Verified on AWS S3 (byte-identical + exact mtimes); the
 Cloudflare R2 matrix row is pending (no R2 endpoint this session). `cargo test`
 green offline (no network in the default suite). Phase 3 (the delete
-confirmation rail - `--yes`/`--max-delete`/prompt - ignore patterns, and
-CI) is next; transfer concurrency already landed under issue 20
+confirmation rail - `--yes`/`--max-delete`/prompt - and CI) is next;
+ignore patterns are **live** (issue #34, epic #9 closed: default Obsidian
+profile, `profile = "none"` escape hatch, user patterns extend, applied on
+both sides). Transfer concurrency already landed under issue 20
 (`[transfer].concurrency`, config-only, default 4). The Phase 2 delete-
 safety surface is already
 landed (freshness guards, parent locality, head-before-delete,
@@ -81,9 +83,17 @@ action a plan - or delete files - against a non-existent store).
   post-pass is scoped to the ancestor chains of the files deleted this run
   (deepest-first, never the vault root): a pre-existing, plan-unrelated empty
   dir (e.g. an intentional `attachments/`) is kept.
-- **`[ignore].patterns` is Phase 3.** It is parsed but not yet applied:
-  `push`/`pull`/`check` refuse loudly on a non-empty `[ignore].patterns`
-  (`status` warns).
+- **`[ignore]` is live end-to-end (issue #34, epic #9 closed).** The default
+  Obsidian profile applies with no config: the Obsidian six
+  (`.git/`, `.trash/`, `.DS_Store`, `.obsidian/workspace*`) are pruned from
+  local walks **and** dropped from remote listings, so a `--delete` run never
+  removes an ignored path/key. `profile = "none"` disables the built-ins;
+  user `patterns` **extend** the active profile (union). Reserved vaultsync
+  names (`.*.vaultsync-tmp-*`, `.vaultsync-check-*`) are always skipped
+  regardless of profile. Skipped paths/keys are reported on stderr as
+  count-only warnings (`ignored N local path(s) / remote key(s) by ignore
+  patterns`). Config-only: there is no `--profile` / `--exclude` /
+  `--include` CLI flag.
 - **`[transfer].concurrency` is live (issue 20).** It bounds how many
   transfers and list-enrichment heads run in flight (default 4, valid range
   `1..=256`; `1` = sequential; the `256` cap is I20-r1 config-layer - library
