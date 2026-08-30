@@ -69,10 +69,17 @@ pub struct StoreConfig {
     pub path_style: Option<bool>,
 }
 
-/// `[ignore]` section (patterns are a Phase 3 feature; parsed but unused).
+/// `[ignore]` section. `profile` selects the built-in default ignore set
+/// (issue #31 D3/D-profile-values: `"obsidian"` is the default when the key
+/// is absent, `"none"` disables built-ins; unknown values are loud errors at
+/// resolution). `patterns` are user additions that **extend** the active
+/// profile (union). Resolution happens in [`resolve_settings`]; application
+/// lands in #34 - W25/M3 still keys off the raw user list only.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IgnoreConfig {
+    #[serde(default)]
+    pub profile: Option<String>,
     #[serde(default)]
     pub patterns: Vec<String>,
 }
@@ -463,6 +470,42 @@ max_delay_ms = 4000
         assert_eq!(retry.max_attempts, Some(5));
         assert_eq!(retry.base_delay_ms, Some(250));
         assert_eq!(retry.max_delay_ms, Some(4000));
+    }
+
+    #[test]
+    fn config_parse_ignore_profile_field() {
+        // Issue #31 (D-config-surface): `[ignore].profile` parses as an
+        // optional string; absent key -> `None` (resolves to `"obsidian"`
+        // at resolution time). `deny_unknown_fields` stays: a typo like
+        // `profil` is a loud parse error naming the key. RED: `IgnoreConfig`
+        // has no `profile` field, so serde rejects it as an unknown field.
+        let text = r#"
+[ignore]
+profile = "obsidian"
+patterns = [".git/"]
+"#;
+        let cfg = parse_config_str(text).unwrap();
+        let ig = cfg.ignore.as_ref().unwrap();
+        assert_eq!(ig.profile.as_deref(), Some("obsidian"));
+        assert_eq!(ig.patterns.len(), 1);
+
+        // No profile key -> None (default resolved later).
+        let cfg = parse_config_str("[ignore]\npatterns = []\n").unwrap();
+        let ig = cfg.ignore.as_ref().unwrap();
+        assert_eq!(ig.profile, None);
+        assert!(ig.patterns.is_empty());
+
+        // Unknown key under `[ignore]` is rejected loudly, naming the key
+        // (W56 / deny_unknown_fields).
+        for bad in ["profil = \"obsidian\"", "foo = 1"] {
+            let text = format!("[ignore]\n{bad}\n");
+            let err = parse_config_str(&text).unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("profil") || msg.contains("foo"),
+                "unknown ignore key not named in: {msg}"
+            );
+        }
     }
 
     #[test]
