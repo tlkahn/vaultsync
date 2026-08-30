@@ -157,11 +157,10 @@ pub fn build_plan(
 }
 
 /// Map an optional vault root to the S7 local-cache paths, or `None` when
-/// no vault root is threaded (cache disabled until W243). The cache lives
-/// under `<vault_root>/.vaultsync/cache/` (issue 45, D-cache).
+/// no vault root is threaded (cache disabled). The cache lives under
+/// `<vault_root>/.vaultsync/cache/` (issue 45, D-cache, W246).
 fn cache_paths(vault_root: &std::path::Path) -> Option<crate::inventory::CachePaths> {
-    let _ = vault_root;
-    None
+    Some(crate::inventory::CachePaths::new(vault_root))
 }
 
 /// Split remote entities into `(kept, dropped)` by the reserved vaultsync
@@ -631,6 +630,48 @@ pub(crate) mod testutil {
             w: &mut dyn std::io::Write,
         ) -> Result<crate::entity::Entity, crate::error::Error> {
             self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime_ms: Option<u64>,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.put_from(key, r, size, mtime_ms)
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// Store whose `get_to` always fails with Unavailable (W245): injects a
+    /// non-NotFound remote fetch failure so the cache-non-authority pin is
+    /// testable offline.
+    pub(crate) struct FailGetStore {
+        pub(crate) inner: crate::store::mock::MemoryStore,
+    }
+    impl crate::store::ObjectStore for FailGetStore {
+        fn list(&self, prefix: &str) -> Result<crate::store::Listing, crate::error::Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.head(key)
+        }
+        fn get_to(
+            &self,
+            _key: &str,
+            _w: &mut dyn std::io::Write,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            Err(crate::error::Error::Unavailable("store down".to_string()))
+        }
+        fn get_to_with(
+            &self,
+            _key: &str,
+            _w: &mut dyn std::io::Write,
+            _opts: crate::store::GetOpts,
+        ) -> Result<crate::store::GetOutcome, crate::error::Error> {
+            Err(crate::error::Error::Unavailable("store down".to_string()))
         }
         fn put_from(
             &self,
