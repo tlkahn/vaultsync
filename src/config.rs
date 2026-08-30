@@ -569,6 +569,27 @@ patterns = [".git/"]
     }
 
     #[test]
+    fn resolve_absent_ignore_does_not_populate_user_field() {
+        // Issue #31 (D-w25-seq, W194): the sequencing invariant - absent
+        // `[ignore]` leaves the user-only field empty (so W25/M3 never trips
+        // on the built-in default profile) while the resolved field carries
+        // the built-ins. A future mistaken merge of the two fields fails
+        // loudly here (mutation-checked: reverting `resolve_ignore` to the
+        // W186 `ignore_patterns.clone()` baseline flips this RED).
+        let cfg = FileConfig::default();
+        let s = settings(&cfg).unwrap();
+        assert!(s.ignore_patterns.is_empty(), "user field must stay empty");
+        assert!(
+            !s.resolved_ignore_patterns.is_empty(),
+            "resolved field must carry the built-in default"
+        );
+        assert_eq!(
+            s.resolved_ignore_patterns.len(),
+            OBSIDIAN_DEFAULT_IGNORE_PATTERNS.len()
+        );
+    }
+
+    #[test]
     fn resolve_bad_pattern_errors() {
         // Issue #31 (D-validate-seam): the full resolved list is validated
         // through `IgnoreSet::from_patterns` (single seam, matcher messages
