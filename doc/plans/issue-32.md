@@ -570,6 +570,11 @@ Issue test sketch names (use these literals where they match acceptance):
   #34; unblocks sequencing of #10.
 - Close #32 after merge (or when acceptance is green on `main`).
 - #10 may start after merge; #33 remains parallel; #34 waits on #31+#32+#33.
+- PR 37 r1 sharpening (post-merge review, doc/plans/pr-37-review-5467761913.md):
+  followed dir-symlink ignore runs before the `visited` insert on the dir arm
+  only - an ignored alias must not claim the canonical target (W67/A-L5 + R-b
+  preserved under ignore). Locality/dangling arms unchanged; plain-walk order
+  unchanged.
 
 ---
 
