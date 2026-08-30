@@ -93,7 +93,32 @@ head-bucket fallback, by design).
 
 ```text
 vaultsync check
+
 ```
+
+### `vaultsync repair`
+
+Rebuild the remote inventory manifest from a live list+head (issue 45,
+W241-W242). Never touches file bodies - it rewrites only the control-plane
+object (and the local cache mirror).
+
+```text
+vaultsync repair              # conditional write (If-Match / If-None-Match: *)
+vaultsync repair --dry-run    # count only; writes nothing
+vaultsync repair --force      # unconditional overwrite
+```
+
+Requires a configured `[store]` like push/pull. Summary lines on stdout:
+
+```text
+repair: listed 18390 objects via list+head
+repair: wrote .vaultsync/manifest/v1.json (18390 entries, etag="...")
+```
+
+Exit codes: `0` ok (including dry-run), `1` store error. Run it to bootstrap
+a manifest on an existing bucket, after console/aws-cli uploads outside
+vaultsync, after repeated `manifest not committed` warnings, or when
+`status` disagrees with raw `aws s3 ls` expectations.
 
 ### `vaultsync version`
 
@@ -132,12 +157,24 @@ mtime_tolerance_ms = 1000
 # max_attempts = 3       # total attempts incl. the initial one; SDK standard default; 1 disables retries
 # base_delay_ms = 1000   # first backoff scale, ms (full jitter: realized delay is uniform in [0, this]); SDK standard default
 # max_delay_ms = 20000   # pre-jitter backoff ceiling, ms; SDK standard default
+
+[inventory]              # live (issue 45): warm manifest vs live list+head
+# mode = "auto"         # auto | manifest | list_head; default when absent
 ```
 
 > `[transfer.retry]` defaults are filled **per field**, so validation runs
 > against the filled mix: a lone `max_delay_ms = 500` fails because the
 > resolved base stays 1000, and a lone `base_delay_ms = 30000` fails against
 > the default max 20000. Set both when tightening either bound.
+
+> `[inventory]` (issue 45) selects how plan build gets the remote file set:
+> `auto` (default) uses the remote manifest `.vaultsync/manifest/v1.json`
+> when present and valid, else falls back to live list+head with a warning;
+> `manifest` requires a valid manifest (fails closed, suggesting `repair`);
+> `list_head` never reads the manifest (debug / bisect / #42 baseline). The
+> local cache mirror lives at `<vault_root>/.vaultsync/cache/` (never
+> walked, never uploaded; owner-only on Unix). Unknown mode strings are
+> loud errors naming the allowed set.
 
 > `[ignore]` is **live** (issue #34): the resolved pattern list is compiled
 > once at dispatch and applied on **both** sides - the local walk prunes
@@ -339,6 +376,23 @@ D  notes/b.md
 (`-v` additionally shows the skip rows with their planner reasons, e.g.
 `S  notes/    folder`.)
 
+**Inventory source line (issue 45).** Every plan build prints one always-on
+stderr line naming where the remote inventory came from:
+
+```text
+inventory: manifest (18390 entries)   # warm: parsed the remote manifest
+inventory: list+head (cold)           # cold: live ListObjectsV2 + per-object heads
+```
+
+**Lost-race warning (issue 45, Q2).** When a `push` succeeds but its manifest
+commit loses the conditional race (another writer committed first), stderr
+carries the locked warning and the exit code stays `0` when the transfers
+succeeded (bodies are live; data ok):
+
+```text
+warning: manifest not committed (lost race or changed under us); run vaultsync repair if status looks wrong
+```
+
 ### JSON (`--json`)
 
 ```json
@@ -377,3 +431,4 @@ above omit it; the confirmation rail is a Phase 3 roadmap item.)
 - no `encrypt` / `decrypt`
 - no `merge`
 - no TUI
+- no deletion journal / per-device ids in the manifest (issue 45 non-goal)

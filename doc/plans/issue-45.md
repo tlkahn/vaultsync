@@ -1,6 +1,9 @@
 # Issue 45 plan: Inventory manifest (remote source of truth + local cache)
 
-**Status:** planned (not started)
+**Status:** implemented (W219-W246 landed on branch
+`worktree-inventory-manifest-issue-45`; docs W247-W248 done). Offline gate at
+landing: `cargo test --offline --lib --bins` green (554 passed / 0 failed / 1
+ignored).
 **Issue:** https://github.com/tlkahn/vaultsync/issues/45 (OPEN; enhancement)
 **Branch:** `worktree-inventory-manifest-issue-45`
 **Design refs:** issue #45 body, normative design

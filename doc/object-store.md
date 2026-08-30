@@ -117,6 +117,26 @@ store out-of-band - can never Download to disk or re-upload (R4-L4/W42). A run
 that encounters such a leftover counts it and surfaces it on stderr instead of
 dropping it silently (W79).
 
+**Control-plane namespace (issue 45).** Since #45, the reserved policy is
+extended with any key whose FIRST path segment is exactly `.vaultsync`
+(file or folder form): `.vaultsync/manifest/v1.json` (the remote inventory
+manifest) and the local `.vaultsync/cache/*` mirror. The extension applies
+uniformly to the local walk prune, the remote partition, and the S3 pre-head
+partition (single `is_reserved_remote_key` predicate in `src/local.rs`;
+W219-W221). `notes/.vaultsync/x` is a normal user path (first segment
+`notes`). `check` probes stay at `.vaultsync-check-*` on the prefix root
+(unchanged); they are never placed under `.vaultsync/manifest/`.
+
+**Conditional put/get (issue 45, W222-W225).** The `ObjectStore` trait adds
+`put_from_with` / `get_to_with` with `PutOpts` (If-Match / If-None-Match: *)
+and `GetOpts` / `GetOutcome` (If-None-Match; 304 is a value, not an error).
+Default bodies keep every existing impl compiling (no precondition ->
+delegate to `put_from` / `get_to`; a precondition -> a loud unsupported
+error). `MemoryStore` and `S3Store` implement real conditionals; S3 maps
+HTTP 412 to `Error::PreconditionFailed` and 304 to
+`GetOutcome::NotModified`. The manifest commit and the local-cache refresh
+use these exclusively.
+
 Zero-byte marker objects at the exact store prefix (e.g. an S3-console
 "Make Folder" marker that strips to an empty vault-relative key) are ignored;
 objects whose keys end in `/` (some tools write content into `dir/` markers)

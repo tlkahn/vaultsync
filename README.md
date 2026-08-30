@@ -33,7 +33,10 @@ confirmation rail - `--yes`/`--max-delete`/prompt - and CI) is next;
 ignore patterns are **live** (issue #34, epic #9 closed: default Obsidian
 profile, `profile = "none"` escape hatch, user patterns extend, applied on
 both sides). Transfer concurrency already landed under issue 20
-(`[transfer].concurrency`, config-only, default 4). The Phase 2 delete-
+(`[transfer].concurrency`, config-only, default 4). The inventory manifest
+(issue #45) landed: warm plan build from a rebuildable remote manifest with
+an optional local cache, conditional commit after push, and `vaultsync
+repair` for bootstrap/repair. The Phase 2 delete-
 safety surface is already
 landed (freshness guards, parent locality, head-before-delete,
 NotFound-as-success).
@@ -65,6 +68,22 @@ action a plan - or delete files - against a non-existent store).
   3's request pool; transient throttles / 5xx on any op are retried with
   exponential backoff + jitter by the SDK standard-mode `[transfer.retry]`
   config (I8).
+- **Fast warm plans via a remote inventory manifest (issue #45).** After a
+  `push` (or `vaultsync repair`), plan build reads the rebuildable JSON
+  manifest `.vaultsync/manifest/v1.json` instead of listing + per-object
+  heads - steady-state `status`/`push`/`pull` cost one GET instead of N+1
+  requests. `[inventory].mode` selects the behavior: `auto` (default: valid
+  manifest wins, else cold list+head with a warning), `manifest` (fail
+  closed if missing/corrupt, suggesting `repair`), or `list_head` (never
+  read the manifest). The manifest is a snapshot, not a deletion journal: it
+  is written only after successful remote mutations (bodies first, manifest
+  last, conditional If-Match/If-None-Match put) and by `repair`; `pull` and
+  `status` never write it; the cold path stays I15-correct and
+  fail-closed. A lost conditional race warns (`manifest not committed...
+  run vaultsync repair if status looks wrong`) and exits 0 when the
+  transfers succeeded. The local cache mirror lives at
+  `<vault_root>/.vaultsync/cache/` (never walked or uploaded; 304
+  conditional GET on repeat loads; never authority).
 - **Reserved-namespace leftovers are filtered before any head** (W118):
   `.vaultsync-check-*` / `.*.vaultsync-tmp-*` keys are partitioned out of a
   listing before a `HeadObject` is issued - no wasted requests and no

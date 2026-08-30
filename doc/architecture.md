@@ -96,6 +96,8 @@ head(key) -> Entity
 get_to(key, w) -> Entity        # stream body into w
 put_from(key, r, size, mtime_ms) -> Entity   # store exactly size bytes from r
 delete(key) -> ()
++ put_from_with(key, r, size, PutOpts) -> Entity   # If-Match / If-None-Match: * (issue 45)
++ get_to_with(key, w, GetOpts) -> Body | NotModified # If-None-Match (issue 45)
 ```
 
 S3 notes that affect the trait:
@@ -103,6 +105,16 @@ S3 notes that affect the trait:
 - list is prefix + pagination
 - mtime: prefer user metadata for vault mtime; fall back to `LastModified`
 - folders: default **no** folder objects (prefix-only); optional marker mode later
+
+### 3b. Inventory facade (issue 45)
+
+`src/inventory.rs` is the single reader of the remote file set for plan
+build (warm manifest `.vaultsync/manifest/v1.json` or live list+head) and
+the only writer of the manifest (commit after a successful push, and
+`repair`). `plan()` stays pure and source-agnostic; `build_plan` threads an
+`InventoryOpts` (mode, concurrency, vault root for the local cache mirror)
+and carries the `InventoryBase` (source + files + manifest etag) on
+`PlanReport` for the commit path. Full design: [inventory-manifest.md](./inventory-manifest.md).
 
 ### 4. Planner
 

@@ -1,7 +1,9 @@
 # Inventory manifest (design note)
 
-**Status:** design only - no implementation yet.  
-**Context:** issue #42 (plan-build latency on large vaults); I15 head-on-list cost; vision "plain objects" softened only for a rebuildable index.  
+**Status:** implemented (issue 45, W219-W246 landed on the worktree
+`worktree-inventory-manifest-issue-45`; docs W247-W248). Q1-Q8 locked - see
+[issue-45 plan](plans/issue-45.md) "Locked decisions" (mirrored to the issue).
+**Context:** issue #42 (plan-build latency on large vaults); I15 head-on-list cost; vision "plain objects" softened only for a rebuildable index.
 **Decision class:** option 1 from the S3 large-vault discussion - keep S3, add a metadata plane.
 
 This note locks a concrete **remote manifest** format and the read / write / repair flows against today's `ObjectStore` trait (`src/store/mod.rs`). A **local cache of that remote manifest** is specified as a follow-on layer with fixed roles (remote = authority, local = cache).
