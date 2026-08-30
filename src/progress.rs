@@ -7,6 +7,14 @@
 
 use std::sync::Mutex;
 
+/// Fixed progress-line budgets (PR 28 r2 F1, Option A): a 12-column verb field,
+/// a 12-column key field, and an 8-cell bar. Together they keep the common
+/// worst-supported frame at 80 columns or fewer; terminal-width detection is a
+/// possible follow-up (Option B), not this PR.
+const VERB_BUDGET: usize = 12;
+const KEY_BUDGET: usize = 12;
+const BAR_CELLS: usize = 8;
+
 /// Which executor pass an event belongs to (I27-events). The human verb per
 /// pass lives in the renderer (`Uploading`, `Downloading`, ...), not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,9 +79,11 @@ impl Progress for NoProgress {
 /// The renderers (cycle 6) own the `\r`/`\x1b[K` refresh mechanics and the
 /// writer; this type only computes text.
 ///
-/// Line layout (I27-render): `{verb:<16}{key:<32}  {done}/{total}  [{bar}]  `
-/// `{pct:>3}%  {rate}  ETA {eta}`; rate/ETA are omitted until at least one
-/// byte-complete event with non-zero elapsed. Bar: fixed 20 cells (I27-width).
+/// Line layout (I27-render): `{verb:<12}{key:<12}  {done}/{total}  [{bar}]  `
+/// `{pct:>3}% {rate} ETA {eta}`; rate/ETA are omitted until at least one
+/// byte-complete event with non-zero elapsed. Fixed 80-column budget (PR 28 r2
+/// F1, Option A): 12-column verb field, 12-column key field, 8-cell bar,
+/// one-space rate/ETA suffixes. No terminal-width detection (Option B).
 #[derive(Debug, Default)]
 pub struct ProgressLine {
     pass: Option<PassKind>,
@@ -156,16 +166,18 @@ impl ProgressLine {
         let verb = match pass {
             PassKind::Upload => "Uploading",
             PassKind::Download => "Downloading",
-            PassKind::DeleteRemote => "Deleting remote",
-            PassKind::DeleteLocal => "Deleting local",
+            PassKind::DeleteRemote => "Del remote",
+            PassKind::DeleteLocal => "Del local",
         };
-        let key_field = truncate_pad(&self.current_key, 32);
+        let key_field = truncate_pad(&self.current_key, KEY_BUDGET);
         let fraction = self.done as f64 / self.total_keys as f64;
         let pct = (self.done as u64 * 100) / self.total_keys as u64;
-        let bar = bar20(fraction);
+        let bar = bar(fraction);
         let mut line = format!(
-            "{verb:<16}{key_field}  {}/{}  {bar}  {pct:>3}%",
-            self.done, self.total_keys
+            "{verb:<width$}{key_field}  {}/{}  {bar}  {pct:>3}%",
+            self.done,
+            self.total_keys,
+            width = VERB_BUDGET
         );
         // I27-rate: cumulative rate only, after at least one byte and a
         // non-zero elapsed; ETA from bytes remaining / rate.
@@ -173,10 +185,10 @@ impl ProgressLine {
             let elapsed_ms = self.now_ms.saturating_sub(self.start_ms);
             if elapsed_ms > 0 {
                 let rate = self.bytes_done as f64 / (elapsed_ms as f64 / 1000.0);
-                line.push_str(&format!("  {}", human_rate(rate)));
+                line.push_str(&format!(" {}", human_rate(rate)));
                 if self.total_bytes > self.bytes_done && rate > 0.0 {
                     let remaining = (self.total_bytes - self.bytes_done) as f64;
-                    line.push_str(&format!("  ETA {}", format_eta(remaining / rate)));
+                    line.push_str(&format!(" ETA {}", format_eta(remaining / rate)));
                 }
             }
         }
@@ -194,21 +206,21 @@ fn truncate_pad(s: &str, budget: usize) -> String {
     out
 }
 
-/// Fixed 20-cell bar (I27-width): `[` + 20 cells + `]`. All full at 100%;
+/// Fixed 8-cell bar (PR 28 r2 F1): `[` + 8 cells + `]` (10 columns total).
+/// All full at 100%;
 /// otherwise `=`-filled cells, a `>` head on the next cell (any non-zero
 /// progress), then `-` remainder.
-fn bar20(fraction: f64) -> String {
-    const CELLS: usize = 20;
-    let filled = (fraction * CELLS as f64).floor() as usize;
+fn bar(fraction: f64) -> String {
+    let filled = (fraction * BAR_CELLS as f64).floor() as usize;
     let mut s = String::from("[");
-    if filled >= CELLS {
-        s.push_str(&"=".repeat(CELLS));
+    if filled >= BAR_CELLS {
+        s.push_str(&"=".repeat(BAR_CELLS));
     } else if fraction > 0.0 {
         s.push_str(&"=".repeat(filled));
         s.push('>');
-        s.push_str(&"-".repeat(CELLS - filled - 1));
+        s.push_str(&"-".repeat(BAR_CELLS - filled - 1));
     } else {
-        s.push_str(&"-".repeat(CELLS));
+        s.push_str(&"-".repeat(BAR_CELLS));
     }
     s.push(']');
     s
@@ -382,7 +394,7 @@ mod tests {
         assert!(r0.contains("Uploading"), "{r0}");
         assert!(r0.contains("0/3"), "{r0}");
         assert!(r0.contains("  0%"), "{r0}");
-        assert_eq!(bar_cells(&r0), "-".repeat(20), "0% bar");
+        assert_eq!(bar_cells(&r0), "-".repeat(8), "0% bar");
 
         line.on_event(
             ProgressEvent::KeyDone {
@@ -396,10 +408,10 @@ mod tests {
         let r1 = line.render();
         assert!(r1.contains("1/3"), "{r1}");
         assert!(r1.contains("33%"), "{r1}");
-        // 1/3 of 20 cells = 6 full + head + 13 remainder
+        // 1/3 of 8 cells = 2 full + head + 5 remainder
         assert_eq!(
             bar_cells(&r1),
-            format!("{}>{}", "=".repeat(6), "-".repeat(13))
+            format!("{}>{}", "=".repeat(2), "-".repeat(5))
         );
 
         line.on_event(
@@ -423,14 +435,14 @@ mod tests {
         let r3 = line.render();
         assert!(r3.contains("3/3"), "{r3}");
         assert!(r3.contains("100%"), "{r3}");
-        assert_eq!(bar_cells(&r3), "=".repeat(20), "100% bar");
+        assert_eq!(bar_cells(&r3), "=".repeat(8), "100% bar");
 
         // verb per PassKind
         for (kind, verb) in [
             (PassKind::Upload, "Uploading"),
             (PassKind::Download, "Downloading"),
-            (PassKind::DeleteRemote, "Deleting remote"),
-            (PassKind::DeleteLocal, "Deleting local"),
+            (PassKind::DeleteRemote, "Del remote"),
+            (PassKind::DeleteLocal, "Del local"),
         ] {
             let mut l = ProgressLine::new();
             l.on_event(
@@ -458,9 +470,9 @@ mod tests {
             },
             0,
         );
-        assert_eq!(bar_cells(&l.render()), "-".repeat(20));
+        assert_eq!(bar_cells(&l.render()), "-".repeat(8));
 
-        // 5/10 = 50% -> 10 full + head + 9 remainder
+        // 5/10 = 50% -> 4 full + head + 3 remainder
         for _ in 0..5 {
             l.on_event(
                 ProgressEvent::KeyDone {
@@ -474,7 +486,7 @@ mod tests {
         }
         assert_eq!(
             bar_cells(&l.render()),
-            format!("{}>{}", "=".repeat(10), "-".repeat(9))
+            format!("{}>{}", "=".repeat(4), "-".repeat(3))
         );
 
         // 10/10 = 100% -> all full
@@ -489,7 +501,7 @@ mod tests {
                 200,
             );
         }
-        assert_eq!(bar_cells(&l.render()), "=".repeat(20));
+        assert_eq!(bar_cells(&l.render()), "=".repeat(8));
     }
 
     // I27-rate: no rate/ETA before the first byte-complete event; afterwards
@@ -562,12 +574,102 @@ mod tests {
             100,
         );
         let r = l.render();
-        assert!(r.contains(&"x".repeat(32)), "key truncated to budget: {r}");
+        assert!(r.contains(&"x".repeat(12)), "key truncated to budget: {r}");
         assert!(
-            !r.contains(&"x".repeat(33)),
+            !r.contains(&"x".repeat(13)),
             "key overflowed the budget: {r}"
         );
-        assert!(r.len() < 140, "line too long ({} chars): {r}", r.len());
+        assert!(
+            r.chars().count() <= 80,
+            "line too long ({} chars): {r}",
+            r.chars().count()
+        );
+    }
+
+    // PR 28 r2 F1 (Option A): the common worst-supported frame fits an
+    // 80-column TTY. DeleteRemote verb, a 10k-key fraction at its widest
+    // (9999/10000), an overlong current key (must truncate), a max-width
+    // rate shape and an hour ETA.
+    #[test]
+    fn progress_line_worst_supported_frame_fits_80_columns() {
+        let mut line = ProgressLine::new();
+        // rate = bytes_done / elapsed_s must render the max-width shape
+        // "1023.9 GiB/s". Use elapsed 1000ms so rate == bytes_done; then
+        // pick bytes_done so human_rate lands on 1023.9.
+        let bytes_done: u64 = (1023.9_f64 * 1024f64.powi(3)) as u64;
+        // remaining / rate = 3661 s -> ETA "1:01:01", so the pass total is
+        // bytes_done * (3661 + 1) with bytes_done already transferred.
+        let total_bytes: u64 = bytes_done * 3662;
+        line.on_event(
+            ProgressEvent::PassStart {
+                kind: PassKind::DeleteRemote,
+                total_keys: 10_000,
+                total_bytes,
+            },
+            0,
+        );
+        // 9998 zero-byte successes advance the key count without touching
+        // bytes (kept at the public state-machine boundary).
+        for _ in 0..9998 {
+            line.on_event(
+                ProgressEvent::KeyDone {
+                    kind: PassKind::DeleteRemote,
+                    key: "x".to_string(),
+                    bytes: 0,
+                    ok: true,
+                },
+                0,
+            );
+        }
+        // final key: overlong (must truncate) and carries the byte total at
+        // elapsed = 1000ms.
+        line.on_event(
+            ProgressEvent::KeyDone {
+                kind: PassKind::DeleteRemote,
+                key: "k".repeat(200),
+                bytes: bytes_done,
+                ok: true,
+            },
+            1000,
+        );
+        let r = line.render();
+        assert!(r.contains("Del remote"), "abbreviated delete verb: {r}");
+        assert!(r.contains("9999/10000"), "10k fraction: {r}");
+        assert!(r.contains("1023.9 GiB/s"), "max-rate shape: {r}");
+        assert!(r.contains("ETA 1:01:01"), "hour ETA: {r}");
+        assert!(
+            r.chars().count() <= 80,
+            "frame width {} > 80: {r}",
+            r.chars().count()
+        );
+    }
+
+    // PR 28 r2 F2: the documented 70% sample (issue 27 / doc/cli.md) shows
+    // an 8-cell bar body `=====>--`: five filled, one `>` head, two
+    // remaining. Test-side counterpart to the markdown sample.
+    #[test]
+    fn progress_line_seventy_percent_sample_has_8_cell_bar() {
+        let mut l = ProgressLine::new();
+        l.on_event(
+            ProgressEvent::PassStart {
+                kind: PassKind::Upload,
+                total_keys: 100,
+                total_bytes: 100_000,
+            },
+            0,
+        );
+        for _ in 0..70 {
+            l.on_event(
+                ProgressEvent::KeyDone {
+                    kind: PassKind::Upload,
+                    key: "notes/foo.md".to_string(),
+                    bytes: 1000,
+                    ok: true,
+                },
+                1000,
+            );
+        }
+        assert_eq!(bar_cells(&l.render()), "=====>--");
     }
 
     // I27-render: a pass with total_keys == 0 renders nothing.

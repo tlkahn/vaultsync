@@ -63,8 +63,13 @@ Push and pull render a live progress bar on stderr while the executor runs
 (issue 27), e.g. one `\r`-refreshed line per active pass:
 
 ```text
-Uploading  notes/foo.md  847/1204  [=========>--------]  70%  12.4 MiB/s  ETA 1:12
+Uploading   notes/foo.md  847/1204  [=====>--]   70% 12.4 MiB/s ETA 1:12
 ```
+
+The fixed layout is budgeted for an 80-column terminal: a 12-column verb
+field, a 12-column key field, and an 8-cell bar, with one-space rate/ETA
+suffixes. Terminal-width detection (rendering below 80 columns on narrow
+ttys) remains a follow-up option.
 
 - **stderr only, TTY only.** The bar appears only when stderr is a terminal
   (`std::io::stderr().is_terminal()`); piped or redirected stderr stays quiet.
