@@ -1751,6 +1751,65 @@ mod tests {
             .expect("valid ignore patterns in W25 helpers must resolve")
     }
 
+    /// The issue #34 acceptance fixture vault: the Obsidian built-in profile
+    /// must keep `notes/a.md` + `.obsidian/app.json` and hide the workspace
+    /// session file, `.trash/`, `.git/`, and `.DS_Store`; `profile = "none"`
+    /// must list everything.
+    fn write_default_profile_vault(dir: &TempDir) {
+        std::fs::create_dir_all(dir.join(".obsidian")).unwrap();
+        std::fs::create_dir_all(dir.join(".trash")).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join(".obsidian/app.json"), "{}").unwrap();
+        std::fs::write(dir.join(".obsidian/workspace.json"), "{}").unwrap();
+        std::fs::write(dir.join(".trash/x.md"), "x").unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+        std::fs::write(dir.join("notes/a.md"), "hi").unwrap();
+        std::fs::write(dir.join("notes/.DS_Store"), "").unwrap();
+    }
+
+    #[test]
+    fn status_default_profile_hides_workspace() {
+        // Issue #34 D3 e2e (acceptance checkbox, issue sketch exact name):
+        // with NO `[ignore]` config the Obsidian built-in profile applies
+        // end-to-end through the CLI - the workspace session file, `.trash/`,
+        // `.git/`, and `.DS_Store` are pruned from the status plan while
+        // `notes/a.md` and `.obsidian/app.json` stay listed. Mutation-checked:
+        // `profile = "none"` settings make this RED (everything listed).
+        let dir = TempDir::new("vaultsync-cli-test");
+        write_default_profile_vault(&dir);
+        let settings = no_store_settings(dir.path());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings(
+            Command::status(dir.path().into()),
+            &settings,
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        // exit 2: dirty plan (uploads pending) - the point is the run
+        // happens with the default profile applied.
+        assert_eq!(code, 2, "stderr: {err}");
+        assert!(
+            out.lines().any(|l| l.starts_with("U  notes/a.md")),
+            "notes/a.md must be listed: {out}"
+        );
+        assert!(
+            out.lines().any(|l| l.starts_with("U  .obsidian/app.json")),
+            ".obsidian/app.json must be listed: {out}"
+        );
+        assert!(
+            !out.contains("workspace.json"),
+            "workspace session file must be ignored: {out}"
+        );
+        assert!(!out.contains(".trash/"), ".trash/ pruned: {out}");
+        assert!(!out.contains(".git/"), ".git/ pruned: {out}");
+        assert!(!out.contains(".DS_Store"), ".DS_Store pruned: {out}");
+    }
+
     #[test]
     fn settings_with_ignore_helper_matches_resolve_split() {
         // F4/W197 (PR 38 r1): the helpers must not build a
