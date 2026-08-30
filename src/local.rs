@@ -1235,12 +1235,20 @@ fn walk(
             walk(&path, root, root_canon, out, opts, report, visited)?;
         } else if ft.is_file() {
             // W23/M1: a reserved vaultsync temp sibling (crash leftover) is
-            // never emitted as a key.
+            // never emitted as a key. Reserved-namespace stays FIRST and
+            // independent (D-filter-order): a reserved leftover is counted in
+            // `skipped_temp_files` and never re-labeled as ignored, even if a
+            // user pattern would also match its name.
             if is_reserved_vaultsync_name(path.file_name()) {
                 report.skipped_temp_files += 1;
             } else {
                 let key = path_to_key(rel)?;
-                if let Some(e) = file_entity(&path, &key)? {
+                // Issue #32: a file whose vault-relative key matches an
+                // ignore pattern is skipped and counted (D-report: each
+                // ignored file counts 1).
+                if opts.ignore.matches(&key) {
+                    report.skipped_ignored += 1;
+                } else if let Some(e) = file_entity(&path, &key)? {
                     out.push(e);
                 }
             }
@@ -2561,6 +2569,35 @@ mod tests {
             "trash dir listed: {keys:?}"
         );
         assert_eq!(rep.skipped_ignored, 1, "only .trash/ pruned: {rep:?}");
+    }
+
+    #[test]
+    fn walk_skips_ignored_file() {
+        // Issue acceptance (D-both-sides local half): a file whose
+        // vault-relative key matches an ignore pattern is absent from the
+        // inventory. `.DS_Store` is a basename pattern - final-segment-
+        // anywhere - so both the root copy and the nested copy are skipped
+        // while siblings stay.
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::write(dir.join("note.md"), "hi").unwrap();
+        std::fs::write(dir.join(".DS_Store"), "x").unwrap();
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join("notes/.DS_Store"), "y").unwrap();
+        std::fs::write(dir.join("notes/keep.md"), "keep").unwrap();
+        let fs = LocalFs::new(dir.path())
+            .with_ignore(IgnoreSet::from_patterns(&[".DS_Store".to_string()]).unwrap());
+        let (ents, rep) = fs.list_report().unwrap();
+        let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
+        for keep in ["note.md", "notes/", "notes/keep.md"] {
+            assert!(keys.contains(&keep), "{keep:?} must remain: {keys:?}");
+        }
+        for absent in [".DS_Store", "notes/.DS_Store"] {
+            assert!(!keys.contains(&absent), "{absent:?} still listed: {keys:?}");
+        }
+        assert_eq!(
+            rep.skipped_ignored, 2,
+            "two .DS_Store files skipped, got: {rep:?}"
+        );
     }
 
     #[test]
