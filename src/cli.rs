@@ -1795,6 +1795,119 @@ mod tests {
     }
 
     #[test]
+    fn status_absent_ignore_resolve_does_not_warn_phase3() {
+        // F3/W196 (PR 38 r1): D-w25-seq locked through the CLI gate, not only
+        // at B5. A real TOML-less FileConfig (absent `[ignore]`) resolves to
+        // an empty raw user list + the six Obsidian built-ins; the W25 gate
+        // keys off the raw user field ONLY, so status must stay silent (no
+        // `[ignore].patterns` / Phase-3 text) and produce a normal plan.
+        // GREEN on arrival + mutation-checked: pointing C1 at
+        // `resolved_ignore_patterns` makes this RED.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let cfg = crate::config::FileConfig {
+            vault_root: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let settings =
+            crate::config::resolve_settings(&cfg, &crate::config::EnvSnapshot::default()).unwrap();
+        assert!(
+            settings.ignore_patterns.is_empty(),
+            "raw user field must stay empty for absent [ignore]"
+        );
+        let expected: Vec<String> = crate::config::OBSIDIAN_DEFAULT_IGNORE_PATTERNS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(settings.resolved_ignore_patterns, expected);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings(
+            Command::status(dir.path().into()),
+            &settings,
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(
+            !err.contains("[ignore].patterns"),
+            "W25 must not warn when only resolved defaults are present: {err}"
+        );
+        assert!(out.contains("plan:"), "plan produced: {out}");
+
+        // section present but empty (`[ignore]` with no keys) matches
+        // absent-section at the gate (same as config W188).
+        let cfg = crate::config::FileConfig {
+            vault_root: Some(dir.path().to_path_buf()),
+            ignore: Some(crate::config::IgnoreConfig::default()),
+            ..Default::default()
+        };
+        let settings =
+            crate::config::resolve_settings(&cfg, &crate::config::EnvSnapshot::default()).unwrap();
+        assert!(settings.ignore_patterns.is_empty());
+        assert_eq!(settings.resolved_ignore_patterns, expected);
+        let mut out2 = Vec::new();
+        let mut err2 = Vec::new();
+        let code2 = run_with_settings(
+            Command::status(dir.path().into()),
+            &settings,
+            ProgressMode::Off,
+            &mut out2,
+            &mut err2,
+        );
+        let err2 = String::from_utf8(err2).unwrap();
+        assert_eq!(code2, 0, "stderr: {err2}");
+        assert!(
+            !err2.contains("[ignore].patterns"),
+            "W25 must not warn for an empty [ignore] section: {err2}"
+        );
+    }
+
+    #[test]
+    fn push_absent_ignore_resolve_does_not_trip_w25() {
+        // F3/W196: the mutating-command branch of C1. With absent `[ignore]`
+        // (raw user field empty, resolved = Obsidian six), push must NOT hit
+        // the W25 Phase-3 refusal - it falls through to the store
+        // requirement and fails there (exit 1, `[store]` message) because no
+        // bucket is configured. GREEN on arrival + mutation-checked: pointing
+        // C1 at `resolved_ignore_patterns` makes this RED (W25 refusal
+        // replaces the store error).
+        let dir = TempDir::new("vaultsync-cli-test");
+        let cfg = crate::config::FileConfig {
+            vault_root: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let settings =
+            crate::config::resolve_settings(&cfg, &crate::config::EnvSnapshot::default()).unwrap();
+        assert!(settings.ignore_patterns.is_empty());
+        assert!(
+            !settings.resolved_ignore_patterns.is_empty(),
+            "resolved defaults must be present"
+        );
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings(
+            Command::push(dir.path().into(), false),
+            &settings,
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(code, 1, "stderr: {err}");
+        assert!(
+            !err.contains("[ignore].patterns"),
+            "W25 must not refuse push when only resolved defaults are present: {err}"
+        );
+        assert!(
+            err.contains("[store]") || err.contains("store.bucket"),
+            "failure must be the store requirement, not W25: {err}"
+        );
+    }
+
+    #[test]
     fn run_silent_on_configured_concurrency() {
         // I20-cli: `[transfer].concurrency` is live (issue 20); an explicitly
         // set value (8) must NOT warn - no "Phase 3"/"concurrency" text on
