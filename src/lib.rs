@@ -1016,6 +1016,46 @@ mod tests {
     }
 
     #[test]
+    fn build_plan_basename_anywhere_drops_nested_remote() {
+        // N4b: the default-profile basename shape (.DS_Store) matches any
+        // key's final segment - here notes/.DS_Store - on the full ingest
+        // path. Characterization pin: GREEN on arrival, mutation-checked
+        // (filter disabled -> nested key reappears).
+        let dir = TempDir::new("vaultsync-lib-test");
+        let local = LocalFs::new(dir.path());
+        let store = StubStore {
+            listed: vec![
+                crate::entity::file("notes/.DS_Store", 25, Some(100)),
+                crate::entity::file("notes/a.md", 25, Some(100)),
+            ],
+        };
+        let ignore = ignore_set(&[".DS_Store"]);
+        let report = build_plan(&local, &store, Mode::Pull, &PlanOpts::default(), &ignore).unwrap();
+        assert!(
+            !report
+                .plan
+                .actions
+                .iter()
+                .any(|a| a.key == "notes/.DS_Store"),
+            "basename-ignored key planned: {:?}",
+            report.plan.actions
+        );
+        assert!(
+            report.plan.actions.iter().any(|a| a.key == "notes/a.md"),
+            "kept key missing: {:?}",
+            report.plan.actions
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("ignored 1 remote key(s) by ignore patterns")),
+            "ignore warning must count 1: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
     fn build_plan_ignore_warning_when_dropped() {
         // W201: two ignored remote keys + one kept drop exactly one warning,
         // count-only (2), with no raw key strings embedded.
