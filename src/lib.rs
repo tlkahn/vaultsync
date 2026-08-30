@@ -1056,6 +1056,52 @@ mod tests {
     }
 
     #[test]
+    fn build_plan_ignored_invalid_remote_key_is_dropped() {
+        // N4c: the ignore filter runs before `ensure_valid_key`, so an ignored
+        // remote key that would otherwise fail closed validation is dropped
+        // without error. `../evil.md` has a `..` segment (invalid); the
+        // basename pattern `evil.md` matches its final segment. A sibling
+        // kept key still plans. Non-ignored control: the same key with an
+        // empty set returns `InvalidKey` (see
+        // `build_plan_rejects_invalid_remote_key`). Characterization pin:
+        // GREEN on arrival, mutation-checked (validate-before-ignore -> RED).
+        let dir = TempDir::new("vaultsync-lib-test");
+        let local = LocalFs::new(dir.path());
+        let store = StubStore {
+            listed: vec![
+                crate::entity::file("../evil.md", 25, Some(100)),
+                crate::entity::file("notes/a.md", 25, Some(100)),
+            ],
+        };
+        let ignore = ignore_set(&["evil.md"]);
+        let report = build_plan(&local, &store, Mode::Pull, &PlanOpts::default(), &ignore);
+        assert!(
+            report.is_ok(),
+            "ignored invalid remote key must not fail closed: {:?}",
+            report.err()
+        );
+        let report = report.unwrap();
+        assert!(
+            !report.plan.actions.iter().any(|a| a.key == "../evil.md"),
+            "ignored invalid key planned: {:?}",
+            report.plan.actions
+        );
+        assert!(
+            report.plan.actions.iter().any(|a| a.key == "notes/a.md"),
+            "kept key missing: {:?}",
+            report.plan.actions
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("ignored 1 remote key(s) by ignore patterns")),
+            "ignore warning must count 1: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
     fn build_plan_ignore_warning_when_dropped() {
         // W201: two ignored remote keys + one kept drop exactly one warning,
         // count-only (2), with no raw key strings embedded.
