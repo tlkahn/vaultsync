@@ -576,6 +576,16 @@ mod tests {
             (&["*a"], "aaa", true),
             (&["*b"], "bb", true),
             (&["a*a*a"], "aaaaa", true),
+            // --- UTF-8 multi-byte literals / backtrack advance (r2 F2):
+            // the byte-wise `chars().next().len_utf8()` step keeps multi-byte
+            // match starts aligned; pins so a "simplify to bytes" refactor
+            // cannot regress these under the ASCII-only star table ---
+            (&["café*"], "caféx", true),
+            (&["café*"], "cafex", false),
+            (&["*é*"], "aéb", true),
+            (&["*é*"], "aeb", false),
+            (&["ä*ä"], "äää", true),
+            (&["ä*"], "xä", false),
             // --- correct positive that a naive "starts_with only" fix
             // would break: trailing `*` consumes extra chars ---
             (&["workspace*"], "workspaces", true),
