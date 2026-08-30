@@ -306,8 +306,13 @@ fn resolve_ignore(ignore: Option<&IgnoreConfig>) -> Result<(Vec<String>, Vec<Str
             .collect(),
     };
     // W190: user patterns extend the active profile (union; stable order:
-    // built-ins first, user next). Exact-string dedup lands in W191.
-    resolved.extend(user.iter().cloned());
+    // built-ins first, user next). W191: exact-string dedup, first wins - a
+    // user entry repeating a built-in (or an earlier user entry) is dropped.
+    for p in user.iter() {
+        if !resolved.contains(p) {
+            resolved.push(p.clone());
+        }
+    }
     Ok((user, resolved))
 }
 
@@ -545,6 +550,35 @@ patterns = [".git/"]
                 "unknown ignore key not named in: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn resolve_ignore_dedup_exact_string() {
+        // Issue #31 (D-dedup): exact `String` equality, first occurrence
+        // wins. Built-ins first means a user entry repeating a built-in is
+        // dropped; a repeated user entry is dropped too. Order of first
+        // occurrence preserved. Not path-semantic (`.git` vs `.git/` stay
+        // distinct if both present). RED: no dedup yet - user `.git/` and the
+        // second user `.git/` duplicate built-ins.
+        let text =
+            "[ignore]\nprofile = \"obsidian\"\npatterns = [\".git/\", \"private/\", \".git/\"]\n";
+        let cfg = parse_config_str(text).unwrap();
+        let s = settings(&cfg).unwrap();
+        let expected: Vec<String> = OBSIDIAN_DEFAULT_IGNORE_PATTERNS
+            .iter()
+            .map(|s| s.to_string())
+            .chain(std::iter::once("private/".to_string()))
+            .collect();
+        assert_eq!(s.resolved_ignore_patterns, expected);
+
+        // User-only dup under `profile = "none"`: exact-string first wins.
+        let text = "[ignore]\nprofile = \"none\"\npatterns = [\"a/\", \"b/\", \"a/\"]\n";
+        let cfg = parse_config_str(text).unwrap();
+        let s = settings(&cfg).unwrap();
+        assert_eq!(
+            s.resolved_ignore_patterns,
+            vec!["a/".to_string(), "b/".to_string()]
+        );
     }
 
     #[test]
