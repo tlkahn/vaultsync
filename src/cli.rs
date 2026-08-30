@@ -2055,6 +2055,101 @@ mod tests {
     }
 
     #[test]
+    fn push_delete_does_not_delete_remote_ignored_e2e() {
+        // Issue #34 delete invariant, remote half (issue sketch exact name):
+        // `push --delete` must never plan a `DeleteRemote` for a remote-only
+        // key the ignore patterns drop (the ignored key is absent from the
+        // plan entirely), while a non-ignored remote-only key still deletes.
+        // Real execution against MemoryStore: the ignored workspace key
+        // survives on the store, `orphan.md` is gone. Mutation-checked: an
+        // empty `IgnoreSet` at the CLI compile site makes this RED (DR row
+        // for the workspace key appears).
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join("notes/a.md"), "hi").unwrap();
+        let store = MemoryStore::new();
+        let mut c1 = std::io::Cursor::new(b"{}".to_vec());
+        store
+            .put_from(".obsidian/workspace.json", &mut c1, 2, Some(100))
+            .unwrap();
+        let mut c2 = std::io::Cursor::new(b"same".to_vec());
+        store.put_from("notes/a.md", &mut c2, 4, Some(100)).unwrap();
+        let mut c3 = std::io::Cursor::new(b"orphan".to_vec());
+        store.put_from("orphan.md", &mut c3, 6, Some(100)).unwrap();
+        let mut settings = no_store_settings(dir.path());
+        settings.store.bucket = "b".to_string(); // store injected below
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings_store(
+            Command::push(dir.path().into(), true),
+            &settings,
+            &store,
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(
+            !out.lines()
+                .any(|l| l.starts_with("DR .obsidian/workspace.json")),
+            "no DeleteRemote for ignored workspace key: {out}"
+        );
+        assert!(
+            out.lines().any(|l| l.starts_with("DR orphan.md")),
+            "non-ignored remote-only key still deletes: {out}"
+        );
+        assert!(
+            store.head(".obsidian/workspace.json").is_ok(),
+            "ignored remote key survives on the store"
+        );
+        assert!(store.head("orphan.md").is_err(), "orphan deleted");
+        assert!(store.head("notes/a.md").is_ok(), "a.md still present");
+    }
+
+    #[test]
+    fn pull_delete_does_not_delete_local_ignored() {
+        // Issue #34 delete invariant, local half (issue sketch exact name):
+        // `pull --delete` must never delete a local-only path the ignore
+        // patterns prune (it never enters the plan, so no `DL` row) while the
+        // walk still sees everything else. Real execution: `.trash/x.md`
+        // survives on disk, `notes/a.md` intact.
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::create_dir_all(dir.join(".trash")).unwrap();
+        std::fs::write(dir.join("notes/a.md"), "same").unwrap();
+        std::fs::write(dir.join(".trash/x.md"), "x").unwrap();
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"same".to_vec());
+        store.put_from("notes/a.md", &mut c, 4, Some(100)).unwrap();
+        let mut settings = no_store_settings(dir.path());
+        settings.store.bucket = "b".to_string(); // store injected below
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings_store(
+            Command::pull(dir.path().into(), true),
+            &settings,
+            &store,
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(
+            !out.lines().any(|l| l.starts_with("DL .trash/x.md")),
+            "no DeleteLocal for ignored trash path: {out}"
+        );
+        assert!(
+            dir.join(".trash/x.md").exists(),
+            "ignored local file survives the pull --delete"
+        );
+        assert!(dir.join("notes/a.md").exists(), "a.md intact");
+    }
+
+    #[test]
     fn status_absent_ignore_resolve_does_not_warn_phase3() {
         // F3/W196 (PR 38 r1): D-w25-seq locked through the CLI gate, not only
         // at B5. A real TOML-less FileConfig (absent `[ignore]`) resolves to
