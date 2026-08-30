@@ -570,16 +570,20 @@ against `rg fn resolve_ default_profile` etc.
 
 ## Implementation checklist (copy into PR body)
 
-- [ ] W186 `resolved_ignore_patterns` field scaffold
-- [ ] W187 `IgnoreConfig.profile` serde + `config_parse_ignore_profile_field`
-- [ ] W188 `resolve_default_profile_is_obsidian` + constant
-- [ ] W189 `resolve_profile_none_plus_user`
-- [ ] W190 `resolve_user_extends_obsidian`
-- [ ] W191 exact-string dedup
-- [ ] W192 `resolve_unknown_profile_errors`
-- [ ] W193 `resolve_bad_pattern_errors` via `IgnoreSet`
-- [ ] W194 W25 user-vs-resolved split pins (CLI W25 untouched)
-- [ ] W195 rustdoc + roadmap I31-profile row + plan status
-- [ ] No W25 logic change; no walk/remote/apply wiring
-- [ ] `Cargo.toml` deps unchanged
-- [ ] Full gate green on tip
+- [x] W186 `resolved_ignore_patterns` field scaffold
+- [x] W187 `IgnoreConfig.profile` serde + `config_parse_ignore_profile_field`
+- [x] W188 `resolve_default_profile_is_obsidian` + constant
+- [x] W189 `resolve_profile_none_plus_user`
+- [x] W190 `resolve_user_extends_obsidian`
+- [x] W191 exact-string dedup
+- [x] W192 `resolve_unknown_profile_errors`
+- [x] W193 `resolve_bad_pattern_errors` via `IgnoreSet`
+- [x] W194 W25 user-vs-resolved split pins (CLI W25 untouched)
+- [x] W195 rustdoc + roadmap I31-profile row + plan status
+- [x] No W25 logic change; no walk/remote/apply wiring
+- [x] `Cargo.toml` deps unchanged
+- [x] Full gate green on tip
+
+PR 38 r1 hardening (review comment 5467754440, approve) tracked in
+doc/plans/pr-38-fix-5467754440.md: W196-W198 characterization + hygiene
+commits landed on the same branch; W200 = this docs commit.
