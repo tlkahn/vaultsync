@@ -42,11 +42,21 @@ pub struct PlanReport {
 /// (fail closed): an escaping or control-char key from the store never becomes
 /// a planned action. `plan()` itself stays pure (fixtures may feed it
 /// anything).
+///
+/// The `ignore: &IgnoreSet` filter applies to the remote ingest after the
+/// reserved-namespace partition and before `ensure_valid_key` / `plan()`: an
+/// ignored remote key is **absent** from `remote_entities` (no plan row of
+/// any kind, not even a `Skip(ignored)`, so `--delete` never plans a
+/// `DeleteRemote` for an ignored remote-only key). `plan()` stays
+/// filter-agnostic - this function narrows the remote list first. An empty
+/// set (the default at most call sites until #34 wires patterns from
+/// settings) matches nothing and behaves exactly like today.
 pub fn build_plan(
     local: &LocalFs,
     store: &dyn ObjectStore,
     mode: Mode,
     opts: &PlanOpts,
+    ignore: &IgnoreSet,
 ) -> Result<PlanReport, Error> {
     let (local_entities, walk_report) = local.list_report()?;
     // H1 (W99): the store listing carries its own warnings (e.g. dropped
@@ -76,6 +86,17 @@ pub fn build_plan(
     let (remote_entities, reserved_dropped) = partition_reserved_remote_keys(remote_entities);
     if !reserved_dropped.is_empty() {
         warnings.push(reserved_drops_warning(&reserved_dropped));
+    }
+    // Issue #33: the `IgnoreSet` filter (remote half of D-both-sides) runs
+    // after the reserved partition - so a reserved leftover is never counted
+    // as an ignore drop - and before `ensure_valid_key` / `plan()`, so an
+    // ignored remote key is absent from `remote_entities` (never a plan row,
+    // not even a `Skip(ignored)`), and ignored invalid keys never reach
+    // fail-closed validation. An empty set (the default until #34 wires real
+    // patterns) drops nothing and emits no warning.
+    let (remote_entities, ignored_dropped) = partition_ignored_remote_keys(remote_entities, ignore);
+    if !ignored_dropped.is_empty() {
+        warnings.push(ignored_remote_drops_warning(ignored_dropped.len()));
     }
     for e in &remote_entities {
         crate::entity::ensure_valid_key(&e.key)?;
@@ -181,6 +202,37 @@ pub(crate) fn reserved_drops_warning(dropped: &[Entity]) -> String {
     )
 }
 
+/// Split remote entities into `(kept, dropped)` by [`IgnoreSet::matches`]
+/// on `Entity.key` (issue #33). Pure and unit-testable offline. Both output
+/// lists preserve the input order. Runs *after*
+/// [`partition_reserved_remote_keys`] so a reserved leftover is never
+/// double-counted as an ignore drop.
+pub(crate) fn partition_ignored_remote_keys(
+    entities: Vec<Entity>,
+    ignore: &IgnoreSet,
+) -> (Vec<Entity>, Vec<Entity>) {
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for e in entities {
+        if ignore.matches(&e.key) {
+            dropped.push(e);
+        } else {
+            kept.push(e);
+        }
+    }
+    (kept, dropped)
+}
+
+/// The one-line PlanReport warning for ignored remote keys (issue #33,
+/// D-report): count-only so a pathological pattern set can't flood output
+/// with key names (the reserved warning names its first 5; the ignore
+/// warning stays count-only per the issue sketch). Take a count, not a slice
+/// of entities, to make "no key dump" structural. Only call when
+/// `dropped_count > 0`.
+pub(crate) fn ignored_remote_drops_warning(dropped_count: usize) -> String {
+    format!("ignored {dropped_count} remote key(s) by ignore patterns")
+}
+
 fn compute_stats(actions: &[plan::Action]) -> plan::PlanStats {
     use plan::ActionKind::*;
     let mut s = plan::PlanStats::default();
@@ -198,13 +250,17 @@ fn compute_stats(actions: &[plan::Action]) -> plan::PlanStats {
 }
 
 /// Build a [`Plan`] against a store for a real vault directory (Status mode).
+///
+/// `ignore` forwards to [`build_plan`]; pass `&IgnoreSet::empty()` if you do
+/// not care (the CLI passes empty under W25 until #34 wires patterns).
 pub fn status_with_store(
     vault: &Path,
     store: &dyn ObjectStore,
     opts: &PlanOpts,
+    ignore: &IgnoreSet,
 ) -> Result<Plan, Error> {
     let local = LocalFs::new(vault);
-    build_plan(&local, store, Mode::Status, opts).map(|report| report.plan)
+    build_plan(&local, store, Mode::Status, opts, ignore).map(|report| report.plan)
 }
 
 /// Connectivity probe: write a tiny probe object, read it back, delete it.
@@ -628,6 +684,347 @@ mod tests {
     }
 
     #[test]
+    fn partition_ignored_remote_keys_preserves_order() {
+        // W195: the pure ignore partition splits matched keys from
+        // non-matched while preserving order in both output lists (the same
+        // shape as the reserved partition). Compile-RED on the helper.
+        let all = vec![
+            crate::entity::file("a.md", 1, Some(1)),
+            crate::entity::file(".obsidian/workspace.json", 2, Some(2)),
+            crate::entity::file("notes/a.md", 3, Some(3)),
+            crate::entity::file("b.md", 4, Some(4)),
+        ];
+        let ignore = IgnoreSet::from_patterns(&[".obsidian/workspace.json".to_string()]).unwrap();
+        let (kept, dropped) = partition_ignored_remote_keys(all, &ignore);
+        let kept_keys: Vec<&str> = kept.iter().map(|e| e.key.as_str()).collect();
+        let dropped_keys: Vec<&str> = dropped.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            kept_keys,
+            vec!["a.md", "notes/a.md", "b.md"],
+            "kept order wrong"
+        );
+        assert_eq!(
+            dropped_keys,
+            vec![".obsidian/workspace.json"],
+            "dropped wrong"
+        );
+    }
+
+    #[test]
+    fn partition_ignored_empty_set_passthrough() {
+        // W195: an empty IgnoreSet (or empty pattern list) matches nothing,
+        // so kept is the full input order and dropped is empty - the
+        // no-op default that keeps today's behavior under W25.
+        let all = vec![
+            crate::entity::file("a.md", 1, Some(1)),
+            crate::entity::file(".obsidian/workspace.json", 2, Some(2)),
+            crate::entity::file("notes/a.md", 3, Some(3)),
+            crate::entity::file("b.md", 4, Some(4)),
+        ];
+        let (kept, dropped) = partition_ignored_remote_keys(all, &IgnoreSet::empty());
+        let kept_keys: Vec<&str> = kept.iter().map(|e| e.key.as_str()).collect();
+        let dropped_keys: Vec<&str> = dropped.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            kept_keys,
+            vec!["a.md", ".obsidian/workspace.json", "notes/a.md", "b.md"],
+            "empty ignore must pass everything through in order"
+        );
+        assert!(
+            dropped_keys.is_empty(),
+            "dropped must be empty: {dropped_keys:?}"
+        );
+    }
+
+    #[test]
+    fn partition_ignored_dir_prefix_nested() {
+        // W195 helper-level pin for the `.git/` dir-prefix form: the folder
+        // and everything under it drops in input order, while a sibling
+        // stays kept.
+        let all = vec![
+            crate::entity::file(".git/objects/aa", 1, Some(1)),
+            crate::entity::file("notes/a.md", 2, Some(2)),
+            crate::entity::file(".git/HEAD", 3, Some(3)),
+        ];
+        let ignore = IgnoreSet::from_patterns(&[".git/".to_string()]).unwrap();
+        let (kept, dropped) = partition_ignored_remote_keys(all, &ignore);
+        let kept_keys: Vec<&str> = kept.iter().map(|e| e.key.as_str()).collect();
+        let dropped_keys: Vec<&str> = dropped.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(kept_keys, vec!["notes/a.md"], "kept wrong");
+        assert_eq!(
+            dropped_keys,
+            vec![".git/objects/aa", ".git/HEAD"],
+            "dropped order wrong"
+        );
+    }
+
+    #[test]
+    fn build_plan_empty_ignore_matches_today() {
+        // W196: the new `ignore: &IgnoreSet` argument defaults to empty, and
+        // an empty set must not break remote ingest - a normal remote-only
+        // `ok.md` still plans a Download under Pull.
+        let dir = TempDir::new("vaultsync-lib-test");
+        let local = LocalFs::new(dir.path());
+        let store = StubStore {
+            listed: vec![crate::entity::file("ok.md", 25, Some(100))],
+        };
+        let p = build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .unwrap()
+        .plan;
+        assert!(
+            p.actions.iter().any(|a| a.key == "ok.md"),
+            "empty ignore must not drop normal ingests: {:?}",
+            p.actions
+        );
+    }
+
+    fn ignore_set(patterns: &[&str]) -> IgnoreSet {
+        IgnoreSet::from_patterns(&patterns.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            .unwrap()
+    }
+
+    #[test]
+    fn build_plan_filters_remote_ignored() {
+        // W197 (issue checkbox): an ignored remote key is absent from the
+        // plan - no row of any kind, not even a Skip - while a non-ignored
+        // remote-only key still plans a Download under Pull.
+        let dir = TempDir::new("vaultsync-lib-test");
+        let local = LocalFs::new(dir.path());
+        let store = StubStore {
+            listed: vec![
+                crate::entity::file(".obsidian/workspace.json", 25, Some(100)),
+                crate::entity::file("notes/a.md", 25, Some(100)),
+            ],
+        };
+        let ignore = ignore_set(&[".obsidian/workspace.json"]);
+        let p = build_plan(&local, &store, Mode::Pull, &PlanOpts::default(), &ignore)
+            .unwrap()
+            .plan;
+        assert!(
+            !p.actions
+                .iter()
+                .any(|a| a.key == ".obsidian/workspace.json"),
+            "ignored key planned: {:?}",
+            p.actions
+        );
+        assert!(
+            p.actions.iter().any(|a| a.key == "notes/a.md"),
+            "non-ignored key missing: {:?}",
+            p.actions
+        );
+    }
+
+    #[test]
+    fn push_delete_does_not_delete_remote_ignored() {
+        // W198 (issue checkbox, delete invariant remote half): `push --delete`
+        // must never plan a DeleteRemote for a remote-only key that matches
+        // ignore (it never enters the remote list, so it is not remote-only),
+        // while a non-ignored remote-only key still plans DeleteRemote.
+        let dir = TempDir::new("vaultsync-lib-test");
+        let local = LocalFs::new(dir.path());
+        let store = StubStore {
+            listed: vec![
+                crate::entity::file(".obsidian/workspace.json", 25, Some(100)),
+                crate::entity::file("orphan.md", 25, Some(100)),
+            ],
+        };
+        let ignore = ignore_set(&[".obsidian/workspace.json"]);
+        let opts = PlanOpts {
+            delete: true,
+            ..Default::default()
+        };
+        let p = build_plan(&local, &store, Mode::Push, &opts, &ignore)
+            .unwrap()
+            .plan;
+        assert!(
+            !p.actions.iter().any(|a| {
+                a.kind == ActionKind::DeleteRemote && a.key == ".obsidian/workspace.json"
+            }),
+            "ignored key got DeleteRemote: {:?}",
+            p.actions
+        );
+        assert!(
+            p.actions
+                .iter()
+                .any(|a| { a.kind == ActionKind::DeleteRemote && a.key == "orphan.md" }),
+            "non-ignored remote-only must still DeleteRemote: {:?}",
+            p.actions
+        );
+        assert_eq!(
+            p.stats.delete_remote, 1,
+            "only orphan.md should be a remote delete: {:?}",
+            p.stats
+        );
+    }
+
+    #[test]
+    fn build_plan_ignore_after_reserved() {
+        // W199: the reserved partition runs before the ignore filter, so a
+        // key that is both reserved and ignore-matching (here
+        // `.vaultsync-check-1-2-3` also matches its basename pattern) is
+        // dropped only as reserved - the reserved warning names it, the
+        // ignore N stays 1 (just the `.git/...` key), and no warning claims
+        // ignore count 2.
+        let dir = TempDir::new("vaultsync-lib-test");
+        let local = LocalFs::new(dir.path());
+        let store = StubStore {
+            listed: vec![
+                crate::entity::file(".vaultsync-check-1-2-3", 25, Some(100)),
+                crate::entity::file(".git/objects/aa", 25, Some(100)),
+                crate::entity::file("notes/a.md", 25, Some(100)),
+            ],
+        };
+        let ignore = ignore_set(&[".git/", ".vaultsync-check-1-2-3"]);
+        let report = build_plan(&local, &store, Mode::Pull, &PlanOpts::default(), &ignore).unwrap();
+        assert!(
+            !report
+                .plan
+                .actions
+                .iter()
+                .any(|a| { a.key == ".vaultsync-check-1-2-3" || a.key == ".git/objects/aa" }),
+            "reserved/ignored key planned: {:?}",
+            report.plan.actions
+        );
+        assert!(
+            report.plan.actions.iter().any(|a| a.key == "notes/a.md"),
+            "kept key missing: {:?}",
+            report.plan.actions
+        );
+        let reserved_warn: Vec<&String> = report
+            .warnings
+            .iter()
+            .filter(|w| w.contains("reserved vaultsync namespace"))
+            .collect();
+        assert_eq!(reserved_warn.len(), 1, "{:?}", report.warnings);
+        assert!(
+            reserved_warn[0].contains(".vaultsync-check-1-2-3"),
+            "reserved warning must name the leftover: {:?}",
+            reserved_warn[0]
+        );
+        let ignore_warn: Vec<&String> = report
+            .warnings
+            .iter()
+            .filter(|w| w.contains("ignore patterns"))
+            .collect();
+        assert_eq!(ignore_warn.len(), 1, "{:?}", report.warnings);
+        assert!(
+            ignore_warn[0].contains("ignored 1 remote key(s) by ignore patterns"),
+            "ignore count must be 1 (reserved not double-counted): {:?}",
+            ignore_warn[0]
+        );
+        assert!(
+            report.warnings.iter().all(|w| !w.contains("ignored 2 ")),
+            "no warning may claim ignore count 2: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn build_plan_dir_prefix_drops_nested_remote() {
+        // W200 (issue sketch): a remote prefix under an ignored dir - here
+        // `.git/objects/aa` via the `.git/` dir-prefix pattern - is absent
+        // from the plan, `notes/a.md` stays, and the count-only warning fires
+        // once.
+        let dir = TempDir::new("vaultsync-lib-test");
+        let local = LocalFs::new(dir.path());
+        let store = StubStore {
+            listed: vec![
+                crate::entity::file(".git/objects/aa", 25, Some(100)),
+                crate::entity::file("notes/a.md", 25, Some(100)),
+            ],
+        };
+        let ignore = ignore_set(&[".git/"]);
+        let report = build_plan(&local, &store, Mode::Pull, &PlanOpts::default(), &ignore).unwrap();
+        assert!(
+            !report
+                .plan
+                .actions
+                .iter()
+                .any(|a| a.key == ".git/objects/aa"),
+            "nested ignored key planned: {:?}",
+            report.plan.actions
+        );
+        assert!(
+            report.plan.actions.iter().any(|a| a.key == "notes/a.md"),
+            "kept key missing: {:?}",
+            report.plan.actions
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("ignored 1 remote key(s) by ignore patterns")),
+            "ignore warning missing: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn build_plan_ignore_warning_when_dropped() {
+        // W201: two ignored remote keys + one kept drop exactly one warning,
+        // count-only (2), with no raw key strings embedded.
+        let dir = TempDir::new("vaultsync-lib-test");
+        let local = LocalFs::new(dir.path());
+        let store = StubStore {
+            listed: vec![
+                crate::entity::file(".git/objects/aa", 25, Some(100)),
+                crate::entity::file(".trash/old.md", 25, Some(100)),
+                crate::entity::file("notes/a.md", 25, Some(100)),
+            ],
+        };
+        let ignore = ignore_set(&[".git/", ".trash/"]);
+        let report = build_plan(&local, &store, Mode::Pull, &PlanOpts::default(), &ignore).unwrap();
+        let ignore_warn: Vec<&String> = report
+            .warnings
+            .iter()
+            .filter(|w| w.contains("ignore patterns"))
+            .collect();
+        assert_eq!(ignore_warn.len(), 1, "{:?}", report.warnings);
+        assert!(
+            ignore_warn[0].contains("ignored 2 remote key(s) by ignore patterns"),
+            "count must be 2: {:?}",
+            ignore_warn[0]
+        );
+        // count-only: the raw ignored key strings are not dumped.
+        assert!(
+            !ignore_warn[0].contains(".git/objects/aa"),
+            "{:?}",
+            ignore_warn[0]
+        );
+        assert!(
+            !ignore_warn[0].contains(".trash/old.md"),
+            "{:?}",
+            ignore_warn[0]
+        );
+    }
+
+    #[test]
+    fn build_plan_no_ignore_warning_when_none_dropped() {
+        // W201: a non-empty IgnoreSet whose patterns match nothing in the
+        // listing produces no ignore warning (N == 0 guard).
+        let dir = TempDir::new("vaultsync-lib-test");
+        let local = LocalFs::new(dir.path());
+        let store = StubStore {
+            listed: vec![crate::entity::file("notes/a.md", 25, Some(100))],
+        };
+        let ignore = ignore_set(&[".trash/"]);
+        let report = build_plan(&local, &store, Mode::Pull, &PlanOpts::default(), &ignore).unwrap();
+        assert!(
+            report
+                .warnings
+                .iter()
+                .all(|w| !w.contains("ignore patterns")),
+            "no-drop run must not warn: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
     fn build_plan_drops_reserved_remote_keys_unchanged() {
         // W79/r9 L1 behavior lock: with the counting + stderr warning added,
         // reserved remote keys still produce NO plan rows (the W63 invariant
@@ -641,9 +1038,15 @@ mod tests {
                 crate::entity::file("ok.md", 25, Some(100)),
             ],
         };
-        let p = build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
-            .unwrap()
-            .plan;
+        let p = build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .unwrap()
+        .plan;
         assert!(
             !p.actions.iter().any(|a| {
                 a.key == ".a.md.vaultsync-tmp-1-2" || a.key == "notes/.vaultsync-check-1-2-3"
@@ -672,7 +1075,14 @@ mod tests {
                 None,
             )
             .unwrap();
-        let report = build_plan(&local, &store, Mode::Pull, &PlanOpts::default()).unwrap();
+        let report = build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .unwrap();
         assert!(
             report
                 .warnings
@@ -722,7 +1132,14 @@ mod tests {
             )
             .unwrap();
         let local = LocalFs::new(dir.path());
-        let report = build_plan(&local, &store, Mode::Status, &PlanOpts::default()).unwrap();
+        let report = build_plan(
+            &local,
+            &store,
+            Mode::Status,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .unwrap();
         // reserved key never planned.
         assert!(
             !report
@@ -791,7 +1208,14 @@ mod tests {
             )
             .unwrap();
         let local = LocalFs::new(dir.path());
-        let report = build_plan(&local, &store, Mode::Status, &PlanOpts::default()).unwrap();
+        let report = build_plan(
+            &local,
+            &store,
+            Mode::Status,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .unwrap();
         assert!(
             report.plan.actions.iter().any(|a| a.key == "notes/a.md"),
             "healthy key dropped: {:?}",
@@ -810,9 +1234,15 @@ mod tests {
         let store = StubStore {
             listed: vec![crate::entity::file(".vaultsync-check-1-2-3", 25, Some(100))],
         };
-        let p = build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
-            .unwrap()
-            .plan;
+        let p = build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .unwrap()
+        .plan;
         assert!(
             !p.actions
                 .iter()
@@ -840,9 +1270,15 @@ mod tests {
                 Some(100),
             )],
         };
-        let p = build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
-            .unwrap()
-            .plan;
+        let p = build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .unwrap()
+        .plan;
         assert!(
             !p.actions
                 .iter()
@@ -869,9 +1305,15 @@ mod tests {
                 crate::entity::file("notes/.a.md.vaultsync-tmp-3-4", 25, Some(100)),
             ],
         };
-        let p = build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
-            .unwrap()
-            .plan;
+        let p = build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .unwrap()
+        .plan;
         assert!(
             !p.actions.iter().any(|a| {
                 a.key == ".a.md.vaultsync-tmp-1-2" || a.key == "notes/.a.md.vaultsync-tmp-3-4"
@@ -897,9 +1339,15 @@ mod tests {
         std::os::unix::fs::symlink("realdir", dir.join("linkdir")).unwrap();
         let local = LocalFs::with_follow(dir.path(), true);
         let store = MemoryStore::new();
-        let p = build_plan(&local, &store, Mode::Push, &PlanOpts::default())
-            .unwrap()
-            .plan;
+        let p = build_plan(
+            &local,
+            &store,
+            Mode::Push,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .unwrap()
+        .plan;
         let link = p.actions.iter().find(|a| a.key == "link.md").unwrap();
         assert_eq!(link.kind, ActionKind::Skip, "{:?}", link);
         assert_eq!(link.reason, "followed_symlink");
@@ -935,9 +1383,15 @@ mod tests {
         // remote link.md much newer than the target's (remote_newer -> Download)
         put_str(&store, "link.md", "remote-new", base + 1_000_000);
         put_str(&store, "real.md", "r", 1);
-        let p = build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
-            .unwrap()
-            .plan;
+        let p = build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .unwrap()
+        .plan;
         let link = p
             .actions
             .iter()
@@ -964,7 +1418,9 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let p = build_plan(&local, &store, Mode::Pull, &opts).unwrap().plan;
+        let p = build_plan(&local, &store, Mode::Pull, &opts, &IgnoreSet::empty())
+            .unwrap()
+            .plan;
         let link = p.actions.iter().find(|a| a.key == "link.md").unwrap();
         assert_eq!(link.kind, ActionKind::Skip, "{:?}", link);
         assert_eq!(link.reason, "followed_symlink");
@@ -981,9 +1437,15 @@ mod tests {
         std::os::unix::fs::symlink("real.md", dir.join("link.md")).unwrap();
         let local = LocalFs::with_follow(dir.path(), true);
         let store = MemoryStore::new();
-        let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default())
-            .unwrap()
-            .plan;
+        let p = build_plan(
+            &local,
+            &store,
+            Mode::Status,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .unwrap()
+        .plan;
         let link = p.actions.iter().find(|a| a.key == "link.md").unwrap();
         assert_eq!(
             link.kind,
@@ -1010,9 +1472,15 @@ mod tests {
                 etag: None,
             }],
         };
-        let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default())
-            .unwrap()
-            .plan;
+        let p = build_plan(
+            &local,
+            &store,
+            Mode::Status,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .unwrap()
+        .plan;
         assert!(
             !p.actions.iter().any(|a| a.key.is_empty()),
             "empty key planned: {:?}",
@@ -1031,7 +1499,14 @@ mod tests {
             let store = StubStore {
                 listed: vec![crate::entity::file(bad, 1, Some(1))],
             };
-            let err = build_plan(&local, &store, Mode::Status, &PlanOpts::default()).unwrap_err();
+            let err = build_plan(
+                &local,
+                &store,
+                Mode::Status,
+                &PlanOpts::default(),
+                &IgnoreSet::empty(),
+            )
+            .unwrap_err();
             assert!(matches!(err, Error::InvalidKey(_)), "key {bad:?}: {err}");
         }
     }
@@ -1048,9 +1523,15 @@ mod tests {
                 crate::entity::file("notes/a.md", 1, Some(1)),
             ],
         };
-        let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default())
-            .unwrap()
-            .plan;
+        let p = build_plan(
+            &local,
+            &store,
+            Mode::Status,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .unwrap()
+        .plan;
         let folder_act = p
             .actions
             .iter()
@@ -1084,7 +1565,7 @@ mod tests {
         let dir = TempDir::new("vaultsync-lib-test");
         std::fs::write(dir.join("a.md"), "hi").unwrap();
         let store = MemoryStore::new();
-        let p = status_with_store(&dir, &store, &PlanOpts::default()).unwrap();
+        let p = status_with_store(&dir, &store, &PlanOpts::default(), &IgnoreSet::empty()).unwrap();
         assert_eq!(p.actions.len(), 1);
         assert_eq!(p.actions[0].key, "a.md");
         assert_eq!(p.actions[0].kind, ActionKind::Upload);
@@ -1104,7 +1585,7 @@ mod tests {
             .as_millis() as u64;
         let store = MemoryStore::new();
         put_str(&store, "a.md", "same", ms);
-        let p = status_with_store(&dir, &store, &PlanOpts::default()).unwrap();
+        let p = status_with_store(&dir, &store, &PlanOpts::default(), &IgnoreSet::empty()).unwrap();
         assert_eq!(p.actions.len(), 1);
         assert_eq!(p.actions[0].kind, ActionKind::Skip);
         assert_eq!(p.stats.skip, 1);
@@ -1115,7 +1596,7 @@ mod tests {
         let dir = TempDir::new("vaultsync-lib-test");
         let store = MemoryStore::new();
         put_str(&store, "b.md", "x", 1000);
-        let p = status_with_store(&dir, &store, &PlanOpts::default()).unwrap();
+        let p = status_with_store(&dir, &store, &PlanOpts::default(), &IgnoreSet::empty()).unwrap();
         assert!(
             p.actions
                 .iter()
@@ -1129,7 +1610,7 @@ mod tests {
         put_str(&store, "b.md", "x", 1000);
         let dir = TempDir::new("vaultsync-lib-test");
         std::fs::write(dir.join("a.md"), "hi").unwrap();
-        let p = status_with_store(&dir, &store, &PlanOpts::default()).unwrap();
+        let p = status_with_store(&dir, &store, &PlanOpts::default(), &IgnoreSet::empty()).unwrap();
         let txt = format_plan_human(&p);
         assert!(txt.contains("plan:"));
         assert!(txt.contains("1 upload"));
@@ -1153,7 +1634,7 @@ mod tests {
         let store = MemoryStore::new();
         put_str(&store, "b.md", "x", 1000);
         put_str(&store, "c.md", "xx", ms);
-        let p = status_with_store(&dir, &store, &PlanOpts::default()).unwrap();
+        let p = status_with_store(&dir, &store, &PlanOpts::default(), &IgnoreSet::empty()).unwrap();
         let txt = format_plan_human(&p);
         assert!(txt.lines().any(|l| l.starts_with("U  a.md")));
         assert!(txt.lines().any(|l| l.starts_with("D  b.md")));
@@ -1188,7 +1669,7 @@ mod tests {
         std::fs::write(dir.join("notes/hello.md"), "hi").unwrap();
 
         let store = MemoryStore::new(); // seeded with nothing
-        let p = status_with_store(&dir, &store, &PlanOpts::default()).unwrap();
+        let p = status_with_store(&dir, &store, &PlanOpts::default(), &IgnoreSet::empty()).unwrap();
 
         let upload = p
             .actions
@@ -1224,9 +1705,15 @@ mod tests {
                 crate::entity::file("notes/x", 1, Some(1)),
             ],
         };
-        let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default())
-            .unwrap()
-            .plan;
+        let p = build_plan(
+            &local,
+            &store,
+            Mode::Status,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .unwrap()
+        .plan;
         let file_act = p
             .actions
             .iter()
@@ -1263,9 +1750,15 @@ mod tests {
         let store = StubStore {
             listed: vec![crate::entity::file("note.md", 5, Some(1000))],
         };
-        let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default())
-            .unwrap()
-            .plan;
+        let p = build_plan(
+            &local,
+            &store,
+            Mode::Status,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .unwrap()
+        .plan;
         let note = p
             .actions
             .iter()
@@ -1297,9 +1790,15 @@ mod tests {
                 crate::entity::file("notes/x", 1, Some(1)),
             ],
         };
-        let p = build_plan(&local, &store, Mode::Status, &PlanOpts::default())
-            .unwrap()
-            .plan;
+        let p = build_plan(
+            &local,
+            &store,
+            Mode::Status,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .unwrap()
+        .plan;
         let notes = p.actions.iter().find(|a| a.key == "Notes").expect("Notes");
         let notes_folder = p
             .actions
@@ -1331,9 +1830,15 @@ mod tests {
         let store = StubStore {
             listed: vec![crate::entity::file("LINK.md", 11, Some(100))],
         };
-        let p = build_plan(&local, &store, Mode::Push, &PlanOpts::default())
-            .unwrap()
-            .plan;
+        let p = build_plan(
+            &local,
+            &store,
+            Mode::Push,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .unwrap()
+        .plan;
         let link = p
             .actions
             .iter()
@@ -1359,9 +1864,15 @@ mod tests {
         std::fs::write(dir.join(".note.md.vaultsync-tmp-123-4"), "leftover").unwrap();
         let local = LocalFs::new(dir.path());
         let store = MemoryStore::new();
-        let p = build_plan(&local, &store, Mode::Push, &PlanOpts::default())
-            .unwrap()
-            .plan;
+        let p = build_plan(
+            &local,
+            &store,
+            Mode::Push,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .unwrap()
+        .plan;
         assert_eq!(p.stats.upload, 1);
         assert!(p.actions.iter().any(|a| a.key == "note.md"));
         assert!(
@@ -1516,9 +2027,15 @@ mod tests {
         std::fs::write(dir.join("local-only.md"), "x").unwrap();
         let local = LocalFs::new(dir.path());
         let store = MemoryStore::new();
-        let p = crate::build_plan(&local, &store, Mode::Pull, &PlanOpts::default())
-            .unwrap()
-            .plan;
+        let p = crate::build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .unwrap()
+        .plan;
         let verbose = format_plan_human_verbose(&p, 1);
         let s_line = verbose
             .lines()
@@ -1553,7 +2070,7 @@ mod tests {
             let mut c = std::io::Cursor::new(b"same".to_vec());
             store.put_from("a.md", &mut c, 4, Some(ms)).unwrap();
         }
-        let p = status_with_store(&dir, &store, &PlanOpts::default()).unwrap();
+        let p = status_with_store(&dir, &store, &PlanOpts::default(), &IgnoreSet::empty()).unwrap();
         let default = format_plan_human(&p);
         assert!(
             !default.lines().any(|l| l.starts_with("S  ")),
@@ -1608,9 +2125,15 @@ mod tests {
         let store = S3LikeListStore::new();
         let local = LocalFs::new(dir.path());
         // push (the S3LikeListStore list enriches via head, so this converges)
-        let plan = crate::build_plan(&local, &store, Mode::Push, &PlanOpts::default())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Push,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .unwrap()
+        .plan;
         // W120/R1-M3: assert the push plan actually planned the seeded
         // uploads (a vacuous pass on an empty push would hide regressions).
         assert_eq!(
@@ -1639,9 +2162,15 @@ mod tests {
             );
         }
         // status after push must plan 0 mutating actions (issue acceptance 1)
-        let status = crate::build_plan(&local, &store, Mode::Status, &PlanOpts::default())
-            .unwrap()
-            .plan;
+        let status = crate::build_plan(
+            &local,
+            &store,
+            Mode::Status,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .unwrap()
+        .plan;
         assert_eq!(status.stats.upload, 0, "uploads: {:?}", status.actions);
         assert_eq!(status.stats.download, 0, "downloads: {:?}", status.actions);
         assert_eq!(status.stats.conflict, 0, "conflicts: {:?}", status.actions);
@@ -1672,9 +2201,15 @@ mod tests {
         }
         let dst = TempDir::new("vaultsync-lib-test");
         let ldst = LocalFs::new(dst.path());
-        let plan = crate::build_plan(&ldst, &store, Mode::Pull, &PlanOpts::default())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &ldst,
+            &store,
+            Mode::Pull,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .unwrap()
+        .plan;
         let rep =
             crate::exec::execute_plan(&ldst, &store, &plan, Mode::Pull, &PlanOpts::default(), 1);
         assert!(rep.failed.is_empty(), "pull failures: {:?}", rep.failed);
@@ -1685,9 +2220,15 @@ mod tests {
             assert!(gm.abs_diff(fixed) < 2000, "{rel} mtime {gm} != {fixed}");
         }
         // status in the fresh dir plans 0 mutating actions (issue acceptance 2)
-        let status = crate::build_plan(&ldst, &store, Mode::Status, &PlanOpts::default())
-            .unwrap()
-            .plan;
+        let status = crate::build_plan(
+            &ldst,
+            &store,
+            Mode::Status,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .unwrap()
+        .plan;
         assert_eq!(status.stats.upload, 0, "uploads: {:?}", status.actions);
         assert_eq!(status.stats.download, 0, "downloads: {:?}", status.actions);
         assert_eq!(status.stats.conflict, 0, "conflicts: {:?}", status.actions);

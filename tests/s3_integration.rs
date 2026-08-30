@@ -18,6 +18,7 @@
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use vaultsync::IgnoreSet;
 use vaultsync::config::{RetrySettings, StoreSettings};
 use vaultsync::error::Error;
 use vaultsync::local::LocalFs;
@@ -628,9 +629,15 @@ fn s3_integ_e2e_push_pull() {
 
         // push
         let local = LocalFs::new(src.path());
-        let plan = vaultsync::build_plan(&local, s, Mode::Push, &PlanOpts::default())
-            .map_err(|e| format!("{e}"))?
-            .plan;
+        let plan = vaultsync::build_plan(
+            &local,
+            s,
+            Mode::Push,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .map_err(|e| format!("{e}"))?
+        .plan;
         let rep =
             vaultsync::exec::execute_plan(&local, s, &plan, Mode::Push, &PlanOpts::default(), 1);
         assert!(rep.failed.is_empty(), "push failures: {:?}", rep.failed);
@@ -639,9 +646,15 @@ fn s3_integ_e2e_push_pull() {
         let _ = std::fs::remove_dir_all(src.path());
         let dst = TestDir::new("dst");
         let ldst = LocalFs::new(dst.path());
-        let plan2 = vaultsync::build_plan(&ldst, s, Mode::Pull, &PlanOpts::default())
-            .map_err(|e| format!("{e}"))?
-            .plan;
+        let plan2 = vaultsync::build_plan(
+            &ldst,
+            s,
+            Mode::Pull,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .map_err(|e| format!("{e}"))?
+        .plan;
         let rep2 =
             vaultsync::exec::execute_plan(&ldst, s, &plan2, Mode::Pull, &PlanOpts::default(), 1);
         assert!(rep2.failed.is_empty(), "pull failures: {:?}", rep2.failed);
@@ -680,9 +693,15 @@ fn s3_integ_status_converges_after_push() {
             set_mtime(&path, fixed);
         }
         let local = LocalFs::new(src.path());
-        let plan = vaultsync::build_plan(&local, s, Mode::Push, &PlanOpts::default())
-            .map_err(|e| format!("{e}"))?
-            .plan;
+        let plan = vaultsync::build_plan(
+            &local,
+            s,
+            Mode::Push,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .map_err(|e| format!("{e}"))?
+        .plan;
         // W120/R1-M3: assert the push plan actually planned the seeded uploads
         // (a vacuous pass on an empty push would hide regressions).
         assert_eq!(
@@ -706,9 +725,15 @@ fn s3_integ_status_converges_after_push() {
             assert_eq!(h, bytes.len() as u64, "uploaded {rel} size wrong");
         }
 
-        let status = vaultsync::build_plan(&local, s, Mode::Status, &PlanOpts::default())
-            .map_err(|e| format!("{e}"))?
-            .plan;
+        let status = vaultsync::build_plan(
+            &local,
+            s,
+            Mode::Status,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .map_err(|e| format!("{e}"))?
+        .plan;
         assert_eq!(status.stats.upload, 0, "uploads: {:?}", status.actions);
         assert_eq!(status.stats.download, 0, "downloads: {:?}", status.actions);
         assert_eq!(status.stats.conflict, 0, "conflicts: {:?}", status.actions);
@@ -776,9 +801,15 @@ fn s3_integ_pull_then_status_converges() {
         }
         // stage the remote
         let local = LocalFs::new(src.path());
-        let plan = vaultsync::build_plan(&local, s, Mode::Push, &PlanOpts::default())
-            .map_err(|e| format!("{e}"))?
-            .plan;
+        let plan = vaultsync::build_plan(
+            &local,
+            s,
+            Mode::Push,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .map_err(|e| format!("{e}"))?
+        .plan;
         let rep =
             vaultsync::exec::execute_plan(&local, s, &plan, Mode::Push, &PlanOpts::default(), 1);
         assert!(rep.failed.is_empty(), "push failures: {:?}", rep.failed);
@@ -787,9 +818,15 @@ fn s3_integ_pull_then_status_converges() {
         let _ = std::fs::remove_dir_all(src.path());
         let dst = TestDir::new("dst");
         let ldst = LocalFs::new(dst.path());
-        let plan2 = vaultsync::build_plan(&ldst, s, Mode::Pull, &PlanOpts::default())
-            .map_err(|e| format!("{e}"))?
-            .plan;
+        let plan2 = vaultsync::build_plan(
+            &ldst,
+            s,
+            Mode::Pull,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .map_err(|e| format!("{e}"))?
+        .plan;
         let rep2 =
             vaultsync::exec::execute_plan(&ldst, s, &plan2, Mode::Pull, &PlanOpts::default(), 1);
         assert!(rep2.failed.is_empty(), "pull failures: {:?}", rep2.failed);
@@ -801,9 +838,15 @@ fn s3_integ_pull_then_status_converges() {
         }
 
         // status on the fresh dir plans 0 mutating actions
-        let status = vaultsync::build_plan(&ldst, s, Mode::Status, &PlanOpts::default())
-            .map_err(|e| format!("{e}"))?
-            .plan;
+        let status = vaultsync::build_plan(
+            &ldst,
+            s,
+            Mode::Status,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .map_err(|e| format!("{e}"))?
+        .plan;
         assert_eq!(status.stats.upload, 0, "uploads: {:?}", status.actions);
         assert_eq!(status.stats.download, 0, "downloads: {:?}", status.actions);
         assert_eq!(status.stats.conflict, 0, "conflicts: {:?}", status.actions);
@@ -826,9 +869,15 @@ fn s3_integ_parallel_pull_correct() {
         }
         let dst = TestDir::new("dst");
         let ldst = LocalFs::new(dst.path());
-        let plan = vaultsync::build_plan(&ldst, s, Mode::Pull, &PlanOpts::default())
-            .map_err(|e| format!("{e}"))?
-            .plan;
+        let plan = vaultsync::build_plan(
+            &ldst,
+            s,
+            Mode::Pull,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .map_err(|e| format!("{e}"))?
+        .plan;
         let rep =
             vaultsync::exec::execute_plan(&ldst, s, &plan, Mode::Pull, &PlanOpts::default(), 4);
         assert!(rep.failed.is_empty(), "pull failures: {:?}", rep.failed);
@@ -864,9 +913,15 @@ fn s3_integ_parallel_push_correct() {
             files.push((key, body));
         }
         let local = LocalFs::new(src.path());
-        let plan = vaultsync::build_plan(&local, s, Mode::Push, &PlanOpts::default())
-            .map_err(|e| format!("{e}"))?
-            .plan;
+        let plan = vaultsync::build_plan(
+            &local,
+            s,
+            Mode::Push,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .map_err(|e| format!("{e}"))?
+        .plan;
         let rep =
             vaultsync::exec::execute_plan(&local, s, &plan, Mode::Push, &PlanOpts::default(), 4);
         assert!(rep.failed.is_empty(), "push failures: {:?}", rep.failed);
