@@ -165,7 +165,7 @@ Credentials **should not** be required inside the config file. Prefer the AWS st
 | path walk, mtime, bytes | `local` |
 | S3 protocol | `s3` |
 | diff decisions | `core` planner |
-| default ignore patterns for Obsidian | `core` defaults or CLI profile `--profile obsidian` |
+| default ignore patterns for Obsidian | `config [ignore].profile` + built-in defaults (`OBSIDIAN_DEFAULT_IGNORE_PATTERNS`, issue #31; live end-to-end since issue #34) - **not** a CLI `--profile obsidian` flag (config-only by design) |
 | plugin UI, settings tab | future frontend only |
 
 ## Concurrency and safety

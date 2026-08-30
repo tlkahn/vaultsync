@@ -290,14 +290,29 @@ fn reject_json(err: &mut dyn Write) -> i32 {
     1
 }
 
+/// Resolved dispatch knobs bundled so `run_with_io` stays under clippy's
+/// 7-argument limit (W18/B-L9, W203) while keeping the public test seam
+/// callable without an arg explosion. `tolerance_ms` is the resolved
+/// `transfer.mtime_tolerance_ms` threaded into every `PlanOpts` (W2, PR2
+/// A-H2/B-M1); `concurrency` bounds the transfer passes (I20);
+/// `progress_mode` selects the push/pull progress renderer (I27-test);
+/// `ignore` is the compiled `[ignore]` set threaded into both the local walk
+/// (`LocalFs::with_ignore`, issue #32) and `build_plan` (issue #33) so the
+/// two halves always see the same matcher (D-both-sides, issue #34).
+#[derive(Debug, Clone)]
+pub struct DispatchCtx {
+    pub tolerance_ms: u64,
+    pub concurrency: u32,
+    pub progress_mode: ProgressMode,
+    pub ignore: crate::IgnoreSet,
+}
+
 /// Dispatch a command against a store, writing to `out`/`err`. Returns exit code.
-/// `tolerance_ms` is the resolved `transfer.mtime_tolerance_ms` threaded into
-/// every `PlanOpts` (W2, PR2 A-H2/B-M1).
 ///
-/// I27-test: `progress_mode` selects the push/pull progress renderer - tests
-/// pass `Off` so their captured-stderr contracts stay untouched; the real
-/// binary path passes `Auto` (resolved against `stderr().is_terminal()` in
-/// dispatch); `Always` forces the bar for CLI progress tests.
+/// I27-test: `ctx.progress_mode` selects the push/pull progress renderer -
+/// tests pass `Off` so their captured-stderr contracts stay untouched; the
+/// real binary path passes `Auto` (resolved against `stderr().is_terminal()`
+/// in dispatch); `Always` forces the bar for CLI progress tests.
 ///
 /// `err` is `&mut (dyn Write + Send)` (not bare `dyn Write`) so the I27
 /// renderer built over it can satisfy `Progress: Send + Sync`. In-tree `Send`
@@ -312,9 +327,7 @@ fn reject_json(err: &mut dyn Write) -> i32 {
 pub fn run_with_io(
     cmd: Command,
     store: &dyn ObjectStore,
-    tolerance_ms: u64,
-    concurrency: u32,
-    progress_mode: ProgressMode,
+    ctx: &DispatchCtx,
     out: &mut dyn Write,
     err: &mut (dyn Write + Send),
 ) -> i32 {
@@ -368,17 +381,12 @@ pub fn run_with_io(
                 return reject_json(err);
             }
             let opts = PlanOpts {
-                mtime_tolerance_ms: tolerance_ms,
+                mtime_tolerance_ms: ctx.tolerance_ms,
                 ..Default::default()
             };
-            let local = crate::local::LocalFs::with_follow(&vault, follow_symlinks);
-            match crate::build_plan(
-                &local,
-                store,
-                Mode::Status,
-                &opts,
-                &crate::IgnoreSet::empty(),
-            ) {
+            let local = crate::local::LocalFs::with_follow(&vault, follow_symlinks)
+                .with_ignore(ctx.ignore.clone());
+            match crate::build_plan(&local, store, Mode::Status, &opts, &ctx.ignore) {
                 Ok(report) => {
                     // H1 (W99): build_plan + store-listing warnings surface
                     // here, at the CLI layer - library code never writes to
@@ -412,7 +420,7 @@ pub fn run_with_io(
                 return reject_json(err);
             }
             let opts = PlanOpts {
-                mtime_tolerance_ms: tolerance_ms,
+                mtime_tolerance_ms: ctx.tolerance_ms,
                 delete,
                 force_local,
                 force_remote,
@@ -421,8 +429,9 @@ pub fn run_with_io(
                 dry_run,
                 follow_symlinks,
                 verbose,
-                concurrency,
-                progress: progress_mode,
+                concurrency: ctx.concurrency,
+                progress: ctx.progress_mode,
+                ignore: ctx.ignore.clone(),
             };
             dispatch_plan(&vault, store, Mode::Push, &opts, &flags, out, err)
         }
@@ -441,7 +450,7 @@ pub fn run_with_io(
                 return reject_json(err);
             }
             let opts = PlanOpts {
-                mtime_tolerance_ms: tolerance_ms,
+                mtime_tolerance_ms: ctx.tolerance_ms,
                 delete,
                 force_local,
                 force_remote,
@@ -450,16 +459,21 @@ pub fn run_with_io(
                 dry_run,
                 follow_symlinks,
                 verbose,
-                concurrency,
-                progress: progress_mode,
+                concurrency: ctx.concurrency,
+                progress: ctx.progress_mode,
+                ignore: ctx.ignore.clone(),
             };
             dispatch_plan(&vault, store, Mode::Pull, &opts, &flags, out, err)
         }
     }
 }
 
-/// Print walk-report warnings to stderr (Slice 9): out-of-vault followed
-/// symlink skips, and the default-mode skipped-symlink count hint.
+/// Print walk-report warnings to stderr: out-of-vault followed-symlink
+/// skips, the default-mode skipped-symlink count hint, the reserved
+/// temp/probe skip count (always-on crash-leftover signal), and the local
+/// ignore count when `WalkReport.skipped_ignored > 0` (issue #34 D-report
+/// local half; locked string `warning: ignored N local path(s) by ignore
+/// patterns`, count-only, always-on).
 fn print_walk_warnings(local: &crate::local::LocalFs, follow: bool, err: &mut dyn Write) {
     let rep = local.report();
     for w in &rep.warnings {
@@ -481,19 +495,34 @@ fn print_walk_warnings(local: &crate::local::LocalFs, follow: bool, err: &mut dy
             rep.skipped_temp_files
         );
     }
+    if rep.skipped_ignored > 0 {
+        // Issue #34 D-report local half (locked string): always-on (not
+        // -v-only), count-only (no key dump - a pathological pattern set
+        // must not flood stderr). The remote half is a PlanReport warning
+        // printed by the dispatch loops above.
+        let _ = writeln!(
+            err,
+            "warning: ignored {} local path(s) by ignore patterns",
+            rep.skipped_ignored
+        );
+    }
 }
 
 /// Push/pull value flags bundled so `dispatch_plan` stays under clippy's
 /// 7-argument limit (W18/B-L9) while keeping the dry-run/verbosity/symlink
 /// plumbing in one place. `concurrency` rides along (I20: resolved
 /// `[transfer].concurrency`, bounds the transfer passes; 1 = sequential).
-/// `progress` is the I27 renderer selection (I27-test).
+/// `progress` is the I27 renderer selection (I27-test). `ignore` is the
+/// compiled `[ignore]` set (W203, issue #34) threaded into both
+/// [`LocalFs::with_ignore`] and `build_plan` so the local walk and the
+/// remote filter always see the same matcher (D-both-sides).
 struct PlanFlags {
     dry_run: bool,
     follow_symlinks: bool,
     verbose: u8,
     concurrency: u32,
     progress: ProgressMode,
+    ignore: crate::IgnoreSet,
 }
 
 /// Build the I27 progress renderer for a resolved mode (I27 cycle 8 refactor:
@@ -531,13 +560,14 @@ fn dispatch_plan(
     out: &mut dyn Write,
     err: &mut (dyn Write + Send),
 ) -> i32 {
-    let local = crate::local::LocalFs::with_follow(vault, flags.follow_symlinks);
+    let local = crate::local::LocalFs::with_follow(vault, flags.follow_symlinks)
+        .with_ignore(flags.ignore.clone());
     // I27-tty: resolve the progress mode against the real stderr terminal
     // status once per dispatch (Auto follows it; tests inject Off/Always via
     // the seam).
     let resolved =
         crate::progress::resolve_progress_mode(flags.progress, std::io::stderr().is_terminal());
-    match crate::build_plan(&local, store, mode, opts, &crate::IgnoreSet::empty()) {
+    match crate::build_plan(&local, store, mode, opts, &flags.ignore) {
         Ok(report) => {
             // H1 (W99): build_plan + store-listing warnings surface here, at
             // the CLI layer - library code never writes to stderr.
@@ -742,29 +772,6 @@ fn run_with_settings_store(
     out: &mut dyn Write,
     err: &mut (dyn Write + Send),
 ) -> i32 {
-    // W25/M3: `[ignore].patterns` is a Phase 3 feature (parsed but not yet
-    // applied). A mutating command that would silently not apply it must
-    // refuse loudly; `status` (read-only) warns and proceeds with the plan.
-    if !settings.ignore_patterns.is_empty() {
-        match &cmd {
-            Command::Push { .. } | Command::Pull { .. } | Command::Check { .. } => {
-                let _ = writeln!(
-                    err,
-                    "error: [ignore].patterns is a Phase 3 feature and is not yet applied; refusing {} ({:?} ignored). Remove the [ignore] section or use `status` to preview.",
-                    command_name(&cmd),
-                    settings.ignore_patterns
-                );
-                return 1;
-            }
-            _ => {
-                let _ = writeln!(
-                    err,
-                    "warning: [ignore].patterns is a Phase 3 feature and is not yet applied ({:?} ignored)",
-                    settings.ignore_patterns
-                );
-            }
-        }
-    }
     if requires_real_store(&cmd) && settings.store.bucket.is_empty() {
         let _ = writeln!(
             err,
@@ -776,12 +783,30 @@ fn run_with_settings_store(
     // Merge the config vault_root into the command when --vault was unset.
     let cmd = resolve_vault_from_config(cmd, settings);
 
+    // Issue #34 (D-wire): compile the resolved ignore patterns once at the
+    // settings boundary and thread the SAME set into both the local walk
+    // (`LocalFs::with_ignore`, issue #32) and the remote filter
+    // (`build_plan`, issue #33) so the two halves can never disagree
+    // (D-both-sides). Patterns were already validated in `resolve_settings`;
+    // a re-compile failure here is defensive - fail loudly (exit 1, same
+    // shape as other settings errors), never `unwrap` in the production path.
+    let ignore = match crate::IgnoreSet::from_patterns(&settings.resolved_ignore_patterns) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = writeln!(err, "error: {e}");
+            return 1;
+        }
+    };
+
     run_with_io(
         cmd,
         store,
-        settings.mtime_tolerance_ms,
-        settings.concurrency,
-        progress_mode,
+        &DispatchCtx {
+            tolerance_ms: settings.mtime_tolerance_ms,
+            concurrency: settings.concurrency,
+            progress_mode,
+            ignore,
+        },
         out,
         err,
     )
@@ -820,16 +845,15 @@ pub fn run_from_env() -> i32 {
 
     // help/version need no config and must not fail on a bad config file.
     if matches!(cmd, Command::Help | Command::Version) {
-        // help/version need no tolerance; the value is unused for these.
-        return run_with_io(
-            cmd,
-            &MemoryStore::new(),
-            0,
-            1,
-            ProgressMode::Auto,
-            &mut out,
-            &mut err,
-        );
+        // help/version need no tolerance; the value is unused for these. The
+        // ignore set stays empty (W203): help/version never walk or plan.
+        let ctx = DispatchCtx {
+            tolerance_ms: 0,
+            concurrency: 1,
+            progress_mode: ProgressMode::Auto,
+            ignore: crate::IgnoreSet::empty(),
+        };
+        return run_with_io(cmd, &MemoryStore::new(), &ctx, &mut out, &mut err);
     }
 
     // Load + resolve config.
@@ -1248,6 +1272,11 @@ mod tests {
 
     // --- dispatch ---
 
+    // Ignore e2e must use run_with_settings / run_with_settings_store (real
+    // resolve -> resolved_ignore_patterns). These helpers keep
+    // IgnoreSet::empty() on purpose so pre-ignore contracts (progress,
+    // tolerance, parse, store refusal, ...) stay isolated from the default
+    // Obsidian profile.
     fn run(cmd: Command, store: &dyn ObjectStore) -> (i32, String, String) {
         run_tol(cmd, store, crate::config::DEFAULT_MTIME_TOLERANCE_MS)
     }
@@ -1258,11 +1287,14 @@ mod tests {
         let code = run_with_io(
             cmd,
             store,
-            tolerance_ms,
-            1,
-            // I27-test: the existing suite captures stderr and must stay
-            // progress-silent; only progress tests opt into Always.
-            ProgressMode::Off,
+            &DispatchCtx {
+                tolerance_ms,
+                concurrency: 1,
+                // I27-test: the existing suite captures stderr and must stay
+                // progress-silent; only progress tests opt into Always.
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+            },
             &mut out,
             &mut err,
         );
@@ -1288,9 +1320,12 @@ mod tests {
         let code = run_with_io(
             Command::push(dir.path().into(), false),
             &MemoryStore::new(),
-            crate::config::DEFAULT_MTIME_TOLERANCE_MS,
-            1,
-            ProgressMode::Off,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+            },
             &mut out,
             &mut err,
         );
@@ -1315,9 +1350,12 @@ mod tests {
         let code = run_with_io(
             cmd,
             store,
-            crate::config::DEFAULT_MTIME_TOLERANCE_MS,
-            1,
-            mode,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: mode,
+                ignore: crate::IgnoreSet::empty(),
+            },
             &mut out,
             &mut err,
         );
@@ -1730,7 +1768,159 @@ mod tests {
             ..Default::default()
         };
         crate::config::resolve_settings(&cfg, &crate::config::EnvSnapshot::default())
-            .expect("valid ignore patterns in W25 helpers must resolve")
+            .expect("valid ignore patterns in settings helpers must resolve")
+    }
+
+    fn settings_profile_none(
+        vault: &std::path::Path,
+        patterns: Vec<&str>,
+    ) -> crate::config::Settings {
+        // F4/W197: real resolve with `[ignore].profile = "none"` - the
+        // escape hatch that disables the Obsidian built-ins (user patterns
+        // still apply when non-empty).
+        let cfg = crate::config::FileConfig {
+            vault_root: Some(vault.to_path_buf()),
+            ignore: Some(crate::config::IgnoreConfig {
+                profile: Some("none".to_string()),
+                patterns: patterns.iter().map(|s| s.to_string()).collect(),
+            }),
+            ..Default::default()
+        };
+        crate::config::resolve_settings(&cfg, &crate::config::EnvSnapshot::default())
+            .expect("valid profile=none settings must resolve")
+    }
+
+    /// The issue #34 acceptance fixture vault: the Obsidian built-in profile
+    /// must keep `notes/a.md` + `.obsidian/app.json` and hide the workspace
+    /// session file, `.trash/`, `.git/`, and `.DS_Store`; `profile = "none"`
+    /// must list everything.
+    fn write_default_profile_vault(dir: &TempDir) {
+        std::fs::create_dir_all(dir.join(".obsidian")).unwrap();
+        std::fs::create_dir_all(dir.join(".trash")).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join(".obsidian/app.json"), "{}").unwrap();
+        std::fs::write(dir.join(".obsidian/workspace.json"), "{}").unwrap();
+        std::fs::write(dir.join(".trash/x.md"), "x").unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+        std::fs::write(dir.join("notes/a.md"), "hi").unwrap();
+        std::fs::write(dir.join("notes/.DS_Store"), "").unwrap();
+    }
+
+    #[test]
+    fn status_default_profile_hides_workspace() {
+        // Issue #34 D3 e2e (acceptance checkbox, issue sketch exact name):
+        // with NO `[ignore]` config the Obsidian built-in profile applies
+        // end-to-end through the CLI - the workspace session file, `.trash/`,
+        // `.git/`, and `.DS_Store` are pruned from the status plan while
+        // `notes/a.md` and `.obsidian/app.json` stay listed. Mutation-checked:
+        // `profile = "none"` settings make this RED (everything listed).
+        let dir = TempDir::new("vaultsync-cli-test");
+        write_default_profile_vault(&dir);
+        let settings = no_store_settings(dir.path());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings(
+            Command::status(dir.path().into()),
+            &settings,
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        // exit 2: dirty plan (uploads pending) - the point is the run
+        // happens with the default profile applied.
+        assert_eq!(code, 2, "stderr: {err}");
+        assert!(
+            out.lines().any(|l| l.starts_with("U  notes/a.md")),
+            "notes/a.md must be listed: {out}"
+        );
+        assert!(
+            out.lines().any(|l| l.starts_with("U  .obsidian/app.json")),
+            ".obsidian/app.json must be listed: {out}"
+        );
+        assert!(
+            !out.contains("workspace.json"),
+            "workspace session file must be ignored: {out}"
+        );
+        assert!(!out.contains(".trash/"), ".trash/ pruned: {out}");
+        assert!(!out.contains(".git/"), ".git/ pruned: {out}");
+        assert!(!out.contains(".DS_Store"), ".DS_Store pruned: {out}");
+    }
+
+    #[test]
+    fn status_profile_none_lists_workspace() {
+        // Issue #34 D3 escape hatch (issue sketch exact name):
+        // `profile = "none"` disables the Obsidian built-ins, so the same
+        // fixture vault lists everything - workspace session file, `.trash/`,
+        // `.git/HEAD`, `notes/.DS_Store` - with no Phase 3 text.
+        let dir = TempDir::new("vaultsync-cli-test");
+        write_default_profile_vault(&dir);
+        let settings = settings_profile_none(dir.path(), vec![]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings(
+            Command::status(dir.path().into()),
+            &settings,
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(code, 2, "dirty plan; stderr: {err}");
+        assert!(!err.contains("Phase 3"), "no W25 text: {err}");
+        for expected in [
+            "U  .obsidian/workspace.json",
+            "U  .obsidian/app.json",
+            "U  .trash/x.md",
+            "U  .git/HEAD",
+            "U  notes/.DS_Store",
+            "U  notes/a.md",
+        ] {
+            assert!(
+                out.lines().any(|l| l.starts_with(expected)),
+                "{expected} missing under profile=none: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_profile_none_still_skips_reserved() {
+        // Issue #34 reserved orthogonal: even under `profile = "none"` the
+        // reserved vaultsync temp/probe namespace is still skipped (a
+        // walker-level invariant independent of ignore patterns) - the
+        // reserved name is absent from the plan and surfaced as a temp-file
+        // skip warning, never as an ignore skip.
+        let dir = TempDir::new("vaultsync-cli-test");
+        write_default_profile_vault(&dir);
+        std::fs::write(dir.join(".name.vaultsync-tmp-1-2"), "x").unwrap();
+        let settings = settings_profile_none(dir.path(), vec![]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings(
+            Command::status(dir.path().into()),
+            &settings,
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(code, 2, "dirty plan; stderr: {err}");
+        assert!(
+            !out.contains(".name.vaultsync-tmp-1-2"),
+            "reserved name must be absent from plan: {out}"
+        );
+        assert!(
+            err.contains("temp/probe") && err.contains("vaultsync"),
+            "temp skip warning expected: {err}"
+        );
+        assert!(
+            !err.contains("local path(s) by ignore patterns"),
+            "reserved skip is not an ignore skip: {err}"
+        );
     }
 
     #[test]
@@ -1759,57 +1949,113 @@ mod tests {
     }
 
     #[test]
-    fn push_with_ignore_patterns_errors_loudly() {
-        // W25/M3: `[ignore].patterns` is a Phase 3 feature; a mutating command
-        // that would silently not apply it must refuse loudly, naming the key
-        // and the phase.
+    fn push_with_ignore_patterns_applies() {
+        // Issue #34 (D-wire + D3-extend): user patterns (union with the
+        // Obsidian defaults) must actually prune the push plan - no W25
+        // refusal (exit 0), the ignored key absent from the plan, and the
+        // ignored file never reaches the store. The fixture uses user-only
+        // `private/` (not one of the six Obsidian built-ins), so a
+        // defaults-only matcher cannot mask a broken user union.
+        // Mutation-checked: built-ins-only at the compile site makes this RED
+        // (private/secret.md uploads).
         let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::create_dir_all(dir.join("private")).unwrap();
         std::fs::write(dir.join("a.md"), "hi").unwrap();
-        let settings = settings_with_ignore(dir.path(), vec![".trash/"]);
+        std::fs::write(dir.join("private/secret.md"), "s").unwrap();
+        let mut settings = settings_with_ignore(dir.path(), vec!["private/"]);
+        settings.store.bucket = "b".to_string(); // store injected below; avoids the no-store refusal
+        let store = MemoryStore::new();
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_with_settings(
+        let code = run_with_settings_store(
             Command::push(dir.path().into(), false),
             &settings,
+            &store,
             ProgressMode::Off,
             &mut out,
             &mut err,
         );
         let err = String::from_utf8(err).unwrap();
-        assert_eq!(code, 1);
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(!err.contains("Phase 3"), "W25 refusal must be gone: {err}");
         assert!(
-            err.to_lowercase().contains("ignore") && err.contains("Phase 3"),
-            "expected ignore/Phase-3 refusal: {err}"
+            out.lines().any(|l| l.starts_with("U  a.md")),
+            "a.md planned: {out}"
+        );
+        assert!(
+            !out.contains("private/secret.md"),
+            "ignored key absent from plan: {out}"
+        );
+        assert!(store.head("a.md").is_ok(), "a.md uploaded");
+        assert!(
+            matches!(
+                store.head("private/secret.md"),
+                Err(crate::error::Error::NotFound(_))
+            ),
+            "ignored file must never reach the store"
         );
     }
 
     #[test]
-    fn pull_with_ignore_patterns_errors_loudly() {
+    fn pull_with_ignore_patterns_applies() {
+        // Issue #34 apply/pull equivalent: a remote-only ignored key
+        // (`private/secret.md` under user pattern `private/`) must be
+        // filtered from the pull plan - no Download row, nothing materialized
+        // locally, and no W25 refusal (exit 0). The fixture uses user-only
+        // `private/` (not one of the six Obsidian built-ins), so a
+        // defaults-only matcher cannot mask a broken user union.
         let dir = TempDir::new("vaultsync-cli-test");
-        let settings = settings_with_ignore(dir.path(), vec![".trash/"]);
+        let store = MemoryStore::new();
+        let mut c1 = std::io::Cursor::new(b"a".to_vec());
+        store.put_from("a.md", &mut c1, 1, Some(100)).unwrap();
+        let mut c2 = std::io::Cursor::new(b"s".to_vec());
+        store
+            .put_from("private/secret.md", &mut c2, 1, Some(100))
+            .unwrap();
+        let mut settings = settings_with_ignore(dir.path(), vec!["private/"]);
+        settings.store.bucket = "b".to_string(); // store injected below
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_with_settings(
+        let code = run_with_settings_store(
             Command::pull(dir.path().into(), false),
             &settings,
+            &store,
             ProgressMode::Off,
             &mut out,
             &mut err,
         );
         let err = String::from_utf8(err).unwrap();
-        assert_eq!(code, 1);
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(!err.contains("Phase 3"), "W25 refusal must be gone: {err}");
         assert!(
-            err.to_lowercase().contains("ignore") && err.contains("Phase 3"),
-            "expected ignore/Phase-3 refusal: {err}"
+            out.lines().any(|l| l.starts_with("D  a.md")),
+            "a.md download planned: {out}"
+        );
+        assert!(
+            !out.contains("private/secret.md"),
+            "ignored remote key absent from plan: {out}"
+        );
+        assert!(dir.join("a.md").exists(), "a.md materialized");
+        assert!(
+            !dir.join("private/secret.md").exists(),
+            "ignored remote key must not be downloaded"
         );
     }
 
     #[test]
-    fn status_with_ignore_patterns_warns_but_runs() {
-        // W25/M3: `status` is read-only, so ignore patterns warn on stderr but
-        // the plan is still produced (exit 0 on a clean vault).
+    fn status_with_ignore_patterns_applies() {
+        // Issue #34 status half: user patterns prune the status plan (ignored
+        // key absent) and the run proceeds with exit 2 (dirty plan - a.md
+        // upload pending) and NO Phase 3 warning. The fixture uses user-only
+        // `private/` (not one of the six Obsidian built-ins), so a
+        // defaults-only matcher cannot mask a broken user union.
         let dir = TempDir::new("vaultsync-cli-test");
-        let settings = settings_with_ignore(dir.path(), vec![".trash/"]);
+        std::fs::create_dir_all(dir.join("private")).unwrap();
+        std::fs::write(dir.join("a.md"), "hi").unwrap();
+        std::fs::write(dir.join("private/secret.md"), "s").unwrap();
+        let settings = settings_with_ignore(dir.path(), vec!["private/"]);
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = run_with_settings(
@@ -1821,23 +2067,305 @@ mod tests {
         );
         let err = String::from_utf8(err).unwrap();
         let out = String::from_utf8(out).unwrap();
-        assert_eq!(code, 0);
+        // exit 2: the plan is dirty (a.md upload pending), which is the
+        // success signal for status - the point is it RUNS (no W25 refuse)
+        // with the ignored key pruned.
+        assert_eq!(code, 2, "stderr: {err}");
+        assert!(!err.contains("Phase 3"), "W25 warning must be gone: {err}");
         assert!(
-            err.to_lowercase().contains("ignore") && err.contains("Phase 3"),
-            "expected ignore/Phase-3 warning: {err}"
+            out.lines().any(|l| l.starts_with("U  a.md")),
+            "a.md planned: {out}"
         );
-        assert!(out.contains("plan:"), "plan produced: {out}");
+        assert!(
+            !out.contains("private/"),
+            "ignored key absent from plan: {out}"
+        );
+    }
+
+    #[test]
+    fn push_delete_does_not_delete_remote_ignored_e2e() {
+        // Issue #34 delete invariant, remote half (issue sketch exact name):
+        // `push --delete` must never plan a `DeleteRemote` for a remote-only
+        // key the ignore patterns drop (the ignored key is absent from the
+        // plan entirely), while a non-ignored remote-only key still deletes.
+        // Real execution against MemoryStore: the ignored workspace key
+        // survives on the store, `orphan.md` is gone. Mutation-checked: an
+        // empty `IgnoreSet` at the CLI compile site makes this RED (DR row
+        // for the workspace key appears).
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join("notes/a.md"), "hi").unwrap();
+        let store = MemoryStore::new();
+        let mut c1 = std::io::Cursor::new(b"{}".to_vec());
+        store
+            .put_from(".obsidian/workspace.json", &mut c1, 2, Some(100))
+            .unwrap();
+        let mut c2 = std::io::Cursor::new(b"same".to_vec());
+        store.put_from("notes/a.md", &mut c2, 4, Some(100)).unwrap();
+        let mut c3 = std::io::Cursor::new(b"orphan".to_vec());
+        store.put_from("orphan.md", &mut c3, 6, Some(100)).unwrap();
+        let mut settings = no_store_settings(dir.path());
+        settings.store.bucket = "b".to_string(); // store injected below
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings_store(
+            Command::push(dir.path().into(), true),
+            &settings,
+            &store,
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(
+            !out.lines()
+                .any(|l| l.starts_with("DR .obsidian/workspace.json")),
+            "no DeleteRemote for ignored workspace key: {out}"
+        );
+        assert!(
+            out.lines().any(|l| l.starts_with("DR orphan.md")),
+            "non-ignored remote-only key still deletes: {out}"
+        );
+        assert!(
+            store.head(".obsidian/workspace.json").is_ok(),
+            "ignored remote key survives on the store"
+        );
+        assert!(store.head("orphan.md").is_err(), "orphan deleted");
+        assert!(store.head("notes/a.md").is_ok(), "a.md still present");
+    }
+
+    #[test]
+    fn pull_delete_does_not_delete_local_ignored() {
+        // Issue #34 delete invariant, local half (issue sketch exact name):
+        // `pull --delete` must never delete a local-only path the ignore
+        // patterns prune (it never enters the plan, so no `DL` row) while the
+        // walk still sees everything else. Real execution: `.trash/x.md`
+        // survives on disk, `notes/a.md` intact, and a non-ignored local-only
+        // `extra.md` is still DeleteLocal'd (PR 41 F1 positive control -
+        // the pin cannot pass with delete silently off).
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::create_dir_all(dir.join(".trash")).unwrap();
+        std::fs::write(dir.join("notes/a.md"), "same").unwrap();
+        std::fs::write(dir.join(".trash/x.md"), "x").unwrap();
+        std::fs::write(dir.join("extra.md"), "extra").unwrap();
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"same".to_vec());
+        store.put_from("notes/a.md", &mut c, 4, Some(100)).unwrap();
+        let mut settings = no_store_settings(dir.path());
+        settings.store.bucket = "b".to_string(); // store injected below
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings_store(
+            Command::pull(dir.path().into(), true),
+            &settings,
+            &store,
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(
+            !out.lines().any(|l| l.starts_with("DL .trash/x.md")),
+            "no DeleteLocal for ignored trash path: {out}"
+        );
+        assert!(
+            dir.join(".trash/x.md").exists(),
+            "ignored local file survives the pull --delete"
+        );
+        assert!(dir.join("notes/a.md").exists(), "a.md intact");
+        assert!(
+            out.lines().any(|l| l.starts_with("DL extra.md")),
+            "non-ignored local-only key must DeleteLocal: {out}"
+        );
+        assert!(
+            !dir.join("extra.md").exists(),
+            "non-ignored local-only file must be removed by pull --delete"
+        );
+    }
+
+    #[test]
+    fn status_reports_skipped_ignored() {
+        // Issue #34 D-report local half (issue sketch exact name): when the
+        // walk prunes/skips > 0 paths by ignore patterns, the CLI always
+        // prints the locked count line (not -v-only, no key dump). Fixture
+        // counting (issue #32 D-report): each pruned dir counts 1 (`.trash/`,
+        // `.git/`), each ignored file counts 1 (`workspace.json`,
+        // `.DS_Store`) => exactly 4. RED today: `print_walk_warnings` has no
+        // `skipped_ignored` branch.
+        let dir = TempDir::new("vaultsync-cli-test");
+        write_default_profile_vault(&dir);
+        let settings = no_store_settings(dir.path());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings(
+            Command::status(dir.path().into()),
+            &settings,
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        let _out = String::from_utf8(out).unwrap();
+        assert_eq!(code, 2, "stderr: {err}");
+        assert!(
+            err.contains("warning: ignored 4 local path(s) by ignore patterns"),
+            "exact local ignore count line expected: {err}"
+        );
+        // the warning is count-only - no per-key dump of ignored names
+        assert!(!err.contains("workspace.json"), "no key dump: {err}");
+    }
+
+    #[test]
+    fn push_reports_remote_ignored_count() {
+        // Issue #34 D-report remote half at the CLI: the #33 remote ignore
+        // partition's `PlanReport.warnings` entry must surface as a
+        // `warning: ...` stderr line - count-only (no key names in that
+        // line). Already produced by `ignored_remote_drops_warning` + the
+        // dispatch warning loop once W205 wired the real set; this pins the
+        // CLI half.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = MemoryStore::new();
+        let mut c1 = std::io::Cursor::new(b"{}".to_vec());
+        store
+            .put_from(".obsidian/workspace.json", &mut c1, 2, Some(100))
+            .unwrap();
+        let mut c2 = std::io::Cursor::new(b"x".to_vec());
+        store
+            .put_from(".trash/x.md", &mut c2, 1, Some(100))
+            .unwrap();
+        let mut settings = no_store_settings(dir.path());
+        settings.store.bucket = "b".to_string(); // store injected below
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings_store(
+            Command::push(dir.path().into(), false),
+            &settings,
+            &store,
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        let _out = String::from_utf8(out).unwrap();
+        assert_eq!(code, 0, "stderr: {err}");
+        // `.trash/` folder marker (MemoryStore lists ancestor folders) + the
+        // two keys => 3 dropped.
+        assert!(
+            err.contains("warning: ignored 3 remote key(s) by ignore patterns"),
+            "remote ignore count line expected: {err}"
+        );
+        assert!(
+            !err.contains(".obsidian/workspace.json") && !err.contains(".trash/x.md"),
+            "no per-key dump in the warning: {err}"
+        );
+    }
+
+    #[test]
+    fn status_no_local_ignore_warning_when_zero() {
+        // Issue #34 D-report N==0: no local ignore line when nothing was
+        // skipped by ignore patterns (`profile = "none"` + a clean vault).
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join("notes/a.md"), "hi").unwrap();
+        let settings = settings_profile_none(dir.path(), vec![]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings(
+            Command::status(dir.path().into()),
+            &settings,
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        let _out = String::from_utf8(out).unwrap();
+        assert_eq!(code, 2, "dirty plan; stderr: {err}");
+        assert!(
+            !err.contains("local path(s) by ignore patterns"),
+            "no ignore line when N == 0: {err}"
+        );
+    }
+
+    #[test]
+    fn status_user_patterns_extend_default_profile() {
+        // Issue #34 D3-extend: user patterns UNION with the Obsidian
+        // built-ins - `private/` (user pattern) and workspace.json (built-in)
+        // are both pruned while notes/a.md stays listed.
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::create_dir_all(dir.join("private")).unwrap();
+        std::fs::create_dir_all(dir.join(".obsidian")).unwrap();
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join("private/secret.md"), "s").unwrap();
+        std::fs::write(dir.join(".obsidian/workspace.json"), "{}").unwrap();
+        std::fs::write(dir.join("notes/a.md"), "hi").unwrap();
+        let settings = settings_with_ignore(dir.path(), vec!["private/"]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings(
+            Command::status(dir.path().into()),
+            &settings,
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(code, 2, "dirty plan; stderr: {err}");
+        assert!(
+            out.lines().any(|l| l.starts_with("U  notes/a.md")),
+            "notes/a.md kept: {out}"
+        );
+        assert!(!out.contains("private/"), "user pattern pruned: {out}");
+        assert!(
+            !out.contains("workspace.json"),
+            "built-in pattern still pruned: {out}"
+        );
+    }
+
+    #[test]
+    fn check_with_ignore_patterns_does_not_refuse() {
+        // Issue #34 W25 retirement + D-wire: `check` with non-empty user
+        // ignore patterns must NOT be refused for Phase 3 - it falls through
+        // to the store requirement (empty bucket => exit 1, `[store]`
+        // message) with no Phase 3 ignore text.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let settings = settings_with_ignore(dir.path(), vec![".trash/"]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings(
+            Command::check(),
+            &settings,
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(code, 1, "store requirement failure; stderr: {err}");
+        assert!(!err.contains("Phase 3"), "no W25 refusal: {err}");
+        assert!(
+            err.to_lowercase().contains("store"),
+            "failure must be the store requirement: {err}"
+        );
+        assert!(
+            !String::from_utf8(out).unwrap().contains("check: ok"),
+            "must not be a mock green check"
+        );
     }
 
     #[test]
     fn status_absent_ignore_resolve_does_not_warn_phase3() {
-        // F3/W196 (PR 38 r1): D-w25-seq locked through the CLI gate, not only
-        // at B5. A real TOML-less FileConfig (absent `[ignore]`) resolves to
-        // an empty raw user list + the six Obsidian built-ins; the W25 gate
-        // keys off the raw user field ONLY, so status must stay silent (no
-        // `[ignore].patterns` / Phase-3 text) and produce a normal plan.
-        // GREEN on arrival + mutation-checked: pointing C1 at
-        // `resolved_ignore_patterns` makes this RED.
+        // F3/W196 (PR 38 r1) kept green after the W25 retire (issue #34
+        // D-w25-retire): a real TOML-less FileConfig (absent `[ignore]`)
+        // resolves to an empty raw user list + the six Obsidian built-ins;
+        // status must stay silent (no `[ignore].patterns` / Phase-3 text -
+        // the retired W25 strings must not reappear) and produce a normal
+        // plan. The D-wire compile site reads `resolved_ignore_patterns`,
+        // never the raw user field alone.
         let dir = TempDir::new("vaultsync-cli-test");
         let cfg = crate::config::FileConfig {
             vault_root: Some(dir.path().to_path_buf()),
@@ -1868,12 +2396,12 @@ mod tests {
         assert_eq!(code, 0, "stderr: {err}");
         assert!(
             !err.contains("[ignore].patterns"),
-            "W25 must not warn when only resolved defaults are present: {err}"
+            "retired W25 warning string must not reappear: {err}"
         );
         assert!(out.contains("plan:"), "plan produced: {out}");
 
-        // section present but empty (`[ignore]` with no keys) matches
-        // absent-section at the gate (same as config W188).
+        // section present but empty (`[ignore]` with no keys) resolves
+        // identically (same as config W188).
         let cfg = crate::config::FileConfig {
             vault_root: Some(dir.path().to_path_buf()),
             ignore: Some(crate::config::IgnoreConfig::default()),
@@ -1896,19 +2424,17 @@ mod tests {
         assert_eq!(code2, 0, "stderr: {err2}");
         assert!(
             !err2.contains("[ignore].patterns"),
-            "W25 must not warn for an empty [ignore] section: {err2}"
+            "retired W25 warning string must not reappear for an empty section: {err2}"
         );
     }
 
     #[test]
     fn push_absent_ignore_resolve_does_not_trip_w25() {
-        // F3/W196: the mutating-command branch of C1. With absent `[ignore]`
-        // (raw user field empty, resolved = Obsidian six), push must NOT hit
-        // the W25 Phase-3 refusal - it falls through to the store
-        // requirement and fails there (exit 1, `[store]` message) because no
-        // bucket is configured. GREEN on arrival + mutation-checked: pointing
-        // C1 at `resolved_ignore_patterns` makes this RED (W25 refusal
-        // replaces the store error).
+        // F3/W196 kept green after the W25 retire (issue #34 D-w25-retire):
+        // with absent `[ignore]` (raw user field empty, resolved = Obsidian
+        // six), push must not emit the retired Phase-3 refusal - it falls
+        // through to the store requirement and fails there (exit 1,
+        // `[store]` message) because no bucket is configured.
         let dir = TempDir::new("vaultsync-cli-test");
         let cfg = crate::config::FileConfig {
             vault_root: Some(dir.path().to_path_buf()),
@@ -1934,11 +2460,11 @@ mod tests {
         assert_eq!(code, 1, "stderr: {err}");
         assert!(
             !err.contains("[ignore].patterns"),
-            "W25 must not refuse push when only resolved defaults are present: {err}"
+            "retired W25 refusal string must not reappear: {err}"
         );
         assert!(
             err.contains("[store]") || err.contains("store.bucket"),
-            "failure must be the store requirement, not W25: {err}"
+            "failure must be the store requirement: {err}"
         );
     }
 

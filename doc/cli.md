@@ -112,7 +112,8 @@ region = "us-west-2"
 # prefix = "notes/"
 # path_style = true
 
-# [ignore]     # Phase 3 (ignored patterns are not yet applied)
+# [ignore]     # live (issue #34): compiled once, applied on both sides
+# profile = "obsidian"   # default when absent; "none" disables built-ins
 # patterns = [
 #   ".git/",
 #   ".trash/",
@@ -138,10 +139,37 @@ mtime_tolerance_ms = 1000
 > resolved base stays 1000, and a lone `base_delay_ms = 30000` fails against
 > the default max 20000. Set both when tightening either bound.
 
-> `[ignore].patterns` is a **Phase 3 feature**: it is parsed and validated
-> but not yet applied. A `push`/`pull`/`check` run refuses loudly when it is
-> present (exit 1); `status` warns on stderr and proceeds. Do not expect it
-> to filter the plan until the roadmap's ignore-patterns phase lands.
+> `[ignore]` is **live** (issue #34): the resolved pattern list is compiled
+> once at dispatch and applied on **both** sides - the local walk prunes
+> matching paths before they enter the plan, and the remote listing drops
+> matching keys before planning, so a `--delete` run never removes an
+> ignored remote-only key or an ignored local-only path (D-both-sides).
+> `profile` selects the built-in default set: `"obsidian"` is the default
+> when the key is absent, `"none"` disables the built-ins (user `patterns`
+> still apply). User `patterns` **extend** the active profile (union, never
+> replacement). When a run skips paths/keys by ignore patterns, stderr
+> reports the count only:
+> `warning: ignored N local path(s) by ignore patterns` / `warning: ignored
+> N remote key(s) by ignore patterns`.
+>
+> Upgrade note: keys already uploaded under these patterns before the
+> defaults activated stay on the remote - they are ignored on both sides, so
+> `push --delete` will not remove them (delete invariant); remove them
+> manually in the store, or temporarily set `profile = "none"` for a run
+> (built-ins are disabled for that run).
+>
+> Pattern shapes (issue #30 matcher; `IgnoreSet` is the single source of
+> truth):
+>
+> | Shape | Example | Matches |
+> | ----- | ------- | ------- |
+> | dir prefix (trailing `/`) | `.git/` | the directory key and everything under it |
+> | basename (no `/`) | `.DS_Store` | the final path segment anywhere (`notes/.DS_Store`) |
+> | exact key (has `/`, no trailing `/`) | `.obsidian/workspace.json` | exactly that key |
+> | per-segment `*` glob | `notes/*.md` | one segment matching the wildcard shape |
+>
+> Unsupported: `**`, `!` negation, character classes, `?`, escapes - a
+> pattern using them is a loud config error at resolve time.
 
 `[transfer].concurrency` is **live** (issue 20): it bounds how many
 operations run in flight - the transfer passes (downloads, uploads,
@@ -175,12 +203,9 @@ to the S3 client vaultsync builds - the resolved `[transfer.retry]` policy
 replaces the ambient AWS retry configuration at client build, whether or not
 the section is present.
 
-If you want the full populated form, it is shown here for reference;
-`[transfer]` keys are live, but copying the `[ignore]` block as-is will
-refuse `push`/`pull`/`check` until the ignore-patterns phase lands.
+The full populated form (copy-paste runnable):
 
 ```toml
-# [ignore] is Phase 3 (not yet applied): do not copy verbatim
 vault_root = "/Users/me/Notes"
 
 [store]
@@ -192,6 +217,7 @@ prefix = "notes/"
 path_style = true
 
 [ignore]
+profile = "obsidian"
 patterns = [
   ".git/",
   ".trash/",

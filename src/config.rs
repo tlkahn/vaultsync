@@ -88,7 +88,7 @@ pub struct StoreConfig {
 /// is absent, `"none"` disables built-ins; unknown values are loud errors at
 /// resolution). `patterns` are user additions that **extend** the active
 /// profile (union). Resolution happens in [`resolve_settings`]; application
-/// lands in #34 - W25/M3 still keys off the raw user list only.
+/// is live via `Settings.resolved_ignore_patterns` (issue #34 D-wire).
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IgnoreConfig {
@@ -135,16 +135,16 @@ pub struct Settings {
     /// resolved `[transfer.retry]` policy (I8). Milliseconds at this layer;
     /// `Duration` conversion happens at the S3 boundary.
     pub retry: RetrySettings,
-    /// Raw user `[ignore].patterns` only (no profile injection). W25/M3
-    /// still gates on this field until #34 (issue #31 D-w25-seq): absent
-    /// `[ignore]` leaves it empty even though the resolved list is non-empty,
-    /// so the default profile never trips the Phase 3 refusal.
+    /// Raw user `[ignore].patterns` only (no profile injection). Issue #34
+    /// (D-wire) compiles `resolved_ignore_patterns`, never this raw field
+    /// alone; it is retained for diagnostics (the user-vs-resolved split,
+    /// issue #31 D-w25-seq). Absent `[ignore]` leaves it empty even though
+    /// the resolved list is non-empty (the Obsidian default profile).
     pub ignore_patterns: Vec<String>,
     /// Fully resolved ignore list: active profile built-ins first, then user
-    /// patterns, exact-string deduped, validated via `IgnoreSet`. Unused by
-    /// the CLI until #34 wire-up; present so the Obsidian default can land
-    /// without tripping W25 (issue #31 sequencing note option 2). #34 reads
-    /// this field and retires W25.
+    /// patterns, exact-string deduped, validated via `IgnoreSet`. This is the
+    /// single source of truth the CLI compiles into its `IgnoreSet` (issue
+    /// #34 D-wire).
     pub resolved_ignore_patterns: Vec<String>,
 }
 
@@ -237,9 +237,9 @@ pub struct EnvSnapshot {
 /// disables it; unknown values are loud errors). User `[ignore].patterns`
 /// **extend** the active profile (union, exact-string dedup, validated via
 /// `IgnoreSet` - see [`resolve_ignore`]). `Settings.ignore_patterns` stays
-/// raw user patterns only (W25/M3 gates on it until #34); the fully resolved
-/// list lands on `Settings.resolved_ignore_patterns`, which #34 reads when it
-/// retires W25.
+/// raw user patterns only (diagnostics); the fully resolved list lands on
+/// `Settings.resolved_ignore_patterns`, the single source of truth the CLI
+/// compiles into its `IgnoreSet` (issue #34 D-wire).
 ///
 /// W83/r9 N1: the `--vault`/config merge no longer lives here (the old
 /// `cli: &Cli` parameter was test-only in production - the sole production
@@ -296,8 +296,9 @@ pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings,
 /// user `patterns` **extend** the active profile (union, never replacement).
 /// The resolved list is built-ins first, then user patterns (W190), exact-
 /// string deduped (W191), profile-validated (W192), and pattern-validated via
-/// `IgnoreSet` (W193). The user list stays raw (W25 gates on it until #34 -
-/// D-w25-seq).
+/// `IgnoreSet` (W193). The user list stays raw (kept for the user-vs-resolved
+/// split, D-w25-seq; not read by the CLI production path after W25
+/// retirement).
 fn resolve_ignore(ignore: Option<&IgnoreConfig>) -> Result<(Vec<String>, Vec<String>), Error> {
     let user = ignore.map(|i| i.patterns.clone()).unwrap_or_default();
     // D3/D-profile-values: absent profile (or `None`) -> `obsidian`;
@@ -584,11 +585,12 @@ patterns = [".git/"]
     #[test]
     fn resolve_absent_ignore_does_not_populate_user_field() {
         // Issue #31 (D-w25-seq, W194): the sequencing invariant - absent
-        // `[ignore]` leaves the user-only field empty (so W25/M3 never trips
-        // on the built-in default profile) while the resolved field carries
-        // the built-ins. A future mistaken merge of the two fields fails
-        // loudly here (mutation-checked: reverting `resolve_ignore` to the
-        // W186 `ignore_patterns.clone()` baseline flips this RED).
+        // `[ignore]` leaves the user-only field empty while the resolved
+        // field carries the built-ins (so the default profile can apply
+        // without a user-written pattern). A future mistaken merge of the
+        // two fields fails loudly here (mutation-checked: reverting
+        // `resolve_ignore` to the W186 `ignore_patterns.clone()` baseline
+        // flips this RED).
         let cfg = FileConfig::default();
         let s = settings(&cfg).unwrap();
         assert!(s.ignore_patterns.is_empty(), "user field must stay empty");
@@ -773,10 +775,10 @@ patterns = [".git/"]
     fn resolve_default_profile_is_obsidian() {
         // Issue #31 (D3/D-w25-seq): absent `[ignore]` (or an empty section)
         // resolves the built-in Obsidian default set in constant order on the
-        // *resolved* field, while the user-only field stays empty so W25 never
-        // trips (the critical sequencing hazard). RED: `resolved_ignore_patterns`
-        // mirrors the user list today (W186 baseline), so the six built-ins are
-        // missing.
+        // *resolved* field, while the user-only field stays empty (the
+        // user-vs-resolved split; D-wire compiles the resolved field only).
+        // RED: `resolved_ignore_patterns` mirrors the user list today (W186
+        // baseline), so the six built-ins are missing.
         let expected: Vec<String> = OBSIDIAN_DEFAULT_IGNORE_PATTERNS
             .iter()
             .map(|s| s.to_string())
@@ -786,7 +788,7 @@ patterns = [".git/"]
         let s = settings(&cfg).unwrap();
         assert!(
             s.ignore_patterns.is_empty(),
-            "user field stays empty (W25-safe)"
+            "user field stays empty (raw-only, D-wire)"
         );
         assert_eq!(s.resolved_ignore_patterns, expected);
 
@@ -1286,7 +1288,7 @@ max_delay_ms = 4000
         // W56 (B nit): unknown TOML keys must fail loudly instead of being
         // silently ignored - a `mtime_tolerance` typo (missing `_ms`) must
         // surface as a parse error naming the key, not keep the 1000 default
-        // (consistent with the W25/W28 loud-on-inert-config posture).
+        // (consistent with the loud-on-inert-config posture, W25/W28).
         let text = "[transfer]\nmtime_tolerance = 5000\n";
         let err = parse_config_str(text).unwrap_err();
         let msg = format!("{err}");

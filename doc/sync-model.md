@@ -86,12 +86,27 @@ Safety rails:
 
 ## Filters
 
-Applied when building entity lists (both sides):
+Applied when building entity lists on **both** sides (D-both-sides, issue
+#34): the local walk prunes matching paths (issue #32) and the remote
+listing drops matching keys (issue #33) from the same compiled `IgnoreSet`
+(config `[ignore]`, issue #31). Absence is strict: an ignored key is **not**
+a plan row of any kind (no `Skip(ignored)`), so `--delete` never removes an
+ignored remote-only key (`push --delete`) or an ignored local-only path
+(`pull --delete`). Skipped paths/keys are surfaced as count-only stderr
+warnings.
 
-- default ignores: `.git/`, `.trash/`, OS junk (`.DS_Store`), maybe `.obsidian/workspace`, `.obsidian/workspace.json`, `.obsidian/workspace-mobile.json` (session state)
-- user `--exclude` / `--include` glob patterns (gitignore-style if a small crate is acceptable; else simple prefix/suffix/glob)
-
-**Locked default:** sync `.obsidian/` **except** workspace session files (`.obsidian/workspace`, `.obsidian/workspace.json`, `.obsidian/workspace-mobile.json`), matching "settings yes, ephemeral no". Expose as the built-in `--profile obsidian` defaults (and the default profile when none is named).
+- Matcher: `IgnoreSet` (issue #30) - dir prefix (`.git/`), basename
+  (`.DS_Store` matches `notes/.DS_Store`), exact key
+  (`.obsidian/workspace.json`), per-segment `*` globs. No `**` / `!` /
+  classes / `?` (loud config error).
+- Default profile `"obsidian"` (active when `[ignore]` is absent or
+  `profile` is unset): `.git/`, `.trash/`, `.DS_Store`,
+  `.obsidian/workspace`, `.obsidian/workspace.json`,
+  `.obsidian/workspace-mobile.json` (settings yes, ephemeral session no).
+  `profile = "none"` disables built-ins.
+- User `[ignore].patterns` **extend** the active profile (union, never
+  replacement).
+- Config-only: no `--profile` / `--exclude` / `--include` CLI flag in v1.
 
 ## Folder representation
 
