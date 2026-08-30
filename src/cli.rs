@@ -305,6 +305,9 @@ pub struct DispatchCtx {
     pub concurrency: u32,
     pub progress_mode: ProgressMode,
     pub ignore: crate::IgnoreSet,
+    /// Resolved `[inventory].mode` (issue 45): threaded into every
+    /// `build_plan` call (warm manifest vs live list+head).
+    pub inventory_mode: crate::config::InventoryMode,
 }
 
 /// Dispatch a command against a store, writing to `out`/`err`. Returns exit code.
@@ -386,7 +389,18 @@ pub fn run_with_io(
             };
             let local = crate::local::LocalFs::with_follow(&vault, follow_symlinks)
                 .with_ignore(ctx.ignore.clone());
-            match crate::build_plan(&local, store, Mode::Status, &opts, &ctx.ignore) {
+            match crate::build_plan(
+                &local,
+                store,
+                Mode::Status,
+                &opts,
+                &ctx.ignore,
+                &crate::inventory::InventoryOpts {
+                    mode: ctx.inventory_mode,
+                    concurrency: ctx.concurrency,
+                    vault_root: Some(vault.clone()),
+                },
+            ) {
                 Ok(report) => {
                     // H1 (W99): build_plan + store-listing warnings surface
                     // here, at the CLI layer - library code never writes to
@@ -432,6 +446,7 @@ pub fn run_with_io(
                 concurrency: ctx.concurrency,
                 progress: ctx.progress_mode,
                 ignore: ctx.ignore.clone(),
+                inventory_mode: ctx.inventory_mode,
             };
             dispatch_plan(&vault, store, Mode::Push, &opts, &flags, out, err)
         }
@@ -462,6 +477,7 @@ pub fn run_with_io(
                 concurrency: ctx.concurrency,
                 progress: ctx.progress_mode,
                 ignore: ctx.ignore.clone(),
+                inventory_mode: ctx.inventory_mode,
             };
             dispatch_plan(&vault, store, Mode::Pull, &opts, &flags, out, err)
         }
@@ -523,6 +539,9 @@ struct PlanFlags {
     concurrency: u32,
     progress: ProgressMode,
     ignore: crate::IgnoreSet,
+    /// Resolved `[inventory].mode` (issue 45, W235) threaded into
+    /// `dispatch_plan`'s `build_plan` call.
+    inventory_mode: crate::config::InventoryMode,
 }
 
 /// Build the I27 progress renderer for a resolved mode (I27 cycle 8 refactor:
@@ -567,7 +586,18 @@ fn dispatch_plan(
     // the seam).
     let resolved =
         crate::progress::resolve_progress_mode(flags.progress, std::io::stderr().is_terminal());
-    match crate::build_plan(&local, store, mode, opts, &flags.ignore) {
+    match crate::build_plan(
+        &local,
+        store,
+        mode,
+        opts,
+        &flags.ignore,
+        &crate::inventory::InventoryOpts {
+            mode: flags.inventory_mode,
+            concurrency: flags.concurrency,
+            vault_root: Some(vault.clone()),
+        },
+    ) {
         Ok(report) => {
             // H1 (W99): build_plan + store-listing warnings surface here, at
             // the CLI layer - library code never writes to stderr.
@@ -806,6 +836,7 @@ fn run_with_settings_store(
             concurrency: settings.concurrency,
             progress_mode,
             ignore,
+            inventory_mode: settings.inventory_mode,
         },
         out,
         err,
@@ -852,6 +883,7 @@ pub fn run_from_env() -> i32 {
             concurrency: 1,
             progress_mode: ProgressMode::Auto,
             ignore: crate::IgnoreSet::empty(),
+            inventory_mode: crate::config::InventoryMode::Auto,
         };
         return run_with_io(cmd, &MemoryStore::new(), &ctx, &mut out, &mut err);
     }
@@ -1295,6 +1327,8 @@ mod tests {
                 // progress-silent; only progress tests opt into Always.
                 progress_mode: ProgressMode::Off,
                 ignore: crate::IgnoreSet::empty(),
+                // W235: list_head keeps this helper exactly today's behavior.
+                inventory_mode: crate::config::InventoryMode::ListHead,
             },
             &mut out,
             &mut err,
@@ -1326,6 +1360,7 @@ mod tests {
                 concurrency: 1,
                 progress_mode: ProgressMode::Off,
                 ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::ListHead,
             },
             &mut out,
             &mut err,
@@ -1356,6 +1391,7 @@ mod tests {
                 concurrency: 1,
                 progress_mode: mode,
                 ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::ListHead,
             },
             &mut out,
             &mut err,

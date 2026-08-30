@@ -142,9 +142,6 @@ pub(crate) fn parent_folders(key: &str) -> Vec<String> {
 /// (trailing `/`, size 0, no mtime/etag). Same algorithm as the store
 /// listing's folder synthesis so warm == cold plan parity holds. Duplicate
 /// folder keys collapse (a set), so a file set maps to unique folders.
-/// `#[allow(dead_code)]`: production caller lands with the warm inventory
-/// path (W233); the W230 parity test already exercises it.
-#[allow(dead_code)]
 pub(crate) fn synthesize_folders(files: &[Entity]) -> Vec<Entity> {
     let mut folders: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for f in files {

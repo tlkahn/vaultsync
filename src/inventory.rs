@@ -170,6 +170,43 @@ pub struct CachePaths {
     pub meta: std::path::PathBuf,
 }
 
+/// Inventory knobs threaded into [`crate::build_plan`] (issue 45,
+/// D-plan-seam): the resolved `[inventory].mode`, the transfer concurrency
+/// (bounds the cold path's heads via the store), and the vault root
+/// (`Some` enables the S7 local cache; `None` until W243).
+#[derive(Debug, Clone)]
+pub struct InventoryOpts {
+    pub mode: InventoryMode,
+    pub concurrency: u32,
+    pub vault_root: Option<std::path::PathBuf>,
+}
+
+impl InventoryOpts {
+    /// Today's behavior: always live list+head, no manifest coupling, no
+    /// cache. Explicit (not `Default`) so planner tests cannot accidentally
+    /// couple warm (W235: prefer `ListHead` for pure planner tests that seed
+    /// MemoryStore without manifests).
+    pub fn list_head() -> Self {
+        InventoryOpts {
+            mode: InventoryMode::ListHead,
+            concurrency: 1,
+            vault_root: None,
+        }
+    }
+}
+
+impl Default for InventoryOpts {
+    /// Product default (Q1): `auto`, concurrency 1 (callers override with
+    /// their resolved settings), no cache until S7.
+    fn default() -> Self {
+        InventoryOpts {
+            mode: InventoryMode::Auto,
+            concurrency: 1,
+            vault_root: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

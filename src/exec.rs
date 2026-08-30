@@ -628,6 +628,7 @@ mod tests {
             Mode::Push,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -663,9 +664,16 @@ mod tests {
             mtime_tolerance_ms: 5000,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Push, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Push,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         // drift the file 3000 ms after the plan captured its mtime
         set_mtime_ms(&p, base + 3000);
         let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Push, &opts, 1);
@@ -689,9 +697,16 @@ mod tests {
         let local = LocalFs::with_follow(dir.path(), true);
         let store = MemoryStore::new();
         let opts = PlanOpts::default();
-        let plan = crate::build_plan(&local, &store, Mode::Push, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Push,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         let link = plan.actions.iter().find(|a| a.key == "link.md").unwrap();
         assert_eq!(link.kind, ActionKind::Skip, "link.md must be planned skip");
         let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Push, &opts, 1);
@@ -724,6 +739,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -751,6 +767,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -774,9 +791,16 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Push, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Push,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts, 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert!(matches!(
@@ -800,9 +824,16 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         assert!(
             plan.actions
                 .iter()
@@ -839,9 +870,16 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         let link = plan.actions.iter().find(|a| a.key == "link.md").unwrap();
         assert_eq!(link.kind, ActionKind::Skip, "{:?}", link);
         assert_eq!(link.reason, "followed_symlink");
@@ -869,9 +907,16 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         assert!(
             plan.actions
                 .iter()
@@ -913,9 +958,16 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         assert!(
             plan.actions
                 .iter()
@@ -952,9 +1004,16 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Pull, &opts, 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert!(!dir.join("gone.md").exists());
@@ -973,9 +1032,16 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         let rep = execute_plan(&local, &store, &plan, Mode::Pull, &opts, 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert!(!dir.join("n/gone.md").exists());
@@ -1002,9 +1068,16 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         let folder_row = plan
             .actions
             .iter()
@@ -1045,9 +1118,16 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         let rep = execute_plan(&local, &store, &plan, Mode::Pull, &opts, 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert!(!dir.join("a/b/c").exists(), "deepest ancestor not removed");
@@ -1077,9 +1157,16 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         assert!(
             plan.actions
                 .iter()
@@ -1109,9 +1196,16 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         // the file vanishes before execution (pre-cleaned by another process)
         std::fs::remove_file(dir.join("n/sub/gone.md")).unwrap();
         let rep = execute_plan(&local, &store, &plan, Mode::Pull, &opts, 1);
@@ -1146,9 +1240,16 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Push, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Push,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         assert!(
             plan.actions
                 .iter()
@@ -1191,9 +1292,16 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Push, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Push,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         assert!(
             plan.actions
                 .iter()
@@ -1234,9 +1342,16 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Push, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Push,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         assert!(
             plan.actions
                 .iter()
@@ -1265,9 +1380,16 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Push, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Push,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts, 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         assert!(matches!(
@@ -1289,9 +1411,16 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Push, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Push,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts, 1);
         assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
         let log = store.log();
@@ -1488,9 +1617,16 @@ mod tests {
         let opts = PlanOpts::default();
         let dir1 = TempDir::new("vaultsync-exec");
         let local1 = LocalFs::new(dir1.path());
-        let plan = crate::build_plan(&local1, &store, Mode::Pull, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local1,
+            &store,
+            Mode::Pull,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         // I17-r1/F1 (W161): the concurrency-1 leg is an EQUALITY pin, not a
         // gauge, so it runs through `store.inner` (bare MemoryStore) - the
         // Condvar rendezvous latches `released` for the life of the wrapper,
@@ -1540,6 +1676,7 @@ mod tests {
             Mode::Pull,
             &opts,
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -1599,9 +1736,16 @@ mod tests {
         let dir = TempDir::new("vaultsync-exec");
         let local = LocalFs::new(dir.path());
         let opts = PlanOpts::default();
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         let rep4 = execute_plan(&local, &store, &plan, Mode::Pull, &opts, 4);
         assert_eq!(rep4.failed.len(), 1, "{:?}", rep4.failed);
         assert_eq!(rep4.failed[0].key, "f07.md");
@@ -1653,9 +1797,16 @@ mod tests {
             store.poison("n/sub/k00.md");
             let dir = TempDir::new("vaultsync-exec");
             let local = LocalFs::new(dir.path());
-            let plan = crate::build_plan(&local, &store, Mode::Pull, &opts, &IgnoreSet::empty())
-                .unwrap()
-                .plan;
+            let plan = crate::build_plan(
+                &local,
+                &store,
+                Mode::Pull,
+                &opts,
+                &IgnoreSet::empty(),
+                &crate::inventory::InventoryOpts::list_head(),
+            )
+            .unwrap()
+            .plan;
             let rep = execute_plan(&local, &store, &plan, Mode::Pull, &opts, 8);
             // Only the poisoned key may appear in `failed`; a healthy key
             // failing with a NotFound/tmp-allocation error is the
@@ -1697,9 +1848,16 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Push, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Push,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         // post-plan edits: grow a.md (R3.3), replace gone.md remotely (W62).
         let mut f = std::fs::OpenOptions::new()
             .append(true)
@@ -1743,9 +1901,16 @@ mod tests {
                 delete: true,
                 ..Default::default()
             };
-            let plan = crate::build_plan(&local, &store, Mode::Push, &opts, &IgnoreSet::empty())
-                .unwrap()
-                .plan;
+            let plan = crate::build_plan(
+                &local,
+                &store,
+                Mode::Push,
+                &opts,
+                &IgnoreSet::empty(),
+                &crate::inventory::InventoryOpts::list_head(),
+            )
+            .unwrap()
+            .plan;
             let rep = execute_plan(&local, &store, &plan, Mode::Push, &opts, concurrency);
             assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
             let log = store.log();
@@ -1777,6 +1942,7 @@ mod tests {
             Mode::Push,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -1803,6 +1969,7 @@ mod tests {
             Mode::Push,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -1892,6 +2059,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -1998,6 +2166,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -2078,6 +2247,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -2116,6 +2286,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -2156,6 +2327,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -2202,6 +2374,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -2246,6 +2419,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -2290,6 +2464,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -2326,6 +2501,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -2353,6 +2529,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -2404,6 +2581,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -2445,6 +2623,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -2487,6 +2666,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -2520,9 +2700,16 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         assert!(
             plan.actions
                 .iter()
@@ -2559,9 +2746,16 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Push, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Push,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         // remote vanishes before execution -> the planned delete sees NotFound
         store.delete("gone.md").unwrap();
         let rep = crate::exec::execute_plan(&local, &store, &plan, Mode::Push, &opts, 1);
@@ -2582,6 +2776,7 @@ mod tests {
             Mode::Push,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -2614,6 +2809,7 @@ mod tests {
             Mode::Push,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -2638,6 +2834,7 @@ mod tests {
             Mode::Status,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -2782,6 +2979,7 @@ mod tests {
             Mode::Push,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -2855,6 +3053,7 @@ mod tests {
             Mode::Push,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -2909,6 +3108,7 @@ mod tests {
             Mode::Pull,
             &opts,
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -2972,6 +3172,7 @@ mod tests {
             Mode::Push,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -3007,6 +3208,7 @@ mod tests {
             Mode::Push,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -3078,6 +3280,7 @@ mod tests {
             Mode::Push,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -3132,6 +3335,7 @@ mod tests {
             Mode::Push,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -3218,9 +3422,16 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         assert!(
             plan.actions
                 .iter()
@@ -3278,6 +3489,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -3347,6 +3559,7 @@ mod tests {
             Mode::Status,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -3387,9 +3600,16 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let plan = crate::build_plan(&local, &store, Mode::Push, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let plan = crate::build_plan(
+            &local,
+            &store,
+            Mode::Push,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         assert!(plan.actions.iter().any(|a| a.kind == ActionKind::Upload));
         assert!(
             plan.actions
