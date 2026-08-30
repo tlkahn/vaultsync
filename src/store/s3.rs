@@ -426,6 +426,11 @@ fn classify_error(timeout: bool, status: Option<u16>, msg: &str) -> Error {
     match status {
         Some(404) => Error::NotFound(msg.to_string()),
         Some(401) | Some(403) => Error::Unauthorized(msg.to_string()),
+        // W225 (issue 45): HTTP 412 (Precondition Failed) is the S3
+        // If-Match / If-None-Match signal for a lost manifest-commit race - a
+        // real variant (D-error), never stuffed into Other so mock race tests
+        // match cleanly.
+        Some(412) => Error::PreconditionFailed(msg.to_string()),
         // W65/A-L1: 408 (request timeout) is a transient retryable provider
         // signal, classified with the timeout family.
         Some(408) => Error::Timeout(msg.to_string()),
@@ -434,6 +439,36 @@ fn classify_error(timeout: bool, status: Option<u16>, msg: &str) -> Error {
         Some(s) if s >= 500 || s == 429 => Error::Unavailable(msg.to_string()),
         _ => Error::Other(msg.to_string()),
     }
+}
+
+/// Map a conditional put's [`PutOpts`](crate::store::PutOpts) onto S3's
+/// `If-Match` / `If-None-Match` header values (issue 45, W225). Pure so the
+/// header attachment is unit-testable offline; the S3 request builder
+/// receives the returned values verbatim. `if_none_match_star` maps to the
+/// literal `"*"` per HTTP semantics; no precondition maps to no header
+/// (identical to a plain put).
+fn put_conditional_headers(opts: &crate::store::PutOpts) -> (Option<String>, Option<String>) {
+    let if_match = opts.if_match_etag.clone();
+    let if_none_match = if opts.if_none_match_star {
+        Some("*".to_string())
+    } else {
+        None
+    };
+    (if_match, if_none_match)
+}
+
+/// The If-None-Match header value for a conditional get
+/// ([`GetOpts`](crate::store::GetOpts), issue 45, W225): the etag verbatim,
+/// or no header when absent.
+fn get_if_none_match(opts: &crate::store::GetOpts) -> Option<String> {
+    opts.if_none_match_etag.clone()
+}
+
+/// Whether a raw HTTP status is 304 Not Modified - the conditional-GET
+/// satisfied outcome (issue 45, W225). S3 models 304 as an unhandled SDK
+/// error, so detection goes through the raw response status.
+fn status_is_not_modified(status: Option<u16>) -> bool {
+    status == Some(304)
 }
 
 /// Classify a mid-body stream failure (W65/A-L1): a `try_next` error after a
@@ -626,18 +661,48 @@ impl ObjectStore for S3Store {
     }
 
     fn get_to(&self, key: &str, w: &mut dyn Write) -> Result<Entity, Error> {
+        match self.get_to_with(key, w, crate::store::GetOpts::default())? {
+            crate::store::GetOutcome::Body(e) => Ok(e),
+            // A plain get can never be 304 (no If-None-Match was sent).
+            crate::store::GetOutcome::NotModified(_) => {
+                unreachable!("plain get_to cannot answer NotModified (no conditional was sent)")
+            }
+        }
+    }
+
+    fn get_to_with(
+        &self,
+        key: &str,
+        w: &mut dyn Write,
+        opts: crate::store::GetOpts,
+    ) -> Result<crate::store::GetOutcome, Error> {
         validate_object_key(key)?;
         let fk = full_key(&self.prefix, key);
         let rel = key.to_string();
-        let entity = self.rt.block_on(async {
-            let resp = self
-                .client
-                .get_object()
-                .bucket(&self.bucket)
-                .key(&fk)
-                .send()
-                .await
-                .map_err(|e| map_sdk_err(&e, "get"))?;
+        let outcome = self.rt.block_on(async {
+            let mut req = self.client.get_object().bucket(&self.bucket).key(&fk);
+            // W225 (issue 45): If-None-Match on the GET; a 304 answers
+            // NotModified with no body streamed.
+            if let Some(etag) = get_if_none_match(&opts) {
+                req = req.if_none_match(etag);
+            }
+            let resp = match req.send().await {
+                Err(e) if status_is_not_modified(e.raw_response().map(|r| r.status().as_u16())) => {
+                    // 304: conditional GET satisfied. The object's etag IS
+                    // the If-None-Match value we just validated; size/mtime
+                    // are best-effort here (S3 does not return them on a 304).
+                    return Ok::<crate::store::GetOutcome, Error>(
+                        crate::store::GetOutcome::NotModified(Entity {
+                            key: rel,
+                            size: 0,
+                            mtime_ms: None,
+                            etag: get_if_none_match(&opts),
+                        }),
+                    );
+                }
+                Err(e) => return Err(map_sdk_err(&e, "get")),
+                Ok(resp) => resp,
+            };
             let meta = resp.metadata();
             let meta_val = meta.and_then(|m| m.get(MTIME_KEY).map(String::as_str));
             let last = resp.last_modified().and_then(dt_millis);
@@ -670,14 +735,14 @@ impl ObjectStore for S3Store {
             // present it is authoritative (and equals written post-check); when
             // absent, the streamed count is used - never a bogus 0.
             let size = effective_get_size(content_len, written);
-            Ok::<Entity, Error>(Entity {
+            Ok::<crate::store::GetOutcome, Error>(crate::store::GetOutcome::Body(Entity {
                 key: rel,
                 size,
                 mtime_ms: mtime,
                 etag,
-            })
+            }))
         })?;
-        Ok(entity)
+        Ok(outcome)
     }
 
     fn put_from(
@@ -686,6 +751,24 @@ impl ObjectStore for S3Store {
         r: &mut dyn Read,
         size: u64,
         mtime_ms: Option<u64>,
+    ) -> Result<Entity, Error> {
+        self.put_from_with(
+            key,
+            r,
+            size,
+            crate::store::PutOpts {
+                mtime_ms,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn put_from_with(
+        &self,
+        key: &str,
+        r: &mut dyn Read,
+        size: u64,
+        opts: crate::store::PutOpts,
     ) -> Result<Entity, Error> {
         // Validate before any client call (trait N1).
         validate_put_key(key)?;
@@ -723,6 +806,11 @@ impl ObjectStore for S3Store {
         // Refutation R-b).
         drop(f);
 
+        // Copy the opts fields out before the `async move` closure so no
+        // borrow of `opts` outlives the move.
+        let mtime_ms = opts.mtime_ms;
+        let (if_match, if_none_match) = put_conditional_headers(&opts);
+
         let upload = (|| -> Result<Option<String>, Error> {
             let body_res = self.rt.block_on(async {
                 ByteStream::from_path(&tmp)
@@ -739,6 +827,14 @@ impl ObjectStore for S3Store {
                     .body(body);
                 if let Some(v) = encode_mtime(mtime_ms) {
                     req = req.metadata(MTIME_KEY, v);
+                }
+                // W225 (issue 45): If-Match / If-None-Match: * conditionals
+                // for the manifest commit (create vs. race-checked update).
+                if let Some(v) = if_match {
+                    req = req.if_match(v);
+                }
+                if let Some(v) = if_none_match {
+                    req = req.if_none_match(v);
                 }
                 let resp = req.send().await.map_err(|e| map_sdk_err(&e, "put"))?;
                 // R5-L2/W44: return the S3 ETag from the put response so the
@@ -1306,11 +1402,62 @@ mod tests {
             classify_error(false, Some(599), "x"),
             Error::Unavailable(_)
         ));
+        // W225 (issue 45): HTTP 412 (Precondition Failed) maps to the real
+        // `PreconditionFailed` variant - the S3 If-Match / If-None-Match
+        // manifest-commit race signal (D-error, never stuffed into Other).
+        assert!(matches!(
+            classify_error(false, Some(412), "put: x"),
+            Error::PreconditionFailed(_)
+        ));
+        // 412 must not be absorbed by the 5xx/429 Unavailable arm or Other.
+        assert!(matches!(
+            classify_error(false, Some(412), "x"),
+            Error::PreconditionFailed(ref m) if m.contains("x")
+        ));
         assert!(matches!(
             classify_error(false, Some(499), "x"),
             Error::Other(_)
         ));
         assert!(matches!(classify_error(false, None, "x"), Error::Other(_)));
+    }
+
+    #[test]
+    fn conditional_header_helpers_map_opts_to_http_values() {
+        use crate::store::{GetOpts, PutOpts};
+        // W225 (issue 45): the pure header-mapping helpers that the S3
+        // `put_from_with` / `get_to_with` overrides attach to the SDK request
+        // builders. `if_none_match_star` maps to the literal `"*"` (HTTP
+        // If-None-Match: *); a None precondition maps to no header at all
+        // (identical to a plain put/get).
+        let (im, inm) = put_conditional_headers(&PutOpts::default());
+        assert!(im.is_none() && inm.is_none());
+        let (im, inm) = put_conditional_headers(&PutOpts {
+            if_match_etag: Some("\"etag\"".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(im.as_deref(), Some("\"etag\""));
+        assert!(inm.is_none());
+        let (im, inm) = put_conditional_headers(&PutOpts {
+            if_none_match_star: true,
+            ..Default::default()
+        });
+        assert!(im.is_none());
+        assert_eq!(inm.as_deref(), Some("*"));
+        // GetOpts If-None-Match passes the etag straight through.
+        assert_eq!(
+            get_if_none_match(&GetOpts {
+                if_none_match_etag: Some("\"e\"".to_string()),
+            })
+            .as_deref(),
+            Some("\"e\"")
+        );
+        assert!(get_if_none_match(&GetOpts::default()).is_none());
+        // 304 detection via the raw status: only an exact 304 is a "not
+        // modified" outcome; 200 and 412 are not.
+        assert!(status_is_not_modified(Some(304)));
+        assert!(!status_is_not_modified(Some(200)));
+        assert!(!status_is_not_modified(Some(412)));
+        assert!(!status_is_not_modified(None));
     }
 
     #[test]
