@@ -1,6 +1,8 @@
 # Issue 33 plan: Apply ignore patterns to remote listings in `build_plan`
 
 **Status:** implemented (W195-W202 landed on this worktree)
+
+Checklist reconciled (`- [x]`) under review plan `pr-39-review-5467770600.md` W207.
 **Issue:** https://github.com/tlkahn/vaultsync/issues/33 (OPEN; P1 of epic #9)
 **Branch:** `worktree-apply-ignore-patterns-to-remote-listings-in-build_plan` (this worktree; cut from
 `main` tip `b1af61c` = Issue 30 / PR 35 merged)
@@ -585,15 +587,15 @@ Do not pull in S3 or live network. Offline lib tests only.
 
 ## Implementation checklist (copy into PR body)
 
-- [ ] W195 `partition_ignored_remote_keys` + `IgnoreSet::empty`
-- [ ] W196 `build_plan` / `status_with_store` take `&IgnoreSet`; call sites empty
-- [ ] W197 `build_plan_filters_remote_ignored`
-- [ ] W198 `push_delete_does_not_delete_remote_ignored`
-- [ ] W199 `build_plan_ignore_after_reserved` (reserved first, no double-count)
-- [ ] W200 `build_plan_dir_prefix_drops_nested_remote`
-- [ ] W201 ignore warning N>0 / N==0 pins (count-only text)
-- [ ] W202 rustdoc + roadmap decision log + plan status
-- [ ] `Cargo.toml` deps unchanged
-- [ ] W25 tests still green; no CLI apply of real patterns
-- [ ] `plan()` untouched; filter-agnostic
-- [ ] `cargo fmt` / `clippy -D warnings` / `cargo test --offline --lib --bins` green
+- [x] W195 `partition_ignored_remote_keys` + `IgnoreSet::empty`
+- [x] W196 `build_plan` / `status_with_store` take `&IgnoreSet`; call sites empty
+- [x] W197 `build_plan_filters_remote_ignored`
+- [x] W198 `push_delete_does_not_delete_remote_ignored`
+- [x] W199 `build_plan_ignore_after_reserved` (reserved first, no double-count)
+- [x] W200 `build_plan_dir_prefix_drops_nested_remote`
+- [x] W201 ignore warning N>0 / N==0 pins (count-only text)
+- [x] W202 rustdoc + roadmap decision log + plan status
+- [x] `Cargo.toml` deps unchanged
+- [x] W25 tests still green; no CLI apply of real patterns
+- [x] `plan()` untouched; filter-agnostic
+- [x] `cargo fmt` / `clippy -D warnings` / `cargo test --offline --lib --bins` green
