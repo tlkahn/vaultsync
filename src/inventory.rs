@@ -207,6 +207,107 @@ impl Default for InventoryOpts {
     }
 }
 
+/// A successful remote mutation to fold into the manifest commit (issue 45,
+/// D-commit-when / W237). Only successes are listed: a failed upload/delete
+/// must never upsert/remove its key (bodies-first crash order, 7.5).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommitMutation {
+    /// An upload that succeeded. The remote `Entity` (size/mtime/etag) comes
+    /// from the `put_from` result so the manifest copies the true remote
+    /// etag (I15 mtime identity preserved).
+    Upload(Entity),
+    /// A remote delete that succeeded (key only).
+    DeleteRemote(String),
+}
+
+/// Outcome of a manifest commit (W238).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitOutcome {
+    /// The manifest was written; `etag` is the new object etag (may be None
+    /// on backends that do not report one), `entry_count` the committed
+    /// entry count.
+    Written {
+        etag: Option<String>,
+        entry_count: usize,
+    },
+    /// Zero successful remote mutations: nothing to commit (the manifest
+    /// already matches the plan's view of remote for those keys).
+    SkippedNoMutations,
+    /// The conditional put lost its race (If-Match / If-None-Match failed):
+    /// the manifest was NOT overwritten. Bodies from this run may still be
+    /// live; the caller warns and suggests repair.
+    PreconditionFailed,
+}
+
+/// Fold successful mutations into the base file set (W237, pure): uploads
+/// upsert size/mtime/etag; deletes remove; anything not in `successes` keeps
+/// its base entry. Output is sorted by key with no duplicates.
+pub(crate) fn apply_commit_mutations(
+    base_files: &[Entity],
+    successes: &[CommitMutation],
+) -> Vec<Entity> {
+    let mut map: std::collections::BTreeMap<String, Entity> = base_files
+        .iter()
+        .map(|e| (e.key.clone(), e.clone()))
+        .collect();
+    for m in successes {
+        match m {
+            CommitMutation::Upload(e) => {
+                map.insert(e.key.clone(), e.clone());
+            }
+            CommitMutation::DeleteRemote(k) => {
+                map.remove(k);
+            }
+        }
+    }
+    map.into_values().collect()
+}
+
+/// Commit a new manifest after a mutating push (W238, D-commit-cond):
+/// bodies are already live (transfers ran first); this writes the manifest
+/// LAST (D-commit-order) with a conditional put - If-Match on the base etag
+/// when the plan read a manifest, If-None-Match: * when creating (base was
+/// list+head/missing). A lost race answers [`CommitOutcome::PreconditionFailed`]
+/// and never clobbers the other writer's manifest. Zero successes skip the
+/// write entirely (D-commit-when).
+pub fn commit_manifest(
+    store: &dyn ObjectStore,
+    base: &InventoryBase,
+    successes: &[CommitMutation],
+    _cache: Option<&CachePaths>,
+) -> Result<CommitOutcome, Error> {
+    if successes.is_empty() {
+        return Ok(CommitOutcome::SkippedNoMutations);
+    }
+    let files = apply_commit_mutations(&base.file_entities, successes);
+    let created_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let manifest = crate::manifest::file_entities_to_manifest(
+        &files,
+        created_ms,
+        Some(format!("vaultsync {}", crate::version())),
+        None,
+    )?;
+    let body = crate::manifest::serialize_manifest(&manifest)?;
+    let body_len = body.len() as u64;
+    let mut cursor = std::io::Cursor::new(body);
+    let opts = crate::store::PutOpts {
+        mtime_ms: None,
+        if_match_etag: base.manifest_etag.clone(),
+        if_none_match_star: base.manifest_etag.is_none(),
+    };
+    match store.put_from_with(crate::local::MANIFEST_KEY, &mut cursor, body_len, opts) {
+        Ok(entity) => Ok(CommitOutcome::Written {
+            etag: entity.etag,
+            entry_count: manifest.entry_count,
+        }),
+        Err(Error::PreconditionFailed(_)) => Ok(CommitOutcome::PreconditionFailed),
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,5 +560,136 @@ mod tests {
             "control-plane drop must be surfaced: {:?}",
             inv.warnings
         );
+    }
+
+    #[test]
+    fn commit_apply_upserts_deletes_and_keeps_failed() {
+        // W237 (issue 45): the pure apply folds successful uploads (size/
+        // mtime/etag upsert), removes successful deletes, and leaves
+        // anything NOT in the success list at its base value (a failed
+        // upload/delete must never be claimed). Output is sorted by key with
+        // no duplicates.
+        let base = vec![
+            crate::entity::file("a.md", 1, Some(1)),
+            crate::entity::file("b.md", 2, Some(2)),
+            crate::entity::file("gone.md", 3, Some(3)),
+        ];
+        let successes = vec![
+            CommitMutation::Upload(Entity {
+                key: "b.md".to_string(),
+                size: 20,
+                mtime_ms: Some(200),
+                etag: Some("\"new-etag\"".to_string()),
+            }),
+            CommitMutation::DeleteRemote("gone.md".to_string()),
+        ];
+        // `a.md` has no mutation: failed/absent -> base entry survives.
+        let out = apply_commit_mutations(&base, &successes);
+        let keys: Vec<&str> = out.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["a.md", "b.md"], "sorted unique: {keys:?}");
+        let b = out.iter().find(|e| e.key == "b.md").unwrap();
+        assert_eq!(b.size, 20);
+        assert_eq!(b.mtime_ms, Some(200));
+        assert_eq!(b.etag.as_deref(), Some("\"new-etag\""));
+        let a = out.iter().find(|e| e.key == "a.md").unwrap();
+        assert_eq!(a.size, 1, "failed/absent key keeps base entry");
+        assert!(!out.iter().any(|e| e.key == "gone.md"));
+        // An upload for a brand-new key adds it.
+        let out = apply_commit_mutations(
+            &base,
+            &[CommitMutation::Upload(crate::entity::file(
+                "c.md",
+                4,
+                Some(4),
+            ))],
+        );
+        let keys: Vec<&str> = out.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["a.md", "b.md", "c.md", "gone.md"]);
+    }
+
+    #[test]
+    fn commit_manifest_create_then_if_match_race() {
+        use crate::store::{GetOpts, GetOutcome, PutOpts};
+        // W238 (issue 45, D-commit-cond): the first commit creates with
+        // If-None-Match: * (base was list+head); a second commit with a
+        // STALE base etag answers PreconditionFailed and does NOT clobber;
+        // with the CURRENT etag it succeeds (If-Match). Zero successes skip
+        // the write entirely (SkippedNoMutations).
+        let store = MemoryStore::new();
+        let empty = InventoryBase {
+            source: InventorySource::LiveListHead,
+            file_entities: Vec::new(),
+            manifest_etag: None,
+        };
+        // No successes: nothing written.
+        let out = commit_manifest(&store, &empty, &[], None).unwrap();
+        assert_eq!(out, CommitOutcome::SkippedNoMutations);
+        assert!(matches!(
+            store.head(crate::local::MANIFEST_KEY).unwrap_err(),
+            Error::NotFound(_)
+        ));
+        // First commit: create (If-None-Match: *).
+        let up = CommitMutation::Upload(crate::entity::file("a.md", 5, Some(5)));
+        let out = commit_manifest(&store, &empty, std::slice::from_ref(&up), None).unwrap();
+        let (etag1, count1) = match out {
+            CommitOutcome::Written { etag, entry_count } => (etag, entry_count),
+            other => panic!("expected Written, got {other:?}"),
+        };
+        assert_eq!(count1, 1);
+        let etag1 = etag1.expect("mock returns etags");
+        // Second commit with a STALE base etag: PreconditionFailed, no
+        // clobber.
+        let stale = InventoryBase {
+            source: InventorySource::Manifest {
+                remote_etag: Some("\"stale\"".to_string()),
+            },
+            file_entities: vec![crate::entity::file("a.md", 5, Some(5))],
+            manifest_etag: Some("\"stale\"".to_string()),
+        };
+        let out = commit_manifest(&store, &stale, std::slice::from_ref(&up), None).unwrap();
+        assert_eq!(out, CommitOutcome::PreconditionFailed);
+        // Manifest body unchanged (no clobber) - still the first version.
+        let mut buf = Vec::new();
+        store.get_to(crate::local::MANIFEST_KEY, &mut buf).unwrap();
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        assert_eq!(m.entry_count, 1);
+        // Third commit with the CURRENT etag: If-Match succeeds.
+        let current = InventoryBase {
+            source: InventorySource::Manifest {
+                remote_etag: Some(etag1.clone()),
+            },
+            file_entities: vec![crate::entity::file("a.md", 5, Some(5))],
+            manifest_etag: Some(etag1.clone()),
+        };
+        let out = commit_manifest(
+            &store,
+            &current,
+            &[CommitMutation::Upload(crate::entity::file(
+                "b.md",
+                7,
+                Some(7),
+            ))],
+            None,
+        )
+        .unwrap();
+        let (etag2, count2) = match out {
+            CommitOutcome::Written { etag, entry_count } => (etag, entry_count),
+            other => panic!("expected Written, got {other:?}"),
+        };
+        assert_eq!(count2, 2);
+        assert_ne!(etag2, Some(etag1));
+        // Sanity: conditional get surface still works (GetOpts unused here).
+        let _ = PutOpts::default();
+        let mut buf = Vec::new();
+        let out = store
+            .get_to_with(
+                crate::local::MANIFEST_KEY,
+                &mut buf,
+                GetOpts {
+                    if_none_match_etag: Some(etag2.clone().unwrap()),
+                },
+            )
+            .unwrap();
+        assert!(matches!(out, GetOutcome::NotModified(_)));
     }
 }
