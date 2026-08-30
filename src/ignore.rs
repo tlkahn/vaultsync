@@ -140,7 +140,11 @@ fn compile_pattern(pat: &str) -> Result<Rule, Error> {
         });
     }
     if segments.len() == 1 {
-        Ok(Rule::BasenameGlob(SegmentGlob::from(pat)))
+        // Reuse the already-built `Segment` instead of re-splitting `pat`.
+        match segments.into_iter().next().unwrap() {
+            Segment::Glob(g) => Ok(Rule::BasenameGlob(g)),
+            Segment::Exact(s) => Ok(Rule::Basename(s)), // defensive; has_star makes this unreachable
+        }
     } else {
         Ok(Rule::ExactSegs(segments))
     }
@@ -206,27 +210,57 @@ impl SegmentGlob {
     }
 }
 
-/// Match one key segment against a pre-split glob: literal parts must appear
-/// in order; `*` fills the gaps (leading/trailing/interior), never crossing
-/// `/` (a key segment never contains `/`).
+/// Match one key segment against a pre-split glob: `parts[0]` is anchored as
+/// a prefix (empty = leading `*`); later literals may appear anywhere, in
+/// order, with backtracking; the final literal after the last `*` must be a
+/// suffix (empty final part = trailing `*`). `*` never crosses `/` (a key
+/// segment never contains `/`).
 fn segment_glob_matches(seg: &str, glob: &SegmentGlob) -> bool {
     let parts = &glob.parts;
-    let mut start = 0usize;
-    for (i, part) in parts.iter().enumerate() {
-        match seg[start..].find(part.as_str()) {
-            Some(rel) => {
-                let pos = start + rel;
-                if i + 1 == parts.len() {
-                    // The final literal must consume the remainder (an empty
-                    // final part is a trailing `*`, which allows anything).
-                    return part.is_empty() || pos + part.len() == seg.len();
-                }
-                start = pos + part.len();
-            }
-            None => return false,
-        }
+    debug_assert!(!parts.is_empty(), "a glob always has at least one part");
+    // Defensive: if parts were ever empty, never abort a query path.
+    let Some((p0, rest)) = parts.split_first() else {
+        return seg.is_empty();
+    };
+    if !seg.starts_with(p0.as_str()) {
+        return false;
     }
-    unreachable!("a glob always has at least one part")
+    match_after_star(&seg[p0.len()..], rest)
+}
+
+/// Match `seg` (the still-unconsumed tail) against the literal parts that
+/// follow a star. `lit` is the next literal after a star, so it may be
+/// anywhere in `seg`; interior literals backtrack over every occurrence; the
+/// final part is a suffix check (empty = trailing `*`).
+fn match_after_star(seg: &str, parts: &[String]) -> bool {
+    let Some((lit, rest)) = parts.split_first() else {
+        // Past the last star with no final literal: trailing `*`.
+        return true;
+    };
+    if rest.is_empty() {
+        // Final literal after the last star.
+        return lit.is_empty() || seg.ends_with(lit.as_str());
+    }
+    if lit.is_empty() {
+        // Interior empty literal (only reachable if `**` slipped through);
+        // treat as another star.
+        return match_after_star(seg, rest);
+    }
+    // Try every occurrence of `lit`, backtracking on failure. Advance one
+    // char at a time (UTF-8 safe: a match start is always a char boundary).
+    let mut from = 0usize;
+    while from <= seg.len() {
+        let Some(rel) = seg[from..].find(lit.as_str()) else {
+            return false;
+        };
+        let pos = from + rel;
+        if match_after_star(&seg[pos + lit.len()..], rest) {
+            return true;
+        }
+        let next = seg[pos..].chars().next().map_or(1, char::len_utf8);
+        from = pos + next;
+    }
+    false
 }
 
 /// The final segment of a vault-relative key: strip **one** trailing `/`
@@ -447,6 +481,29 @@ mod tests {
             (&["cache/*/"], "cache/x/y/", true),
             (&["cache/*/"], "cache/x", false),
             (&["cache/*/"], "cache/", false),
+            // --- anchor: parts[0] must be a prefix (false positives under
+            // the old unanchored first-literal `find`) ---
+            (&["b*"], "ab", false),
+            (&["b*"], "xb", false),
+            (&["workspace*"], "xworkspace", false),
+            (&["workspace*"], "my_workspace", false),
+            (&["a*a"], "baa", false),
+            (&[".obsidian/workspace*"], ".obsidian/xworkspace", false),
+            (&[".obsidian/workspace*"], ".obsidian/my_workspace", false),
+            // --- backtracking / final literal ends_with (false negatives
+            // under the old greedy first-occurrence `find`) ---
+            (&["a*a"], "aaa", true),
+            (&["a*a"], "aa", true),
+            (&["a*b"], "abxb", true),
+            (&["a*bc"], "abcbc", true),
+            (&["*a"], "baa", true),
+            (&["*a"], "aaa", true),
+            (&["*b"], "bb", true),
+            (&["a*a*a"], "aaaaa", true),
+            // --- correct positive that a naive "starts_with only" fix
+            // would break: trailing `*` consumes extra chars ---
+            (&["workspace*"], "workspaces", true),
+            (&[".obsidian/workspace*"], ".obsidian/workspaces", true),
         ];
         for (patterns, key, expect) in cases {
             let set = set(patterns);
