@@ -20,7 +20,15 @@ use crate::error::Error;
 /// Construct once with [`IgnoreSet::from_patterns`], then query repeatedly
 /// with [`IgnoreSet::matches`]. No re-parsing happens after construction.
 #[derive(Debug, Clone)]
-pub struct IgnoreSet;
+pub struct IgnoreSet {
+    rules: Vec<Rule>,
+}
+
+#[derive(Debug, Clone)]
+enum Rule {
+    /// Final-segment equality (no `/` in pattern, no `*`).
+    Basename(String),
+}
 
 impl IgnoreSet {
     /// Compile `patterns` into a reusable matcher.
@@ -28,19 +36,49 @@ impl IgnoreSet {
     /// Empty input is valid (matches nothing). On an invalid pattern,
     /// `Err(Error::Other(..))` naming the offending pattern and the reason.
     pub fn from_patterns(patterns: &[String]) -> Result<Self, Error> {
-        if patterns.is_empty() {
-            return Ok(IgnoreSet);
+        let mut rules = Vec::new();
+        for pat in patterns {
+            rules.push(compile_pattern(pat)?);
         }
-        // W179+ compiles the individual pattern shapes; not reachable from
-        // this commit's tests (empty-set seam only).
-        Err(Error::Other(
-            "ignore pattern compilation not yet implemented".to_string(),
-        ))
+        Ok(IgnoreSet { rules })
     }
 
     /// True when `key` (vault-relative entity key) is ignored by any pattern.
-    pub fn matches(&self, _key: &str) -> bool {
-        false
+    pub fn matches(&self, key: &str) -> bool {
+        self.rules.iter().any(|r| r.matches(key))
+    }
+}
+
+/// Compile one raw pattern into a [`Rule`]. Slash-free, metachar-free
+/// patterns become basename-anywhere; other shapes are rejected until their
+/// work item lands (W180 dir prefix, W181 exact path, W182 segment `*`).
+fn compile_pattern(pat: &str) -> Result<Rule, Error> {
+    let segments: Vec<&str> = pat.split('/').collect();
+    if segments.len() == 1 && !pat.contains('*') {
+        return Ok(Rule::Basename(pat.to_string()));
+    }
+    Err(Error::Other(
+        "ignore pattern shape not yet implemented".to_string(),
+    ))
+}
+
+impl Rule {
+    fn matches(&self, key: &str) -> bool {
+        match self {
+            Rule::Basename(name) => final_segment(key) == name,
+        }
+    }
+}
+
+/// The final segment of a vault-relative key: strip **one** trailing `/`
+/// (folder form), then the substring after the last `/` (or the whole key if
+/// there is none). `.DS_Store/` -> `.DS_Store`; `notes/.DS_Store` ->
+/// `.DS_Store`.
+fn final_segment(key: &str) -> &str {
+    let k = key.strip_suffix('/').unwrap_or(key);
+    match k.rfind('/') {
+        Some(i) => &k[i + 1..],
+        None => k,
     }
 }
 
@@ -57,5 +95,42 @@ mod tests {
         assert!(!set.matches(".DS_Store"));
         assert!(!set.matches("notes/a.md"));
         assert!(!set.matches(".git/"));
+    }
+
+    #[test]
+    fn ignore_set_basename_ds_store() {
+        // Basename-anywhere: slash-free, metachar-free patterns match any key
+        // whose final segment equals the name (folder form strips one
+        // trailing `/` first).
+        let cases: &[(&[&str], &str, bool)] = &[
+            (&[".DS_Store"], ".DS_Store", true),
+            (&[".DS_Store"], "notes/.DS_Store", true),
+            (&[".DS_Store"], "a/b/.DS_Store", true),
+            (&[".DS_Store"], ".DS_Store/", true),
+            (&[".DS_Store"], "DS_Store.bak", false),
+            (&[".DS_Store"], "notes/DS_Store.bak", false),
+            (&[".DS_Store"], ".ds_store", false),
+            (&[".DS_Store"], "notes/.DS_Store.bak", false),
+            (&[".DS_Store"], "not-.DS_Store", false),
+            (&[".DS_Store"], "notes/.DS_Store/extra", false),
+            // Multi-pattern OR: either basename matches.
+            (&[".DS_Store", "Thumbs.db"], "Thumbs.db", true),
+            (&[".DS_Store", "Thumbs.db"], "notes/Thumbs.db", true),
+            (&[".DS_Store", "Thumbs.db"], ".DS_Store", true),
+            (&[".DS_Store", "Thumbs.db"], "notes/foo.md", false),
+        ];
+        for (patterns, key, expect) in cases {
+            let set = set(patterns);
+            assert_eq!(
+                set.matches(key),
+                *expect,
+                "patterns {patterns:?} key {key:?}"
+            );
+        }
+    }
+
+    fn set(patterns: &[&str]) -> IgnoreSet {
+        IgnoreSet::from_patterns(&patterns.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            .unwrap()
     }
 }
