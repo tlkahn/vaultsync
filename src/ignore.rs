@@ -612,16 +612,10 @@ mod tests {
     fn ignore_set_default_profile_fixture() {
         // The epic #9 D3 built-in set (the bridge fixture #31/#34 reuse):
         // everything compiles, and the workspace trio / .git / .DS_Store
-        // behave while unrelated files do not.
-        let patterns = [
-            ".git/",
-            ".trash/",
-            ".DS_Store",
-            ".obsidian/workspace",
-            ".obsidian/workspace.json",
-            ".obsidian/workspace-mobile.json",
-        ];
-        let set = set(&patterns);
+        // behave while unrelated files do not. Built from
+        // `OBSIDIAN_DEFAULT_IGNORE_PATTERNS` (issue #31 D-constant) so the
+        // six strings have exactly one source of truth.
+        let set = set(crate::config::OBSIDIAN_DEFAULT_IGNORE_PATTERNS);
         let cases: &[(&str, bool)] = &[
             (".obsidian/app.json", false),
             (".obsidian/workspace.json", true),
