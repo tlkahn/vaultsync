@@ -53,11 +53,12 @@ pub struct PlanReport {
 /// set (the default at most call sites until #34 wires patterns from
 /// settings) matches nothing and behaves exactly like today.
 ///
-/// Local entities are **not** filtered by `ignore` in this function - the
-/// local half of D-both-sides is walk-time prune (issue #32). Until #32
-/// lands, a non-empty `IgnoreSet` is remote-only: ignored local paths can
-/// still appear as `Upload` / `DeleteLocal`. Production CLI passes
-/// [`IgnoreSet::empty`] under W25 until #34 wires patterns from settings.
+/// Local entities are **not** filtered by this function's `ignore` argument -
+/// the local half of D-both-sides is walk-time prune on the `LocalFs` itself
+/// via [`LocalFs::with_ignore`] (issue #32). Callers that want both halves
+/// must attach the same compiled set to the walker **and** pass it here.
+/// Production CLI still passes [`IgnoreSet::empty`] (and does not call
+/// `with_ignore`) under W25 until #34 wires patterns from settings.
 pub fn build_plan(
     local: &LocalFs,
     store: &dyn ObjectStore,

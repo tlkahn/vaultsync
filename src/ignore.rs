@@ -22,11 +22,11 @@ use crate::error::Error;
 /// Construct once with [`IgnoreSet::from_patterns`], then query repeatedly
 /// with [`IgnoreSet::matches`]. No re-parsing happens after construction.
 ///
-/// This issue ships only the pure matcher (issue #30). The remote half of
-/// D-both-sides - filtering remote listings in [`crate::build_plan`]
-/// (issue #33) - is applied now; the local walk prune (#32) and `[ignore]`
-/// CLI wiring / W25 retirement (#34) are still later epic #9 work that
-/// filters entity lists through this type before planning.
+/// Pure matcher (issue #30). Application seams that filter entity lists
+/// through this type: local walk prune via [`crate::local::LocalFs::with_ignore`]
+/// (issue #32) and remote listing filter in [`crate::build_plan`] (issue #33).
+/// `[ignore]` CLI wiring / W25 retirement (#34) still wires real patterns from
+/// settings into those seams.
 #[derive(Debug, Clone)]
 pub struct IgnoreSet {
     rules: Vec<Rule>,
@@ -622,16 +622,10 @@ mod tests {
     fn ignore_set_default_profile_fixture() {
         // The epic #9 D3 built-in set (the bridge fixture #31/#34 reuse):
         // everything compiles, and the workspace trio / .git / .DS_Store
-        // behave while unrelated files do not.
-        let patterns = [
-            ".git/",
-            ".trash/",
-            ".DS_Store",
-            ".obsidian/workspace",
-            ".obsidian/workspace.json",
-            ".obsidian/workspace-mobile.json",
-        ];
-        let set = set(&patterns);
+        // behave while unrelated files do not. Built from
+        // `OBSIDIAN_DEFAULT_IGNORE_PATTERNS` (issue #31 D-constant) so the
+        // six strings have exactly one source of truth.
+        let set = set(crate::config::OBSIDIAN_DEFAULT_IGNORE_PATTERNS);
         let cases: &[(&str, bool)] = &[
             (".obsidian/app.json", false),
             (".obsidian/workspace.json", true),

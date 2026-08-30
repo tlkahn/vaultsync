@@ -1,6 +1,16 @@
 //! Local filesystem walker: turns a vault directory tree into [`Entity`] keys.
 //!
 //! Walker omissions (Phase 1, all silent and by design):
+//! - paths matching the configured [`IgnoreSet`] (issue #32) are skipped:
+//!   a matching directory is **pruned** (no folder entity, no recursion -
+//!   D-prune, so `.git/objects/...` is never walked), a matching file is
+//!   skipped; [`WalkReport::skipped_ignored`] counts each pruned directory
+//!   and each skipped file exactly once (D-report). Reserved-namespace
+//!   skips stay in `skipped_temp_files` and are never re-labeled as ignored
+//!   (D-filter-order: reserved first, independent). An empty `IgnoreSet`
+//!   attached via [`LocalFs::with_ignore`] preserves pre-ignore walk
+//!   behavior; the CLI wires `[ignore]` patterns in issue #34, the remote
+//!   half is #33.
 //! - symlinks - files **and** directories - are skipped entirely
 //!   (`--follow-symlinks` is a Phase 2 policy decision, P1r4-symlink);
 //! - a symlinked vault **root** is followed (`fs::metadata` on the root
@@ -23,11 +33,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::entity::Entity;
 use crate::error::Error;
+use crate::ignore::IgnoreSet;
 
 /// Walks a vault root directory.
 pub struct LocalFs {
     root: PathBuf,
     follow_symlinks: bool,
+    /// Compiled ignore patterns applied during the walk (issue #32). Empty by
+    /// default (`new` / `with_follow`); attach via [`LocalFs::with_ignore`].
+    /// An empty set preserves today's walk behavior exactly. CLI wiring of
+    /// `[ignore]` patterns is issue #34; the remote filter is #33.
+    ignore: IgnoreSet,
     /// Walk report, mutated at the end of a walk and read by `report()`.
     /// `Mutex` (not `RefCell`) so `LocalFs` is `Send`/`Sync` ahead of Phase 3
     /// concurrency (W82/r8a-2); single-threaded callers see no difference.
@@ -68,6 +84,13 @@ pub struct WalkReport {
     /// crash leftover `.*.vaultsync-tmp-*` or `.vaultsync-check-*` is never
     /// surfaced as a real key. W41 reports this count on stderr.
     pub skipped_temp_files: u32,
+    /// Local paths skipped by the configured [`IgnoreSet`] (issue #32).
+    /// Counting rule (D-report): each ignored **file** counts 1; each
+    /// **pruned directory** counts 1 (the directory key matched; unvisited
+    /// descendants are **not** counted). Reserved-namespace skips stay in
+    /// `skipped_temp_files` and are not double-counted here. CLI printing of
+    /// this count is issue #34.
+    pub skipped_ignored: u32,
     /// Keys of followed *file* symlinks (R4-M1/W38). The planner uses this to
     /// mark such rows `Skip(followed_symlink)` in mutating modes: the walker
     /// follows them (inventory), but transfers refuse to open a symlink, so
@@ -79,8 +102,11 @@ pub struct WalkReport {
 }
 
 /// Walker mode flags.
-struct WalkOpts {
+struct WalkOpts<'a> {
     follow_symlinks: bool,
+    /// Compiled ignore set threaded through the recursion (issue #32). Empty
+    /// set = pre-ignore behavior.
+    ignore: &'a IgnoreSet,
 }
 
 impl LocalFs {
@@ -89,6 +115,7 @@ impl LocalFs {
         LocalFs {
             root: root.into(),
             follow_symlinks: false,
+            ignore: empty_ignore_set(),
             report: std::sync::Mutex::new(WalkReport::default()),
             root_canon: std::sync::OnceLock::new(),
             dir_create_lock: std::sync::Mutex::new(()),
@@ -101,10 +128,27 @@ impl LocalFs {
         LocalFs {
             root: root.into(),
             follow_symlinks,
+            ignore: empty_ignore_set(),
             report: std::sync::Mutex::new(WalkReport::default()),
             root_canon: std::sync::OnceLock::new(),
             dir_create_lock: std::sync::Mutex::new(()),
         }
+    }
+
+    /// Attach a compiled ignore set applied during the walk (issue #32).
+    /// Empty set preserves pre-ignore walk behavior. Chain after `new` /
+    /// `with_follow`; later construction (e.g. issue #34's CLI wiring) sets
+    /// it without a combinatorial constructor explosion.
+    ///
+    /// Pattern shapes follow `IgnoreSet` semantics (issue #30): dir patterns
+    /// are vault-rooted **path prefixes** (`.git/` matches `.git/objects/...`
+    /// but never `nested/.git/` or `foo.git`); basename patterns match the
+    /// final segment anywhere (`.DS_Store` matches `notes/.DS_Store`). The
+    /// match subject is the vault-relative key of the walked path only - a
+    /// followed symlink's canonical target path is not re-matched.
+    pub fn with_ignore(mut self, ignore: IgnoreSet) -> Self {
+        self.ignore = ignore;
+        self
     }
 
     /// Canonicalized vault root, computed once per [`LocalFs`] and cached
@@ -152,6 +196,7 @@ impl LocalFs {
         let mut out = Vec::new();
         let opts = WalkOpts {
             follow_symlinks: self.follow_symlinks,
+            ignore: &self.ignore,
         };
         // W81/r8a-1: the canonicalized root is computed once per LocalFs and
         // threaded through the walk, instead of being re-canonicalized per
@@ -1119,6 +1164,14 @@ fn is_empty_dir(d: &Path) -> std::io::Result<bool> {
     Ok(rd.next().is_none())
 }
 
+/// Empty compiled ignore set: matches nothing (pre-ignore walk behavior).
+/// Used by the default constructors so `new` / `with_follow` stay
+/// non-breaking (D-library-seam); `IgnoreSet` keeps no `Default` impl so
+/// #30's API surface stays stable.
+fn empty_ignore_set() -> IgnoreSet {
+    IgnoreSet::from_patterns(&[]).expect("empty pattern list always compiles")
+}
+
 fn walk(
     dir: &Path,
     root: &Path,
@@ -1153,7 +1206,15 @@ fn walk(
                 report.skipped_symlinks += 1;
                 continue;
             }
-            handle_followed_symlink(&entry.path(), root, root_canon, out, report, visited)?;
+            handle_followed_symlink(
+                &entry.path(),
+                root,
+                root_canon,
+                out,
+                report,
+                visited,
+                opts.ignore,
+            )?;
             continue;
         }
         let path = entry.path();
@@ -1167,18 +1228,36 @@ fn walk(
         // an invalid name must not abort the walk (P1r7-special-node-key).
         if ft.is_dir() {
             let key = format!("{}/", path_to_key(rel)?);
+            // D-prune (issue #32): a directory whose vault-relative key
+            // matches an ignore pattern is pruned - no folder entity, no
+            // recursion into it (descendants are never enumerated, so
+            // `.git/objects/...` is never walked). Count 1 for the pruned
+            // directory key only; unvisited descendants are not counted
+            // (D-report).
+            if opts.ignore.matches(&key) {
+                report.skipped_ignored += 1;
+                continue;
+            }
             if let Some(e) = folder_entity(&path, &key)? {
                 out.push(e);
             }
             walk(&path, root, root_canon, out, opts, report, visited)?;
         } else if ft.is_file() {
             // W23/M1: a reserved vaultsync temp sibling (crash leftover) is
-            // never emitted as a key.
+            // never emitted as a key. Reserved-namespace stays FIRST and
+            // independent (D-filter-order): a reserved leftover is counted in
+            // `skipped_temp_files` and never re-labeled as ignored, even if a
+            // user pattern would also match its name.
             if is_reserved_vaultsync_name(path.file_name()) {
                 report.skipped_temp_files += 1;
             } else {
                 let key = path_to_key(rel)?;
-                if let Some(e) = file_entity(&path, &key)? {
+                // Issue #32: a file whose vault-relative key matches an
+                // ignore pattern is skipped and counted (D-report: each
+                // ignored file counts 1).
+                if opts.ignore.matches(&key) {
+                    report.skipped_ignored += 1;
+                } else if let Some(e) = file_entity(&path, &key)? {
                     out.push(e);
                 }
             }
@@ -1197,6 +1276,7 @@ fn handle_followed_symlink(
     out: &mut Vec<Entity>,
     report: &mut WalkReport,
     visited: &mut std::collections::HashSet<PathBuf>,
+    ignore: &IgnoreSet,
 ) -> Result<(), Error> {
     let rel = path
         .strip_prefix(root)
@@ -1232,6 +1312,22 @@ fn handle_followed_symlink(
         Ok(m) => m,
     };
     if tmd.is_dir() {
+        // Issue #32 (D-prune on followed dir symlinks): the same ignore
+        // check as the plain dir arm, against the link entry's OWN
+        // vault-relative key (D-match-subject - the canonical target path is
+        // never re-matched). Match: count 1, no emit, no recurse, and -
+        // critically (PR 37 r1, review 5467761913) - NO `visited` mutation:
+        // an ignored alias must not claim the canonical target, so a later
+        // non-ignored alias to the same target still lists (W67/A-L5 + R-b
+        // intact under ignore) and the ignored link is never mis-bucketed
+        // as a duplicate-target `skipped_symlinks`. The "duplicates" warning
+        // below is skipped too: nothing is listed under the alias, so
+        // nothing duplicates.
+        let key = format!("{}/", path_to_key(rel)?);
+        if ignore.matches(&key) {
+            report.skipped_ignored += 1;
+            return Ok(());
+        }
         if !visited.insert(target.clone()) {
             // R5-L8/W46: a second link to an already-followed target (or a
             // true cycle) is skipped, but now warns and counts instead of
@@ -1259,7 +1355,6 @@ fn handle_followed_symlink(
             path_to_key(rel)?,
             target_rel
         ));
-        let key = format!("{}/", path_to_key(rel)?);
         if let Some(e) = folder_entity(path, &key)? {
             out.push(e);
         }
@@ -1272,6 +1367,7 @@ fn handle_followed_symlink(
             out,
             &WalkOpts {
                 follow_symlinks: true,
+                ignore,
             },
             report,
             visited,
@@ -1284,6 +1380,14 @@ fn handle_followed_symlink(
             return Ok(());
         }
         let key = path_to_key(rel)?;
+        // Issue #32: same file-arm ignore check as the plain walk, against
+        // the link entry's own vault-relative key. Match: count 1, no emit,
+        // and do NOT insert into `followed_files` (no plan row exists under
+        // that key).
+        if ignore.matches(&key) {
+            report.skipped_ignored += 1;
+            return Ok(());
+        }
         // R4-M1/W38: record that this file key came from a followed *file*
         // symlink. Transfers refuse to open a symlink, so the planner marks
         // these rows Skip(followed_symlink) in mutating modes; `--follow-
@@ -1631,6 +1735,7 @@ mod tests {
             &mut out,
             &WalkOpts {
                 follow_symlinks: false,
+                ignore: &empty_ignore_set(),
             },
             &mut report,
             &mut visited,
@@ -2409,6 +2514,243 @@ mod tests {
     }
 
     #[test]
+    fn walk_empty_ignore_set_unchanged() {
+        // W195 back-compat (D-library-seam): an empty `IgnoreSet` attached via
+        // `LocalFs::with_ignore` must produce the exact same inventory and
+        // report as a default `LocalFs` - empty set = pre-ignore walk behavior.
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::write(dir.join("note.md"), "hi").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/a.md"), "yo").unwrap();
+        let fs = LocalFs::new(dir.path());
+        let (ents, rep) = fs.list_report().unwrap();
+        let fs2 = LocalFs::new(dir.path()).with_ignore(IgnoreSet::from_patterns(&[]).unwrap());
+        let (ents2, rep2) = fs2.list_report().unwrap();
+        let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
+        let keys2: Vec<&str> = ents2.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            keys, keys2,
+            "empty ignore set changed the inventory: {keys:?} vs {keys2:?}"
+        );
+        assert_eq!(
+            rep2.skipped_ignored, 0,
+            "empty ignore set must skip nothing"
+        );
+        assert_eq!(rep2.skipped_temp_files, rep.skipped_temp_files);
+        assert_eq!(rep2.skipped_symlinks, rep.skipped_symlinks);
+        assert_eq!(rep2.warnings, rep.warnings);
+        // D-report: the field exists and defaults to 0; the empty set skips
+        // nothing, so a default `WalkReport` never sees increments.
+        assert_eq!(WalkReport::default().skipped_ignored, 0);
+    }
+
+    #[test]
+    fn walk_prunes_git_dir() {
+        // D-prune (issue acceptance): a directory whose key matches a
+        // dir-prefix pattern is pruned - no folder entity, no recursion. The
+        // planted `.git/objects/aa/bb` proves the subtree is never enumerated
+        // (entity absence is the acceptance bar; counting rule W198 owns
+        // exact counts).
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::write(dir.join("note.md"), "hi").unwrap();
+        std::fs::create_dir_all(dir.join(".git/objects/aa")).unwrap();
+        std::fs::write(dir.join(".git/objects/aa/bb"), "x").unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "ref").unwrap();
+        let fs = LocalFs::new(dir.path())
+            .with_ignore(IgnoreSet::from_patterns(&[".git/".to_string()]).unwrap());
+        let (ents, rep) = fs.list_report().unwrap();
+        let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
+        assert!(keys.contains(&"note.md"), "keep file missing: {keys:?}");
+        for absent in [
+            ".git/",
+            ".git/HEAD",
+            ".git/objects/",
+            ".git/objects/aa/",
+            ".git/objects/aa/bb",
+        ] {
+            assert!(
+                !keys.contains(&absent),
+                "{absent:?} still listed after prune: {keys:?}"
+            );
+        }
+        assert!(rep.skipped_ignored >= 1, "pruned dir not counted: {rep:?}");
+    }
+
+    #[test]
+    fn walk_dir_prefix_no_false_friends() {
+        // D-prune sharpness (PR 35 r2 heads-up, locked here): `.trash/` is a
+        // vault-rooted dir **prefix** - not a basename, not a substring.
+        // Siblings that merely contain the text must stay listed.
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::write(dir.join("not-trash.md"), "x").unwrap();
+        std::fs::write(dir.join("foo.trash"), "y").unwrap();
+        std::fs::write(dir.join(".trashfile"), "z").unwrap();
+        std::fs::create_dir_all(dir.join(".trash")).unwrap();
+        std::fs::write(dir.join(".trash/real.md"), "t").unwrap();
+        let fs = LocalFs::new(dir.path())
+            .with_ignore(IgnoreSet::from_patterns(&[".trash/".to_string()]).unwrap());
+        let (ents, rep) = fs.list_report().unwrap();
+        let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
+        for keep in ["not-trash.md", "foo.trash", ".trashfile"] {
+            assert!(keys.contains(&keep), "{keep:?} must remain: {keys:?}");
+        }
+        assert!(
+            !keys
+                .iter()
+                .any(|k| *k == ".trash/" || k.starts_with(".trash/")),
+            "trash dir listed: {keys:?}"
+        );
+        assert_eq!(rep.skipped_ignored, 1, "only .trash/ pruned: {rep:?}");
+    }
+
+    #[test]
+    fn walk_dir_prefix_does_not_prune_nested_git() {
+        // W204/F4 (review 5467761913, low/optional): walk-level pin that
+        // `IgnoreSet` dir-prefix semantics hold end-to-end through the walk.
+        // `.git/` is a vault-rooted PATH PREFIX - it prunes the root `.git/`
+        // but must NEVER prune `nested/.git/` (the matcher pins this in #30;
+        // this row stops a future walk-layer "basename dir" helper from
+        // drifting under #10/#34).
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::write(dir.join("note.md"), "hi").unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "ref").unwrap();
+        std::fs::create_dir_all(dir.join("nested/.git")).unwrap();
+        std::fs::write(dir.join("nested/.git/HEAD"), "ref").unwrap();
+        std::fs::write(dir.join("nested/keep.md"), "keep").unwrap();
+        let fs = LocalFs::new(dir.path())
+            .with_ignore(IgnoreSet::from_patterns(&[".git/".to_string()]).unwrap());
+        let (ents, rep) = fs.list_report().unwrap();
+        let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
+        for keep in [
+            "note.md",
+            "nested/",
+            "nested/keep.md",
+            "nested/.git/",
+            "nested/.git/HEAD",
+        ] {
+            assert!(keys.contains(&keep), "{keep:?} must remain: {keys:?}");
+        }
+        for absent in [".git/", ".git/HEAD"] {
+            assert!(!keys.contains(&absent), "{absent:?} still listed: {keys:?}");
+        }
+        assert_eq!(
+            rep.skipped_ignored, 1,
+            "only root .git/ pruned, got: {rep:?}"
+        );
+    }
+
+    #[test]
+    fn walk_skips_ignored_file() {
+        // Issue acceptance (D-both-sides local half): a file whose
+        // vault-relative key matches an ignore pattern is absent from the
+        // inventory. `.DS_Store` is a basename pattern - final-segment-
+        // anywhere - so both the root copy and the nested copy are skipped
+        // while siblings stay.
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::write(dir.join("note.md"), "hi").unwrap();
+        std::fs::write(dir.join(".DS_Store"), "x").unwrap();
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join("notes/.DS_Store"), "y").unwrap();
+        std::fs::write(dir.join("notes/keep.md"), "keep").unwrap();
+        let fs = LocalFs::new(dir.path())
+            .with_ignore(IgnoreSet::from_patterns(&[".DS_Store".to_string()]).unwrap());
+        let (ents, rep) = fs.list_report().unwrap();
+        let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
+        for keep in ["note.md", "notes/", "notes/keep.md"] {
+            assert!(keys.contains(&keep), "{keep:?} must remain: {keys:?}");
+        }
+        for absent in [".DS_Store", "notes/.DS_Store"] {
+            assert!(!keys.contains(&absent), "{absent:?} still listed: {keys:?}");
+        }
+        assert_eq!(
+            rep.skipped_ignored, 2,
+            "two .DS_Store files skipped, got: {rep:?}"
+        );
+    }
+
+    #[test]
+    fn walk_counts_skipped_ignored() {
+        // D-report exact counting lock (issue acceptance): each pruned
+        // directory counts 1 (its key matched; unvisited descendants are
+        // NOT counted) and each skipped file counts 1. The tree exercises
+        // both rules in one walk: `.trash/` pruned (1), root `.DS_Store`
+        // (1), `nested/.DS_Store` (1) -> exactly 3.
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::write(dir.join("note.md"), "keep").unwrap();
+        std::fs::write(dir.join(".DS_Store"), "x").unwrap();
+        std::fs::create_dir_all(dir.join(".trash/b")).unwrap();
+        std::fs::write(dir.join(".trash/a.md"), "t").unwrap();
+        std::fs::write(dir.join(".trash/b/c.md"), "u").unwrap();
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("nested/.DS_Store"), "y").unwrap();
+        let fs = LocalFs::new(dir.path()).with_ignore(
+            IgnoreSet::from_patterns(&[".trash/".to_string(), ".DS_Store".to_string()]).unwrap(),
+        );
+        let (ents, rep) = fs.list_report().unwrap();
+        let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
+        assert!(keys.contains(&"note.md"), "keep file missing: {keys:?}");
+        assert!(
+            keys.contains(&"nested/"),
+            "unignored dir must stay: {keys:?}"
+        );
+        assert!(
+            !keys
+                .iter()
+                .any(|k| *k == ".trash/" || k.starts_with(".trash/")),
+            "trash subtree listed: {keys:?}"
+        );
+        assert!(
+            !keys.iter().any(|k| k.ends_with(".DS_Store")),
+            "ignored files listed: {keys:?}"
+        );
+        assert_eq!(
+            rep.skipped_ignored, 3,
+            "1 pruned dir + 2 skipped files, got: {rep:?}"
+        );
+    }
+
+    #[test]
+    fn walk_ignore_does_not_override_reserved() {
+        // D-filter-order (issue acceptance): reserved-namespace stays FIRST
+        // and independent of ignore. The patterns below would match the
+        // leftover basenames if the ignore were consulted, so the precedence
+        // is real: leftovers count as skipped_temp_files (2), never as
+        // ignored (0), and are never emitted.
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::write(dir.join("note.md"), "real").unwrap();
+        std::fs::write(dir.join(".note.md.vaultsync-tmp-123-4"), "crash").unwrap();
+        std::fs::write(dir.join(".vaultsync-check-1-2-3"), "stray").unwrap();
+        let fs = LocalFs::new(dir.path()).with_ignore(
+            IgnoreSet::from_patterns(&[
+                ".note.md.vaultsync-tmp-123-4".to_string(),
+                ".vaultsync-check-1-2-3".to_string(),
+            ])
+            .unwrap(),
+        );
+        let (ents, rep) = fs.list_report().unwrap();
+        let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["note.md"], "keys: {keys:?}");
+        assert_eq!(rep.skipped_temp_files, 2, "reserved count: {rep:?}");
+        assert_eq!(
+            rep.skipped_ignored, 0,
+            "reserved leftovers must not be counted as ignored: {rep:?}"
+        );
+
+        // Mixed tree: one real .DS_Store (ignored, +1) + one reserved
+        // leftover (temp, not ignored) with the .DS_Store pattern.
+        let dir2 = TempDir::new("vaultsync-test");
+        std::fs::write(dir2.join(".DS_Store"), "real-ignore").unwrap();
+        std::fs::write(dir2.join(".vaultsync-check-9-9-9"), "stray").unwrap();
+        let fs2 = LocalFs::new(dir2.path())
+            .with_ignore(IgnoreSet::from_patterns(&[".DS_Store".to_string()]).unwrap());
+        let (ents2, rep2) = fs2.list_report().unwrap();
+        assert!(ents2.is_empty(), "no keys expected: {:?}", ents2);
+        assert!(rep2.skipped_temp_files >= 1, "reserved count: {rep2:?}");
+        assert_eq!(rep2.skipped_ignored, 1, "one real .DS_Store: {rep2:?}");
+    }
+
+    #[test]
     fn walk_skips_check_probe_leftovers() {
         // R4-L4/W42: a `.vaultsync-check-*` probe leftover on the local side
         // (materialized by an earlier stray download) must be skipped and
@@ -2964,6 +3306,186 @@ mod tests {
                 && w.contains("realdir/")),
             "no in-vault alias warning: {:?}",
             report.warnings
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_follow_symlink_into_ignored_dir() {
+        // D-match-subject: the same ignore checks apply on the
+        // followed-symlink arms, against the link entry's OWN vault-relative
+        // key (never the canonical target's path). The link is named `.git`
+        // so its key matches the `.git/` dir-prefix pattern; the real target
+        // is walked under its own key unless separately ignored. Must not
+        // hang (cycle/visited guards unchanged).
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::create_dir_all(dir.join("realdir")).unwrap();
+        std::fs::write(dir.join("realdir/child.md"), "c").unwrap();
+        std::fs::write(dir.join("keep.md"), "k").unwrap();
+        std::os::unix::fs::symlink("realdir", dir.join(".git")).unwrap();
+        let fs = LocalFs::with_follow(dir.path(), true)
+            .with_ignore(IgnoreSet::from_patterns(&[".git/".to_string()]).unwrap());
+        let (ents, rep) = fs.list_report().unwrap();
+        let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
+        assert!(keys.contains(&"keep.md"), "keep missing: {keys:?}");
+        assert!(
+            keys.contains(&"realdir/child.md"),
+            "real target missing: {keys:?}"
+        );
+        assert!(!keys.contains(&".git/"), "alias dir listed: {keys:?}");
+        assert!(
+            !keys.contains(&".git/child.md"),
+            "alias child listed: {keys:?}"
+        );
+        assert!(rep.skipped_ignored >= 1, "pruned link not counted: {rep:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_follow_skips_ignored_file_symlink() {
+        // D-match-subject, file arm: a followed FILE symlink whose own key
+        // matches an ignore pattern is skipped - absent from entities AND
+        // from `followed_files` (no plan row exists under that key); the
+        // real target still lists.
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::write(dir.join("real.md"), "r").unwrap();
+        std::os::unix::fs::symlink("real.md", dir.join(".DS_Store")).unwrap();
+        let fs = LocalFs::with_follow(dir.path(), true)
+            .with_ignore(IgnoreSet::from_patterns(&[".DS_Store".to_string()]).unwrap());
+        let (ents, rep) = fs.list_report().unwrap();
+        let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
+        assert!(keys.contains(&"real.md"), "real target missing: {keys:?}");
+        assert!(
+            !keys.contains(&".DS_Store"),
+            "ignored file symlink listed: {keys:?}"
+        );
+        assert!(
+            !rep.followed_files.contains(".DS_Store"),
+            "followed_files polluted: {:?}",
+            rep.followed_files
+        );
+        assert!(
+            rep.skipped_ignored >= 1,
+            "skipped link not counted: {rep:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_follow_ignored_dir_symlink_does_not_poison_visited() {
+        // W202/F1 Case A (review 5467761913): a followed DIR symlink whose
+        // OWN vault-relative key matches an ignore pattern must NOT claim its
+        // canonical target in `visited`. Order is the test input: call the
+        // ignored link FIRST, then a non-ignored alias to the same target.
+        // Today (visited.insert before ignore) the ignored link poisons the
+        // set, so the later kept alias is dropped as a "duplicate". Fixed
+        // order: ignore wins first (skipped_ignored, no visited mutation),
+        // so the kept alias still lists under its own key (W67/A-L5 + R-b
+        // intact under ignore).
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::create_dir_all(dir.join("realdir")).unwrap();
+        std::fs::write(dir.join("realdir/child.md"), "c").unwrap();
+        std::os::unix::fs::symlink("realdir", dir.join(".git")).unwrap();
+        std::os::unix::fs::symlink("realdir", dir.join("alias")).unwrap();
+        let ignore = IgnoreSet::from_patterns(&[".git/".to_string()]).unwrap();
+        let root_canon = std::fs::canonicalize(dir.path()).unwrap();
+        let mut out: Vec<Entity> = Vec::new();
+        let mut report = WalkReport::default();
+        let mut visited: std::collections::HashSet<PathBuf> = Default::default();
+        // Explicit order: ignored link first, kept alias second.
+        handle_followed_symlink(
+            &dir.join(".git"),
+            dir.path(),
+            &root_canon,
+            &mut out,
+            &mut report,
+            &mut visited,
+            &ignore,
+        )
+        .unwrap();
+        handle_followed_symlink(
+            &dir.join("alias"),
+            dir.path(),
+            &root_canon,
+            &mut out,
+            &mut report,
+            &mut visited,
+            &ignore,
+        )
+        .unwrap();
+        let keys: Vec<&str> = out.iter().map(|e| e.key.as_str()).collect();
+        assert!(keys.contains(&"alias/"), "kept alias missing: {keys:?}");
+        assert!(
+            keys.contains(&"alias/child.md"),
+            "alias child missing: {keys:?}"
+        );
+        assert!(!keys.contains(&".git/"), "ignored alias listed: {keys:?}");
+        assert!(
+            !keys.contains(&".git/child.md"),
+            "ignored alias child listed: {keys:?}"
+        );
+        assert_eq!(report.skipped_ignored, 1, "report: {report:?}");
+        assert_eq!(
+            report.skipped_symlinks, 0,
+            "kept alias mis-bucketed as duplicate: {report:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_follow_ignored_dir_symlink_not_misbucketed_as_duplicate() {
+        // W202/F1 Case B (review 5467761913): with the kept alias called
+        // FIRST (claims `visited`), a later ignored link to the same target
+        // must be counted as `skipped_ignored` (1), never mis-bucketed as a
+        // duplicate-target `skipped_symlinks` (today: the duplicate check
+        // runs before ignore, so the ignored link never reaches the ignore
+        // arm and is labeled a duplicate instead).
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::create_dir_all(dir.join("realdir")).unwrap();
+        std::fs::write(dir.join("realdir/child.md"), "c").unwrap();
+        std::os::unix::fs::symlink("realdir", dir.join("alias")).unwrap();
+        std::os::unix::fs::symlink("realdir", dir.join(".git")).unwrap();
+        let ignore = IgnoreSet::from_patterns(&[".git/".to_string()]).unwrap();
+        let root_canon = std::fs::canonicalize(dir.path()).unwrap();
+        let mut out: Vec<Entity> = Vec::new();
+        let mut report = WalkReport::default();
+        let mut visited: std::collections::HashSet<PathBuf> = Default::default();
+        // Explicit order: kept alias first, ignored link second.
+        handle_followed_symlink(
+            &dir.join("alias"),
+            dir.path(),
+            &root_canon,
+            &mut out,
+            &mut report,
+            &mut visited,
+            &ignore,
+        )
+        .unwrap();
+        handle_followed_symlink(
+            &dir.join(".git"),
+            dir.path(),
+            &root_canon,
+            &mut out,
+            &mut report,
+            &mut visited,
+            &ignore,
+        )
+        .unwrap();
+        let keys: Vec<&str> = out.iter().map(|e| e.key.as_str()).collect();
+        assert!(keys.contains(&"alias/"), "kept alias missing: {keys:?}");
+        assert!(
+            keys.contains(&"alias/child.md"),
+            "alias child missing: {keys:?}"
+        );
+        assert!(!keys.contains(&".git/"), "ignored alias listed: {keys:?}");
+        assert!(
+            !keys.contains(&".git/child.md"),
+            "ignored alias child listed: {keys:?}"
+        );
+        assert_eq!(report.skipped_ignored, 1, "report: {report:?}");
+        assert_eq!(
+            report.skipped_symlinks, 0,
+            "ignored link mis-bucketed as duplicate: {report:?}"
         );
     }
 
