@@ -1181,7 +1181,6 @@ fn walk(
     report: &mut WalkReport,
     visited: &mut std::collections::HashSet<PathBuf>,
 ) -> Result<(), Error> {
-    let _ = opts.ignore; // threaded; matching applied in W196/W197
     // `NotFound` here means the directory vanished after its parent
     // enumerated it (or between `read_dir` and first use): skip silently.
     // All other IO errors (permission, etc.) stay fatal.
@@ -1313,6 +1312,22 @@ fn handle_followed_symlink(
         Ok(m) => m,
     };
     if tmd.is_dir() {
+        // Issue #32 (D-prune on followed dir symlinks): the same ignore
+        // check as the plain dir arm, against the link entry's OWN
+        // vault-relative key (D-match-subject - the canonical target path is
+        // never re-matched). Match: count 1, no emit, no recurse, and -
+        // critically (PR 37 r1, review 5467761913) - NO `visited` mutation:
+        // an ignored alias must not claim the canonical target, so a later
+        // non-ignored alias to the same target still lists (W67/A-L5 + R-b
+        // intact under ignore) and the ignored link is never mis-bucketed
+        // as a duplicate-target `skipped_symlinks`. The "duplicates" warning
+        // below is skipped too: nothing is listed under the alias, so
+        // nothing duplicates.
+        let key = format!("{}/", path_to_key(rel)?);
+        if ignore.matches(&key) {
+            report.skipped_ignored += 1;
+            return Ok(());
+        }
         if !visited.insert(target.clone()) {
             // R5-L8/W46: a second link to an already-followed target (or a
             // true cycle) is skipped, but now warns and counts instead of
@@ -1323,17 +1338,6 @@ fn handle_followed_symlink(
             ));
             report.skipped_symlinks += 1;
             return Ok(()); // cycle guard / duplicate-target guard
-        }
-        // Issue #32 (D-prune on followed dir symlinks): the same ignore
-        // check as the plain dir arm, against the link entry's OWN
-        // vault-relative key (D-match-subject - the canonical target path is
-        // never re-matched). Match: count 1, no emit, no recurse into the
-        // link path. The "duplicates" warning below is skipped too: nothing
-        // is listed under the alias, so nothing duplicates.
-        let key = format!("{}/", path_to_key(rel)?);
-        if ignore.matches(&key) {
-            report.skipped_ignored += 1;
-            return Ok(());
         }
         // W67/A-L5: an in-vault dir-symlink target is always independently
         // walked (out-of-vault targets are skipped earlier), so the alias
@@ -2535,7 +2539,8 @@ mod tests {
         assert_eq!(rep2.skipped_temp_files, rep.skipped_temp_files);
         assert_eq!(rep2.skipped_symlinks, rep.skipped_symlinks);
         assert_eq!(rep2.warnings, rep.warnings);
-        // D-report: the field exists and defaults to 0 (no increments yet).
+        // D-report: the field exists and defaults to 0; the empty set skips
+        // nothing, so a default `WalkReport` never sees increments.
         assert_eq!(WalkReport::default().skipped_ignored, 0);
     }
 
@@ -3325,6 +3330,125 @@ mod tests {
         assert!(
             rep.skipped_ignored >= 1,
             "skipped link not counted: {rep:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_follow_ignored_dir_symlink_does_not_poison_visited() {
+        // W202/F1 Case A (review 5467761913): a followed DIR symlink whose
+        // OWN vault-relative key matches an ignore pattern must NOT claim its
+        // canonical target in `visited`. Order is the test input: call the
+        // ignored link FIRST, then a non-ignored alias to the same target.
+        // Today (visited.insert before ignore) the ignored link poisons the
+        // set, so the later kept alias is dropped as a "duplicate". Fixed
+        // order: ignore wins first (skipped_ignored, no visited mutation),
+        // so the kept alias still lists under its own key (W67/A-L5 + R-b
+        // intact under ignore).
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::create_dir_all(dir.join("realdir")).unwrap();
+        std::fs::write(dir.join("realdir/child.md"), "c").unwrap();
+        std::os::unix::fs::symlink("realdir", dir.join(".git")).unwrap();
+        std::os::unix::fs::symlink("realdir", dir.join("alias")).unwrap();
+        let ignore = IgnoreSet::from_patterns(&[".git/".to_string()]).unwrap();
+        let root_canon = std::fs::canonicalize(dir.path()).unwrap();
+        let mut out: Vec<Entity> = Vec::new();
+        let mut report = WalkReport::default();
+        let mut visited: std::collections::HashSet<PathBuf> = Default::default();
+        // Explicit order: ignored link first, kept alias second.
+        handle_followed_symlink(
+            &dir.join(".git"),
+            dir.path(),
+            &root_canon,
+            &mut out,
+            &mut report,
+            &mut visited,
+            &ignore,
+        )
+        .unwrap();
+        handle_followed_symlink(
+            &dir.join("alias"),
+            dir.path(),
+            &root_canon,
+            &mut out,
+            &mut report,
+            &mut visited,
+            &ignore,
+        )
+        .unwrap();
+        let keys: Vec<&str> = out.iter().map(|e| e.key.as_str()).collect();
+        assert!(keys.contains(&"alias/"), "kept alias missing: {keys:?}");
+        assert!(
+            keys.contains(&"alias/child.md"),
+            "alias child missing: {keys:?}"
+        );
+        assert!(!keys.contains(&".git/"), "ignored alias listed: {keys:?}");
+        assert!(
+            !keys.contains(&".git/child.md"),
+            "ignored alias child listed: {keys:?}"
+        );
+        assert_eq!(report.skipped_ignored, 1, "report: {report:?}");
+        assert_eq!(
+            report.skipped_symlinks, 0,
+            "kept alias mis-bucketed as duplicate: {report:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_follow_ignored_dir_symlink_not_misbucketed_as_duplicate() {
+        // W202/F1 Case B (review 5467761913): with the kept alias called
+        // FIRST (claims `visited`), a later ignored link to the same target
+        // must be counted as `skipped_ignored` (1), never mis-bucketed as a
+        // duplicate-target `skipped_symlinks` (today: the duplicate check
+        // runs before ignore, so the ignored link never reaches the ignore
+        // arm and is labeled a duplicate instead).
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::create_dir_all(dir.join("realdir")).unwrap();
+        std::fs::write(dir.join("realdir/child.md"), "c").unwrap();
+        std::os::unix::fs::symlink("realdir", dir.join("alias")).unwrap();
+        std::os::unix::fs::symlink("realdir", dir.join(".git")).unwrap();
+        let ignore = IgnoreSet::from_patterns(&[".git/".to_string()]).unwrap();
+        let root_canon = std::fs::canonicalize(dir.path()).unwrap();
+        let mut out: Vec<Entity> = Vec::new();
+        let mut report = WalkReport::default();
+        let mut visited: std::collections::HashSet<PathBuf> = Default::default();
+        // Explicit order: kept alias first, ignored link second.
+        handle_followed_symlink(
+            &dir.join("alias"),
+            dir.path(),
+            &root_canon,
+            &mut out,
+            &mut report,
+            &mut visited,
+            &ignore,
+        )
+        .unwrap();
+        handle_followed_symlink(
+            &dir.join(".git"),
+            dir.path(),
+            &root_canon,
+            &mut out,
+            &mut report,
+            &mut visited,
+            &ignore,
+        )
+        .unwrap();
+        let keys: Vec<&str> = out.iter().map(|e| e.key.as_str()).collect();
+        assert!(keys.contains(&"alias/"), "kept alias missing: {keys:?}");
+        assert!(
+            keys.contains(&"alias/child.md"),
+            "alias child missing: {keys:?}"
+        );
+        assert!(!keys.contains(&".git/"), "ignored alias listed: {keys:?}");
+        assert!(
+            !keys.contains(&".git/child.md"),
+            "ignored alias child listed: {keys:?}"
+        );
+        assert_eq!(report.skipped_ignored, 1, "report: {report:?}");
+        assert_eq!(
+            report.skipped_symlinks, 0,
+            "ignored link mis-bucketed as duplicate: {report:?}"
         );
     }
 
