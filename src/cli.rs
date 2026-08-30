@@ -468,8 +468,12 @@ pub fn run_with_io(
     }
 }
 
-/// Print walk-report warnings to stderr (Slice 9): out-of-vault followed
-/// symlink skips, and the default-mode skipped-symlink count hint.
+/// Print walk-report warnings to stderr: out-of-vault followed-symlink
+/// skips, the default-mode skipped-symlink count hint, the reserved
+/// temp/probe skip count (always-on crash-leftover signal), and the local
+/// ignore count when `WalkReport.skipped_ignored > 0` (issue #34 D-report
+/// local half; locked string `warning: ignored N local path(s) by ignore
+/// patterns`, count-only, always-on).
 fn print_walk_warnings(local: &crate::local::LocalFs, follow: bool, err: &mut dyn Write) {
     let rep = local.report();
     for w in &rep.warnings {
@@ -1268,6 +1272,11 @@ mod tests {
 
     // --- dispatch ---
 
+    // Ignore e2e must use run_with_settings / run_with_settings_store (real
+    // resolve -> resolved_ignore_patterns). These helpers keep
+    // IgnoreSet::empty() on purpose so pre-ignore contracts (progress,
+    // tolerance, parse, store refusal, ...) stay isolated from the default
+    // Obsidian profile.
     fn run(cmd: Command, store: &dyn ObjectStore) -> (i32, String, String) {
         run_tol(cmd, store, crate::config::DEFAULT_MTIME_TOLERANCE_MS)
     }
