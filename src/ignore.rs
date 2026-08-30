@@ -9,7 +9,9 @@
 //! - `path/to/dir/`: that folder key and everything under it;
 //! - a segment containing `*`: per-segment glob (`*` = any run of non-`/`
 //!   chars, including empty; does not cross `/`);
-//! - empty, leading `/`, `**`, `!`, `[`/`]`, `\`, `?`: loud rejects.
+//! - empty, leading `/`, `**`, `!`, `[`/`]`, `\`, `?`, `.` / `..` segments,
+//!   whitespace-only segments, and control characters: loud rejects (dotfile
+//!   *names* like `.DS_Store` / `.git/` stay valid).
 //!
 //! Multiple patterns OR together; zero patterns match nothing.
 
@@ -71,6 +73,11 @@ impl IgnoreSet {
     }
 
     /// True when `key` (vault-relative entity key) is ignored by any pattern.
+    ///
+    /// `key` should already be a vault-relative entity key accepted by
+    /// [`crate::entity::ensure_valid_key`]. This matcher is pure
+    /// string/segment matching and does **not** re-validate keys (e.g. empty
+    /// segments or `..` components are not rejected here).
     pub fn matches(&self, key: &str) -> bool {
         self.rules.iter().any(|r| r.matches(key))
     }
