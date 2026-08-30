@@ -884,6 +884,7 @@ mod tests {
             concurrency: 4,
             retry: crate::config::RetrySettings::default(),
             ignore_patterns: Vec::new(),
+            resolved_ignore_patterns: Vec::new(),
         };
         // explicit --vault wins over the config root
         let cli_explicit = Command::status(PathBuf::from("/cli/vault"));
@@ -1709,6 +1710,7 @@ mod tests {
             concurrency: 4,
             retry: crate::config::RetrySettings::default(),
             ignore_patterns: Vec::new(),
+            resolved_ignore_patterns: Vec::new(),
         }
     }
 

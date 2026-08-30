@@ -114,10 +114,17 @@ pub struct Settings {
     /// resolved `[transfer.retry]` policy (I8). Milliseconds at this layer;
     /// `Duration` conversion happens at the S3 boundary.
     pub retry: RetrySettings,
-    /// Parsed non-empty `[ignore].patterns` (W25/M3). A Phase 3 feature that
-    /// is surfaced loudly - never silently applied - so a user copying the
-    /// cli.md example is not let to believe patterns are in effect.
+    /// Raw user `[ignore].patterns` only (no profile injection). W25/M3
+    /// still gates on this field until #34 (issue #31 D-w25-seq): absent
+    /// `[ignore]` leaves it empty even though the resolved list is non-empty,
+    /// so the default profile never trips the Phase 3 refusal.
     pub ignore_patterns: Vec<String>,
+    /// Fully resolved ignore list: active profile built-ins first, then user
+    /// patterns, exact-string deduped, validated via `IgnoreSet`. Unused by
+    /// the CLI until #34 wire-up; present so the Obsidian default can land
+    /// without tripping W25 (issue #31 sequencing note option 2). #34 reads
+    /// this field and retires W25.
+    pub resolved_ignore_patterns: Vec<String>,
 }
 
 /// Resolved retry policy (I8). Milliseconds at this layer; `Duration`
@@ -251,7 +258,10 @@ pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings,
         mtime_tolerance_ms,
         concurrency,
         retry,
-        ignore_patterns,
+        // W186 baseline: the resolved field mirrors the user list for now;
+        // W188+ replace this with real profile resolution.
+        ignore_patterns: ignore_patterns.clone(),
+        resolved_ignore_patterns: ignore_patterns,
     })
 }
 
