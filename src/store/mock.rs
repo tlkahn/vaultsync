@@ -54,15 +54,10 @@ impl Default for MemoryStore {
     }
 }
 
-/// Ancestor folder keys (each trailing-`/` prefix) of a key.
+/// Ancestor folder keys (each trailing-`/` prefix) of a key. Shared
+/// implementation (W230): see [`crate::manifest::parent_folders`].
 fn parent_folders(key: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for (i, b) in key.bytes().enumerate() {
-        if b == b'/' {
-            out.push(key[..=i].to_string());
-        }
-    }
-    out
+    crate::manifest::parent_folders(key)
 }
 
 /// Read exactly `n` bytes from `r` into a fresh `Vec`, or fail with

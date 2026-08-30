@@ -315,14 +315,9 @@ fn dt_millis(dt: &aws_sdk_s3::primitives::DateTime) -> Option<u64> {
 }
 
 /// Ancestor folder keys (each trailing-`/` prefix) of a key, like the mock.
+/// Shared implementation (W230): see [`crate::manifest::parent_folders`].
 fn parent_folders(key: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for (i, b) in key.bytes().enumerate() {
-        if b == b'/' {
-            out.push(key[..=i].to_string());
-        }
-    }
-    out
+    crate::manifest::parent_folders(key)
 }
 
 /// Pure conversion of a raw listing (key, size, mtime) into sorted entities
