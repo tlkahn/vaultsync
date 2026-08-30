@@ -1697,30 +1697,59 @@ mod tests {
     }
 
     fn no_store_settings(vault: &std::path::Path) -> crate::config::Settings {
-        crate::config::Settings {
-            vault_root: vault.to_path_buf(),
-            store: crate::config::StoreSettings {
-                bucket: String::new(),
-                region: None,
-                endpoint: None,
-                prefix: String::new(),
-                path_style: false,
-            },
-            mtime_tolerance_ms: 1000,
-            concurrency: 4,
-            retry: crate::config::RetrySettings::default(),
-            ignore_patterns: Vec::new(),
-            resolved_ignore_patterns: Vec::new(),
-        }
+        // F4/W197 (PR 38 r1): helpers go through the real resolve path so the
+        // (user, resolved) split can never be production-impossible. Absent
+        // `[ignore]` => user empty, resolved = Obsidian six. Empty bucket
+        // keeps the in-memory mock store path used by CLI unit tests.
+        let cfg = crate::config::FileConfig {
+            vault_root: Some(vault.to_path_buf()),
+            ..Default::default()
+        };
+        crate::config::resolve_settings(&cfg, &crate::config::EnvSnapshot::default())
+            .expect("default FileConfig must resolve")
     }
 
     fn settings_with_ignore(
         vault: &std::path::Path,
         patterns: Vec<&str>,
     ) -> crate::config::Settings {
-        let mut s = no_store_settings(vault);
-        s.ignore_patterns = patterns.iter().map(|s| s.to_string()).collect();
-        s
+        // F4/W197: real resolve with `[ignore].patterns` only; profile absent
+        // => Obsidian default, user patterns extend (production semantics).
+        let cfg = crate::config::FileConfig {
+            vault_root: Some(vault.to_path_buf()),
+            ignore: Some(crate::config::IgnoreConfig {
+                profile: None,
+                patterns: patterns.iter().map(|s| s.to_string()).collect(),
+            }),
+            ..Default::default()
+        };
+        crate::config::resolve_settings(&cfg, &crate::config::EnvSnapshot::default())
+            .expect("valid ignore patterns in W25 helpers must resolve")
+    }
+
+    #[test]
+    fn settings_with_ignore_helper_matches_resolve_split() {
+        // F4/W197 (PR 38 r1): the helpers must not build a
+        // production-impossible split (user non-empty, resolved empty). A
+        // helper-fed `.trash/` must look exactly like a real resolve: raw
+        // user field = supplied patterns, resolved = Obsidian six with the
+        // repeated `.trash/` deduped (no seventh entry). RED today: the
+        // helper leaves resolved empty.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let s = settings_with_ignore(dir.path(), vec![".trash/"]);
+        assert_eq!(s.ignore_patterns, vec![".trash/".to_string()]);
+        assert!(
+            !s.resolved_ignore_patterns.is_empty(),
+            "helper must resolve defaults, not leave resolved empty"
+        );
+        let expected: Vec<String> = crate::config::OBSIDIAN_DEFAULT_IGNORE_PATTERNS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            s.resolved_ignore_patterns, expected,
+            "built-in .trash/ deduped; no seventh entry"
+        );
     }
 
     #[test]
