@@ -1358,6 +1358,94 @@ mod tests {
     }
 
     #[test]
+    fn list_filters_control_plane_keys_before_head_enrichment() {
+        use crate::testutil::S3LikeListStore;
+        // W221 (issue 45): the control-plane namespace (`.vaultsync/**`,
+        // first segment exactly `.vaultsync`) is partitioned out of the S3
+        // listing BEFORE any head is issued - same W118 wiring, extended
+        // predicate. A remote `.vaultsync/manifest/v1.json` (or a
+        // `.vaultsync/cache/` folder view) must never be headed, must appear
+        // in no plan row, and must be named by the shared W79 warning.
+        let dir = TempDir::new("vaultsync-lib-test");
+        let store = S3LikeListStore::new();
+        let manifest_body = b"{\"schema\":\"vaultsync.manifest.v1\"}";
+        store
+            .inner()
+            .put_from(
+                crate::local::MANIFEST_KEY,
+                &mut std::io::Cursor::new(manifest_body.to_vec()),
+                manifest_body.len() as u64,
+                Some(1_600_000_000_000),
+            )
+            .unwrap();
+        store
+            .inner()
+            .put_from(
+                ".vaultsync/cache/manifest-v1.json",
+                &mut std::io::Cursor::new(b"{}".to_vec()),
+                2,
+                Some(1_600_000_000_000),
+            )
+            .unwrap();
+        store
+            .inner()
+            .put_from(
+                "notes/a.md",
+                &mut std::io::Cursor::new(b"aaa".to_vec()),
+                3,
+                Some(1_600_000_000_000),
+            )
+            .unwrap();
+        let local = LocalFs::new(dir.path());
+        let report = build_plan(
+            &local,
+            &store,
+            Mode::Status,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+        )
+        .unwrap();
+        // control-plane keys never planned.
+        assert!(
+            !report
+                .plan
+                .actions
+                .iter()
+                .any(|a| a.key.starts_with(".vaultsync/")),
+            "control-plane key planned: {:?}",
+            report.plan.actions
+        );
+        // store-side warning present exactly once with the W79 text, naming
+        // the manifest key.
+        let matching: Vec<&String> = report
+            .warnings
+            .iter()
+            .filter(|w| w.contains("reserved vaultsync namespace"))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "expected exactly one warning: {:?}",
+            report.warnings
+        );
+        assert!(
+            matching[0].contains(".vaultsync/manifest/v1.json"),
+            "warning must name the manifest key: {}",
+            matching[0]
+        );
+        // head log: healthy key served, control-plane keys never.
+        let head_log = store.head_log();
+        assert!(
+            head_log.iter().any(|k| k == "notes/a.md"),
+            "healthy key not headed: {head_log:?}"
+        );
+        assert!(
+            !head_log.iter().any(|k| k.starts_with(".vaultsync/")),
+            "control-plane key was headed (should be pre-filtered): {head_log:?}"
+        );
+    }
+
+    #[test]
     fn reserved_key_head_failure_does_not_fail_listing() {
         use crate::testutil::S3LikeListStore;
         // W118/R2-2 fail-closed scope creep: a transient head error (throttle)
