@@ -166,19 +166,13 @@ pub(crate) fn partition_reserved_remote_keys(entities: Vec<Entity>) -> (Vec<Enti
     let mut kept = Vec::new();
     let mut dropped = Vec::new();
     for e in entities {
-        // W109/L4: a folder-form key's reserved segment sits behind the
-        // trailing `/` (`rsplit('/').next()` on `.vaultsync-check-1/` yields
-        // the empty string); strip one trailing `/` first, same shape as
-        // `fold_key`, so the filter's stated final-segment policy also holds
-        // for folder-shaped keys.
-        let reserved = e
-            .key
-            .strip_suffix('/')
-            .unwrap_or(&e.key)
-            .rsplit('/')
-            .next()
-            .is_some_and(crate::local::is_reserved_vaultsync_key_name);
-        if reserved {
+        // W109/L4 + W219 (issue 45): the shared `is_reserved_remote_key`
+        // covers BOTH the existing final-segment probe/tmp rule (with the
+        // folder-form trailing-`/` strip) and the new control-plane
+        // first-segment rule (`.vaultsync/**`) - one predicate so the local
+        // walk, the remote partition, and the S3 pre-head partition cannot
+        // drift.
+        if crate::local::is_reserved_remote_key(&e.key) {
             dropped.push(e);
         } else {
             kept.push(e);
@@ -664,6 +658,39 @@ mod tests {
         assert_eq!(
             dropped_keys,
             vec![".vaultsync-check-1/", "a/.name.vaultsync-tmp-1-2/"],
+            "dropped wrong: {dropped_keys:?}"
+        );
+    }
+
+    #[test]
+    fn partition_reserved_drops_control_plane_keys() {
+        // W219 (issue 45): the partition must drop `.vaultsync/**` control-
+        // plane keys (file AND folder form, first segment exactly
+        // `.vaultsync`) in addition to the existing final-segment probe/tmp
+        // rule. `notes/.vaultsync/x` is NOT control-plane (first segment
+        // `notes`) and stays kept.
+        let all = vec![
+            crate::entity::file(".vaultsync/manifest/v1.json", 1, Some(1)),
+            crate::entity::file(".vaultsync/cache/manifest-v1.json", 2, Some(2)),
+            crate::entity::folder(".vaultsync/cache"),
+            crate::entity::file("notes/.vaultsync/x", 3, Some(3)),
+            crate::entity::file("notes/a.md", 4, Some(4)),
+        ];
+        let (kept, dropped) = partition_reserved_remote_keys(all);
+        let kept_keys: Vec<&str> = kept.iter().map(|e| e.key.as_str()).collect();
+        let dropped_keys: Vec<&str> = dropped.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            kept_keys,
+            vec!["notes/.vaultsync/x", "notes/a.md"],
+            "kept wrong: {kept_keys:?}"
+        );
+        assert_eq!(
+            dropped_keys,
+            vec![
+                ".vaultsync/manifest/v1.json",
+                ".vaultsync/cache/manifest-v1.json",
+                ".vaultsync/cache/"
+            ],
             "dropped wrong: {dropped_keys:?}"
         );
     }

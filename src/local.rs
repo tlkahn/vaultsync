@@ -1091,6 +1091,38 @@ pub(crate) fn is_reserved_vaultsync_key_name(name: &str) -> bool {
     (name.starts_with('.') && name.contains(".vaultsync-tmp-")) || is_check_probe_name(name)
 }
 
+/// The vault-relative key of the remote inventory manifest (issue 45,
+/// D-key). Exact string; the single source of truth for readers, writers,
+/// and repair.
+pub const MANIFEST_KEY: &str = ".vaultsync/manifest/v1.json";
+
+/// Whether a vault-relative key is under the control-plane prefix: its FIRST
+/// path segment is exactly `.vaultsync` (file or folder form). Issue 45
+/// (D-reserved) extends the reserved namespace with any such key - local
+/// walk prune, remote partition, and the S3 pre-head partition all use this
+/// one predicate so the policies cannot drift. `notes/.vaultsync/x` is NOT
+/// control-plane (first segment `notes`); the probe/tmp names
+/// (`.vaultsync-check-*`, `.*.vaultsync-tmp-*`) are reserved by the existing
+/// final-segment rule (`is_reserved_vaultsync_key_name`), not by this rule.
+pub(crate) fn is_vaultsync_control_plane_key(key: &str) -> bool {
+    key.split('/').next() == Some(".vaultsync")
+}
+
+/// Whether a vault-relative remote key is reserved: control-plane first
+/// segment (`.vaultsync/**`, issue 45 D-reserved) OR the existing
+/// final-segment probe/tmp rule (W63/A-L3). The final-segment check strips
+/// one trailing `/` first (W109/L4 folder-form handling: a folder key's
+/// reserved segment sits behind the trailing slash).
+pub(crate) fn is_reserved_remote_key(key: &str) -> bool {
+    is_vaultsync_control_plane_key(key)
+        || key
+            .strip_suffix('/')
+            .unwrap_or(key)
+            .rsplit('/')
+            .next()
+            .is_some_and(is_reserved_vaultsync_key_name)
+}
+
 /// The directories `create_dir_all(parent)` will create (W66/A-L2): the chain
 /// from `parent` up to but excluding the deepest pre-existing ancestor, in
 /// deepest-first order (children before parents) so a later bottom-up
@@ -2765,6 +2797,56 @@ mod tests {
         let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(keys, vec!["note.md"], "check leftover listed: {keys:?}");
         assert_eq!(rep.skipped_temp_files, 1);
+    }
+
+    #[test]
+    fn control_plane_key_first_segment_pins() {
+        // W219 (issue 45): the control-plane namespace is exactly the first
+        // path segment `.vaultsync` (file OR folder form). Anything deeper
+        // (`notes/.vaultsync/x`) is a normal user path; the check/probe
+        // names stay reserved via the EXISTING final-segment rule only.
+        let cases: &[(&str, bool)] = &[
+            (".vaultsync/manifest/v1.json", true),
+            (".vaultsync/cache/x", true),
+            (".vaultsync/", true),
+            (".vaultsync", true),
+            ("notes/.vaultsync/x", false),
+            (".vaultsync-check-1-2-3", false),
+            ("notes/a.md", false),
+        ];
+        for (key, want) in cases {
+            assert_eq!(
+                is_vaultsync_control_plane_key(key),
+                *want,
+                "control-plane classification for {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_remote_key_combines_control_plane_and_final_segment() {
+        // W219 (issue 45): the remote reserved predicate is the control-plane
+        // first-segment rule OR the existing final-segment rule (probe/tmp
+        // names, W63/A-L3). `.vaultsync-check-1-2-3` must stay reserved via
+        // the final-segment rule even though its first segment is not
+        // `.vaultsync` (the W109 folder-form handling is preserved too).
+        for key in [
+            ".vaultsync/manifest/v1.json",
+            ".vaultsync/cache/x",
+            ".vaultsync/",
+            ".vaultsync",
+            ".vaultsync-check-1-2-3",
+            ".vaultsync-check-1/",
+            ".a.md.vaultsync-tmp-1-2",
+        ] {
+            assert!(
+                is_reserved_remote_key(key),
+                "{key:?} must be reserved (control-plane or final-segment)"
+            );
+        }
+        for key in ["notes/.vaultsync/x", "notes/a.md", ".vaultsync-notes.md"] {
+            assert!(!is_reserved_remote_key(key), "{key:?} must NOT be reserved");
+        }
     }
 
     #[test]
