@@ -2601,6 +2601,47 @@ mod tests {
     }
 
     #[test]
+    fn walk_counts_skipped_ignored() {
+        // D-report exact counting lock (issue acceptance): each pruned
+        // directory counts 1 (its key matched; unvisited descendants are
+        // NOT counted) and each skipped file counts 1. The tree exercises
+        // both rules in one walk: `.trash/` pruned (1), root `.DS_Store`
+        // (1), `nested/.DS_Store` (1) -> exactly 3.
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::write(dir.join("note.md"), "keep").unwrap();
+        std::fs::write(dir.join(".DS_Store"), "x").unwrap();
+        std::fs::create_dir_all(dir.join(".trash/b")).unwrap();
+        std::fs::write(dir.join(".trash/a.md"), "t").unwrap();
+        std::fs::write(dir.join(".trash/b/c.md"), "u").unwrap();
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("nested/.DS_Store"), "y").unwrap();
+        let fs = LocalFs::new(dir.path()).with_ignore(
+            IgnoreSet::from_patterns(&[".trash/".to_string(), ".DS_Store".to_string()]).unwrap(),
+        );
+        let (ents, rep) = fs.list_report().unwrap();
+        let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
+        assert!(keys.contains(&"note.md"), "keep file missing: {keys:?}");
+        assert!(
+            keys.contains(&"nested/"),
+            "unignored dir must stay: {keys:?}"
+        );
+        assert!(
+            !keys
+                .iter()
+                .any(|k| *k == ".trash/" || k.starts_with(".trash/")),
+            "trash subtree listed: {keys:?}"
+        );
+        assert!(
+            !keys.iter().any(|k| k.ends_with(".DS_Store")),
+            "ignored files listed: {keys:?}"
+        );
+        assert_eq!(
+            rep.skipped_ignored, 3,
+            "1 pruned dir + 2 skipped files, got: {rep:?}"
+        );
+    }
+
+    #[test]
     fn walk_skips_check_probe_leftovers() {
         // R4-L4/W42: a `.vaultsync-check-*` probe leftover on the local side
         // (materialized by an earlier stray download) must be skipped and
