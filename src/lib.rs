@@ -860,6 +860,15 @@ mod tests {
             "only orphan.md should be a remote delete: {:?}",
             p.stats
         );
+        // N4d: the ignored key must be fully absent - no plan row of any
+        // kind - not merely absent from the DeleteRemote arm.
+        assert!(
+            !p.actions
+                .iter()
+                .any(|a| a.key == ".obsidian/workspace.json"),
+            "ignored key must be fully absent, not merely non-DeleteRemote: {:?}",
+            p.actions
+        );
     }
 
     #[test]
@@ -960,6 +969,48 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("ignored 1 remote key(s) by ignore patterns")),
             "ignore warning missing: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn build_plan_dir_prefix_drops_folder_form_remote() {
+        // N4a: a folder-form remote key (trailing `/`) under a dir-prefix
+        // pattern is dropped on the full build_plan path, together with its
+        // nested children - `.git/` (exact match) and `.git/objects/aa`
+        // (prefix match) both stay absent. Characterization pin: GREEN on
+        // arrival, mutation-checked (filter removed -> keys reappear).
+        let dir = TempDir::new("vaultsync-lib-test");
+        let local = LocalFs::new(dir.path());
+        let store = StubStore {
+            listed: vec![
+                crate::entity::folder(".git"),
+                crate::entity::file(".git/objects/aa", 25, Some(100)),
+                crate::entity::file("notes/a.md", 25, Some(100)),
+            ],
+        };
+        let ignore = ignore_set(&[".git/"]);
+        let report = build_plan(&local, &store, Mode::Pull, &PlanOpts::default(), &ignore).unwrap();
+        assert!(
+            !report
+                .plan
+                .actions
+                .iter()
+                .any(|a| a.key == ".git/" || a.key == ".git/objects/aa"),
+            "folder-form ignored key planned: {:?}",
+            report.plan.actions
+        );
+        assert!(
+            report.plan.actions.iter().any(|a| a.key == "notes/a.md"),
+            "kept key missing: {:?}",
+            report.plan.actions
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("ignored 2 remote key(s) by ignore patterns")),
+            "ignore warning must count 2: {:?}",
             report.warnings
         );
     }
