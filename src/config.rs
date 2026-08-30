@@ -320,10 +320,13 @@ fn resolve_ignore(ignore: Option<&IgnoreConfig>) -> Result<(Vec<String>, Vec<Str
         // list (union with the empty profile).
         Some("none") => Vec::new(),
         // W188: `obsidian` / absent key -> the built-in Obsidian set.
-        _ => OBSIDIAN_DEFAULT_IGNORE_PATTERNS
+        Some("obsidian") | None => OBSIDIAN_DEFAULT_IGNORE_PATTERNS
             .iter()
             .map(|s| s.to_string())
             .collect(),
+        // W192 guarded above (unknown profiles already Err); arm kept for
+        // exhaustiveness readability so the guard and match cannot drift.
+        Some(_) => unreachable!("unknown ignore.profile must Err before match"),
     };
     // W190: user patterns extend the active profile (union; stable order:
     // built-ins first, user next). W191: exact-string dedup, first wins - a
@@ -337,7 +340,7 @@ fn resolve_ignore(ignore: Option<&IgnoreConfig>) -> Result<(Vec<String>, Vec<Str
     // `IgnoreSet::from_patterns` and discard the matcher - the matcher's own
     // message (naming the bad pattern + reason) is reused verbatim; no
     // reimplementation of pattern rules here, no new Error variant.
-    let _ = crate::IgnoreSet::from_patterns(&resolved)?;
+    crate::IgnoreSet::from_patterns(&resolved)?;
     Ok((user, resolved))
 }
 
@@ -495,7 +498,8 @@ mod tests {
     #[test]
     fn config_parse_full_example() {
         // Mirrors the cli.md example. Store buckets/prefix and transfer fields
-        // all deserialize; unknown sections like `[ignore]` parse fine.
+        // all deserialize; the known `[ignore]` section deserializes `patterns`
+        // (profile optional; resolution is tested elsewhere).
         let text = r#"
 vault_root = "/Users/me/Notes"
 
