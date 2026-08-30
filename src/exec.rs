@@ -3028,6 +3028,67 @@ mod tests {
     }
 
     #[test]
+    fn execute_plan_with_progress_delete_local_bracket() {
+        // PR 28 r2 F4: pin the complete `DeleteLocal` bracket and the terminal
+        // `RunEnd` at the executor boundary through `RecordingProgress`.
+        // Pins existing behavior (GREEN on arrival); mutation-check the pass
+        // dispatch. Empty store + pull --delete -> a single local-only key is
+        // DeleteLocal, and the file is really removed (not just an event-shape
+        // test).
+        let dir = TempDir::new("vaultsync-exec");
+        std::fs::write(dir.join("gone.md"), "bye").unwrap();
+        let local = LocalFs::new(dir.path());
+        let store = MemoryStore::new();
+        let opts = PlanOpts {
+            delete: true,
+            ..Default::default()
+        };
+        let plan = crate::build_plan(&local, &store, Mode::Pull, &opts)
+            .unwrap()
+            .plan;
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| a.key == "gone.md" && a.kind == ActionKind::DeleteLocal),
+            "plan must delete gone.md locally: {:?}",
+            plan.actions
+        );
+        let prog = RecordingProgress::new();
+        let rep = execute_plan_with_progress(&local, &store, &plan, Mode::Pull, &opts, 1, &prog);
+        assert_eq!(rep.executed, 1, "{:?}", rep);
+        assert_eq!(rep.failed, Vec::<ExecFailure>::new(), "{:?}", rep);
+        assert!(
+            !dir.join("gone.md").exists(),
+            "gone.md must actually be removed by the executor"
+        );
+        let evs = prog.events();
+        assert_eq!(
+            evs,
+            vec![
+                ProgressEvent::PassStart {
+                    kind: PassKind::DeleteLocal,
+                    total_keys: 1,
+                    total_bytes: 0,
+                },
+                ProgressEvent::KeyDone {
+                    kind: PassKind::DeleteLocal,
+                    key: "gone.md".to_string(),
+                    bytes: 0,
+                    ok: true,
+                },
+                ProgressEvent::PassEnd {
+                    kind: PassKind::DeleteLocal,
+                },
+                ProgressEvent::RunEnd {
+                    executed: 1,
+                    failed: 0,
+                },
+            ],
+            "exact DeleteLocal bracket: {evs:?}"
+        );
+    }
+
+    #[test]
     fn execute_plan_with_progress_skips_empty_passes() {
         // I27 cycle 2 / I27-render: zero-item passes emit no PassStart/PassEnd
         // (a pure-download pull plan has no Upload pass events), but the
