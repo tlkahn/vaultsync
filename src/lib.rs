@@ -50,15 +50,14 @@ pub struct PlanReport {
 /// any kind, not even a `Skip(ignored)`, so `--delete` never plans a
 /// `DeleteRemote` for an ignored remote-only key). `plan()` stays
 /// filter-agnostic - this function narrows the remote list first. An empty
-/// set (the default at most call sites until #34 wires patterns from
-/// settings) matches nothing and behaves exactly like today.
+/// set matches nothing and behaves exactly like today (the CLI compiles its
+/// set from `Settings.resolved_ignore_patterns`, issue #34 D-wire).
 ///
 /// Local entities are **not** filtered by this function's `ignore` argument -
 /// the local half of D-both-sides is walk-time prune on the `LocalFs` itself
 /// via [`LocalFs::with_ignore`] (issue #32). Callers that want both halves
-/// must attach the same compiled set to the walker **and** pass it here.
-/// Production CLI still passes [`IgnoreSet::empty`] (and does not call
-/// `with_ignore`) under W25 until #34 wires patterns from settings.
+/// must attach the same compiled set to the walker **and** pass it here - the
+/// CLI threads one compiled set into both seams (issue #34 D-both-sides).
 pub fn build_plan(
     local: &LocalFs,
     store: &dyn ObjectStore,
@@ -100,8 +99,7 @@ pub fn build_plan(
     // as an ignore drop - and before `ensure_valid_key` / `plan()`, so an
     // ignored remote key is absent from `remote_entities` (never a plan row,
     // not even a `Skip(ignored)`), and ignored invalid keys never reach
-    // fail-closed validation. An empty set (the default until #34 wires real
-    // patterns) drops nothing and emits no warning.
+    // fail-closed validation. An empty set drops nothing and emits no warning.
     let (remote_entities, ignored_dropped) = partition_ignored_remote_keys(remote_entities, ignore);
     if !ignored_dropped.is_empty() {
         warnings.push(ignored_remote_drops_warning(ignored_dropped.len()));
@@ -236,7 +234,8 @@ pub(crate) fn partition_ignored_remote_keys(
 /// with key names (the reserved warning names its first 5; the ignore
 /// warning stays count-only per the issue sketch). Take a count, not a slice
 /// of entities, to make "no key dump" structural. Only call when
-/// `dropped_count > 0`.
+/// `dropped_count > 0`. Surfaced by the CLI as `warning: {w}` (issue #34
+/// D-report).
 pub(crate) fn ignored_remote_drops_warning(dropped_count: usize) -> String {
     format!("ignored {dropped_count} remote key(s) by ignore patterns")
 }
@@ -263,8 +262,8 @@ fn compute_stats(actions: &[plan::Action]) -> plan::PlanStats {
 /// [`PlanReport::warnings`] (store-listing, reserved-namespace, and
 /// ignore-pattern drops). Callers that need warnings must use [`build_plan`]
 /// directly. `ignore` forwards to [`build_plan`]; pass `&IgnoreSet::empty()`
-/// if you do not care (the CLI passes empty under W25 until #34 wires
-/// patterns).
+/// if you do not care (the CLI compiles its set from
+/// `Settings.resolved_ignore_patterns`, issue #34 D-wire).
 pub fn status_with_store(
     vault: &Path,
     store: &dyn ObjectStore,
@@ -726,7 +725,8 @@ mod tests {
     fn partition_ignored_empty_set_passthrough() {
         // W195: an empty IgnoreSet (or empty pattern list) matches nothing,
         // so kept is the full input order and dropped is empty - the
-        // no-op default that keeps today's behavior under W25.
+        // no-op default (the CLI only builds a non-empty set when settings
+        // resolve one, issue #34 D-wire).
         let all = vec![
             crate::entity::file("a.md", 1, Some(1)),
             crate::entity::file(".obsidian/workspace.json", 2, Some(2)),

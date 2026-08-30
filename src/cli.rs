@@ -757,29 +757,6 @@ fn run_with_settings_store(
     out: &mut dyn Write,
     err: &mut (dyn Write + Send),
 ) -> i32 {
-    // W25/M3: `[ignore].patterns` is a Phase 3 feature (parsed but not yet
-    // applied). A mutating command that would silently not apply it must
-    // refuse loudly; `status` (read-only) warns and proceeds with the plan.
-    if !settings.ignore_patterns.is_empty() {
-        match &cmd {
-            Command::Push { .. } | Command::Pull { .. } | Command::Check { .. } => {
-                let _ = writeln!(
-                    err,
-                    "error: [ignore].patterns is a Phase 3 feature and is not yet applied; refusing {} ({:?} ignored). Remove the [ignore] section or use `status` to preview.",
-                    command_name(&cmd),
-                    settings.ignore_patterns
-                );
-                return 1;
-            }
-            _ => {
-                let _ = writeln!(
-                    err,
-                    "warning: [ignore].patterns is a Phase 3 feature and is not yet applied ({:?} ignored)",
-                    settings.ignore_patterns
-                );
-            }
-        }
-    }
     if requires_real_store(&cmd) && settings.store.bucket.is_empty() {
         let _ = writeln!(
             err,
@@ -791,6 +768,21 @@ fn run_with_settings_store(
     // Merge the config vault_root into the command when --vault was unset.
     let cmd = resolve_vault_from_config(cmd, settings);
 
+    // Issue #34 (D-wire): compile the resolved ignore patterns once at the
+    // settings boundary and thread the SAME set into both the local walk
+    // (`LocalFs::with_ignore`, issue #32) and the remote filter
+    // (`build_plan`, issue #33) so the two halves can never disagree
+    // (D-both-sides). Patterns were already validated in `resolve_settings`;
+    // a re-compile failure here is defensive - fail loudly (exit 1, same
+    // shape as other settings errors), never `unwrap` in the production path.
+    let ignore = match crate::IgnoreSet::from_patterns(&settings.resolved_ignore_patterns) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = writeln!(err, "error: {e}");
+            return 1;
+        }
+    };
+
     run_with_io(
         cmd,
         store,
@@ -798,12 +790,7 @@ fn run_with_settings_store(
             tolerance_ms: settings.mtime_tolerance_ms,
             concurrency: settings.concurrency,
             progress_mode,
-            // W203: the seam is threaded (empty-compatible); real patterns
-            // from `settings.resolved_ignore_patterns` are wired in W204/W205
-            // together with the W25 gate removal. Today the W25 gate above
-            // still refuses/warns on a non-empty raw user list, so an empty
-            // set here is behavior-preserving.
-            ignore: crate::IgnoreSet::empty(),
+            ignore,
         },
         out,
         err,
@@ -1790,56 +1777,104 @@ mod tests {
     }
 
     #[test]
-    fn push_with_ignore_patterns_errors_loudly() {
-        // W25/M3: `[ignore].patterns` is a Phase 3 feature; a mutating command
-        // that would silently not apply it must refuse loudly, naming the key
-        // and the phase.
+    fn push_with_ignore_patterns_applies() {
+        // Issue #34 (D-wire + D3-extend): user patterns (union with the
+        // Obsidian defaults) must actually prune the push plan - no W25
+        // refusal (exit 0), the ignored key absent from the plan, and the
+        // ignored file never reaches the store. Mutation-checked: an empty
+        // `IgnoreSet` at the compile site makes this RED (.trash/x.md uploads).
         let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::create_dir_all(dir.join(".trash")).unwrap();
         std::fs::write(dir.join("a.md"), "hi").unwrap();
-        let settings = settings_with_ignore(dir.path(), vec![".trash/"]);
+        std::fs::write(dir.join(".trash/x.md"), "x").unwrap();
+        let mut settings = settings_with_ignore(dir.path(), vec![".trash/"]);
+        settings.store.bucket = "b".to_string(); // store injected below; avoids the no-store refusal
+        let store = MemoryStore::new();
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_with_settings(
+        let code = run_with_settings_store(
             Command::push(dir.path().into(), false),
             &settings,
+            &store,
             ProgressMode::Off,
             &mut out,
             &mut err,
         );
         let err = String::from_utf8(err).unwrap();
-        assert_eq!(code, 1);
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(!err.contains("Phase 3"), "W25 refusal must be gone: {err}");
         assert!(
-            err.to_lowercase().contains("ignore") && err.contains("Phase 3"),
-            "expected ignore/Phase-3 refusal: {err}"
+            out.lines().any(|l| l.starts_with("U  a.md")),
+            "a.md planned: {out}"
+        );
+        assert!(
+            !out.contains(".trash/x.md"),
+            "ignored key absent from plan: {out}"
+        );
+        assert!(store.head("a.md").is_ok(), "a.md uploaded");
+        assert!(
+            matches!(
+                store.head(".trash/x.md"),
+                Err(crate::error::Error::NotFound(_))
+            ),
+            "ignored file must never reach the store"
         );
     }
 
     #[test]
-    fn pull_with_ignore_patterns_errors_loudly() {
+    fn pull_with_ignore_patterns_applies() {
+        // Issue #34 apply/pull equivalent: a remote-only ignored key
+        // (`.trash/x.md` under user pattern `.trash/`) must be filtered from
+        // the pull plan - no Download row, nothing materialized locally, and
+        // no W25 refusal (exit 0).
         let dir = TempDir::new("vaultsync-cli-test");
-        let settings = settings_with_ignore(dir.path(), vec![".trash/"]);
+        let store = MemoryStore::new();
+        let mut c1 = std::io::Cursor::new(b"a".to_vec());
+        store.put_from("a.md", &mut c1, 1, Some(100)).unwrap();
+        let mut c2 = std::io::Cursor::new(b"x".to_vec());
+        store
+            .put_from(".trash/x.md", &mut c2, 1, Some(100))
+            .unwrap();
+        let mut settings = settings_with_ignore(dir.path(), vec![".trash/"]);
+        settings.store.bucket = "b".to_string(); // store injected below
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_with_settings(
+        let code = run_with_settings_store(
             Command::pull(dir.path().into(), false),
             &settings,
+            &store,
             ProgressMode::Off,
             &mut out,
             &mut err,
         );
         let err = String::from_utf8(err).unwrap();
-        assert_eq!(code, 1);
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(!err.contains("Phase 3"), "W25 refusal must be gone: {err}");
         assert!(
-            err.to_lowercase().contains("ignore") && err.contains("Phase 3"),
-            "expected ignore/Phase-3 refusal: {err}"
+            out.lines().any(|l| l.starts_with("D  a.md")),
+            "a.md download planned: {out}"
+        );
+        assert!(
+            !out.contains(".trash/x.md"),
+            "ignored remote key absent from plan: {out}"
+        );
+        assert!(dir.join("a.md").exists(), "a.md materialized");
+        assert!(
+            !dir.join(".trash/x.md").exists(),
+            "ignored remote key must not be downloaded"
         );
     }
 
     #[test]
-    fn status_with_ignore_patterns_warns_but_runs() {
-        // W25/M3: `status` is read-only, so ignore patterns warn on stderr but
-        // the plan is still produced (exit 0 on a clean vault).
+    fn status_with_ignore_patterns_applies() {
+        // Issue #34 status half: user patterns prune the status plan (ignored
+        // key absent), the run proceeds (exit 0) with NO Phase 3 warning.
         let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::create_dir_all(dir.join(".trash")).unwrap();
+        std::fs::write(dir.join("a.md"), "hi").unwrap();
+        std::fs::write(dir.join(".trash/x.md"), "x").unwrap();
         let settings = settings_with_ignore(dir.path(), vec![".trash/"]);
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -1852,12 +1887,19 @@ mod tests {
         );
         let err = String::from_utf8(err).unwrap();
         let out = String::from_utf8(out).unwrap();
-        assert_eq!(code, 0);
+        // exit 2: the plan is dirty (a.md upload pending), which is the
+        // success signal for status - the point is it RUNS (no W25 refuse)
+        // with the ignored key pruned.
+        assert_eq!(code, 2, "stderr: {err}");
+        assert!(!err.contains("Phase 3"), "W25 warning must be gone: {err}");
         assert!(
-            err.to_lowercase().contains("ignore") && err.contains("Phase 3"),
-            "expected ignore/Phase-3 warning: {err}"
+            out.lines().any(|l| l.starts_with("U  a.md")),
+            "a.md planned: {out}"
         );
-        assert!(out.contains("plan:"), "plan produced: {out}");
+        assert!(
+            !out.contains(".trash/x.md"),
+            "ignored key absent from plan: {out}"
+        );
     }
 
     #[test]

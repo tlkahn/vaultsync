@@ -9,7 +9,8 @@
 //!   skips stay in `skipped_temp_files` and are never re-labeled as ignored
 //!   (D-filter-order: reserved first, independent). An empty `IgnoreSet`
 //!   attached via [`LocalFs::with_ignore`] preserves pre-ignore walk
-//!   behavior; the CLI wires `[ignore]` patterns in issue #34, the remote
+//!   behavior; the CLI attaches the set compiled from
+//!   `Settings.resolved_ignore_patterns` (issue #34 D-wire), the remote
 //!   half is #33.
 //! - symlinks - files **and** directories - are skipped entirely
 //!   (`--follow-symlinks` is a Phase 2 policy decision, P1r4-symlink);
@@ -41,8 +42,9 @@ pub struct LocalFs {
     follow_symlinks: bool,
     /// Compiled ignore patterns applied during the walk (issue #32). Empty by
     /// default (`new` / `with_follow`); attach via [`LocalFs::with_ignore`].
-    /// An empty set preserves today's walk behavior exactly. CLI wiring of
-    /// `[ignore]` patterns is issue #34; the remote filter is #33.
+    /// An empty set preserves today's walk behavior exactly. The CLI attaches
+    /// the set compiled from `Settings.resolved_ignore_patterns` (issue #34
+    /// D-wire); the remote filter is #33.
     ignore: IgnoreSet,
     /// Walk report, mutated at the end of a walk and read by `report()`.
     /// `Mutex` (not `RefCell`) so `LocalFs` is `Send`/`Sync` ahead of Phase 3
@@ -89,7 +91,7 @@ pub struct WalkReport {
     /// **pruned directory** counts 1 (the directory key matched; unvisited
     /// descendants are **not** counted). Reserved-namespace skips stay in
     /// `skipped_temp_files` and are not double-counted here. CLI printing of
-    /// this count is issue #34.
+    /// this count is issue #34 (D-report, W209).
     pub skipped_ignored: u32,
     /// Keys of followed *file* symlinks (R4-M1/W38). The planner uses this to
     /// mark such rows `Skip(followed_symlink)` in mutating modes: the walker
@@ -137,8 +139,8 @@ impl LocalFs {
 
     /// Attach a compiled ignore set applied during the walk (issue #32).
     /// Empty set preserves pre-ignore walk behavior. Chain after `new` /
-    /// `with_follow`; later construction (e.g. issue #34's CLI wiring) sets
-    /// it without a combinatorial constructor explosion.
+    /// `with_follow`; later construction (the CLI's `[ignore]` wiring, issue
+    /// #34) sets it without a combinatorial constructor explosion.
     ///
     /// Pattern shapes follow `IgnoreSet` semantics (issue #30): dir patterns
     /// are vault-rooted **path prefixes** (`.git/` matches `.git/objects/...`
