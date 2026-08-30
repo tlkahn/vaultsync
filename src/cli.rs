@@ -915,6 +915,7 @@ mod tests {
             retry: crate::config::RetrySettings::default(),
             ignore_patterns: Vec::new(),
             resolved_ignore_patterns: Vec::new(),
+            inventory_mode: crate::config::InventoryMode::Auto,
         };
         // explicit --vault wins over the config root
         let cli_explicit = Command::status(PathBuf::from("/cli/vault"));

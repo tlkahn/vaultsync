@@ -32,6 +32,17 @@ pub const DEFAULT_RETRY_MAX_ATTEMPTS: u32 = 3;
 pub const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 1000;
 pub const DEFAULT_RETRY_MAX_DELAY_MS: u64 = 20000;
 
+/// Resolved inventory read mode (issue 45, D-modes / Q1). `Auto` (default)
+/// uses the remote manifest when present and valid, else live list+head;
+/// `Manifest` requires a valid manifest (fail closed); `ListHead` never reads
+/// the manifest (debug / bisect / #42 baseline).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InventoryMode {
+    Auto,
+    Manifest,
+    ListHead,
+}
+
 /// Built-in Obsidian default ignore profile (issue #31 / roadmap D3).
 /// Vault-relative; exact strings; single source of truth for docs + resolve.
 /// The `obsidian` profile is the default when `[ignore]` is absent or
@@ -62,6 +73,8 @@ pub struct FileConfig {
     pub ignore: Option<IgnoreConfig>,
     #[serde(default)]
     pub transfer: Option<TransferConfig>,
+    #[serde(default)]
+    pub inventory: Option<InventoryConfig>,
 }
 
 /// `[store]` section. `type` must be `"s3"`; `bucket` is required when the
@@ -110,6 +123,15 @@ pub struct TransferConfig {
     pub retry: Option<RetryConfig>,
 }
 
+/// `[inventory]` section (issue 45, D-config). Optional; `mode` absent =>
+/// `auto`. Unknown keys are rejected loudly (W56) via `deny_unknown_fields`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryConfig {
+    #[serde(default)]
+    pub mode: Option<String>,
+}
+
 /// `[transfer.retry]` section (I8). All fields optional; absent section (or
 /// absent field) resolves to the AWS SDK standard-mode defaults at
 /// [`resolve_settings`] time (3 / 1000 / 20000). Unknown keys are rejected
@@ -146,6 +168,8 @@ pub struct Settings {
     /// single source of truth the CLI compiles into its `IgnoreSet` (issue
     /// #34 D-wire).
     pub resolved_ignore_patterns: Vec<String>,
+    /// Resolved `[inventory].mode` (issue 45): `Auto` when absent.
+    pub inventory_mode: InventoryMode,
 }
 
 /// Resolved retry policy (I8). Milliseconds at this layer; `Duration`
@@ -278,6 +302,7 @@ pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings,
     }
     let (ignore_patterns, resolved_ignore_patterns) = resolve_ignore(cfg.ignore.as_ref())?;
     let retry = resolve_retry(cfg.transfer.as_ref())?;
+    let inventory_mode = resolve_inventory_mode(cfg.inventory.as_ref())?;
     Ok(Settings {
         vault_root,
         store,
@@ -286,7 +311,24 @@ pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings,
         retry,
         ignore_patterns,
         resolved_ignore_patterns,
+        inventory_mode,
     })
+}
+
+/// Resolve `[inventory].mode` (issue 45, W231): absent section or key =>
+/// `Auto`; `"auto"` / `"manifest"` / `"list_head"` map 1:1; unknown values
+/// are loud errors naming the raw value and the allowed set (W56 ethos -
+/// same shape as the W192 ignore profile validation).
+fn resolve_inventory_mode(inventory: Option<&InventoryConfig>) -> Result<InventoryMode, Error> {
+    let mode = inventory.and_then(|i| i.mode.as_deref());
+    match mode {
+        None | Some("auto") => Ok(InventoryMode::Auto),
+        Some("manifest") => Ok(InventoryMode::Manifest),
+        Some("list_head") => Ok(InventoryMode::ListHead),
+        Some(other) => Err(Error::Other(format!(
+            "inventory.mode: unknown mode {other:?} (allowed: \"auto\" | \"manifest\" | \"list_head\")"
+        ))),
+    }
 }
 
 /// Resolve `[ignore]` into `(user patterns, resolved patterns)` (issue #31).
@@ -580,6 +622,64 @@ patterns = [".git/"]
                 "unknown ignore key not named in: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn inventory_mode_absent_defaults_to_auto() {
+        // W231 (issue 45, D-config): `[inventory]` is optional; absent
+        // section (or absent `mode`) resolves to `InventoryMode::Auto`.
+        let cfg = FileConfig::default();
+        assert_eq!(settings(&cfg).unwrap().inventory_mode, InventoryMode::Auto);
+        let cfg = parse_config_str("[inventory]\n").unwrap();
+        assert_eq!(settings(&cfg).unwrap().inventory_mode, InventoryMode::Auto);
+        let cfg = parse_config_str("[inventory]\nmode = \"auto\"\n").unwrap();
+        assert_eq!(settings(&cfg).unwrap().inventory_mode, InventoryMode::Auto);
+    }
+
+    #[test]
+    fn inventory_mode_explicit_values_parse() {
+        // W231 (issue 45): `manifest` and `list_head` resolve to their
+        // variants; the string form round-trips through `FileConfig`.
+        let cfg = parse_config_str("[inventory]\nmode = \"manifest\"\n").unwrap();
+        let inv = cfg.inventory.as_ref().unwrap();
+        assert_eq!(inv.mode.as_deref(), Some("manifest"));
+        assert_eq!(
+            settings(&cfg).unwrap().inventory_mode,
+            InventoryMode::Manifest
+        );
+        let cfg = parse_config_str("[inventory]\nmode = \"list_head\"\n").unwrap();
+        assert_eq!(
+            settings(&cfg).unwrap().inventory_mode,
+            InventoryMode::ListHead
+        );
+    }
+
+    #[test]
+    fn inventory_mode_unknown_is_loud_error() {
+        // W231 (issue 45, W56 ethos): an unknown mode string is rejected
+        // loudly naming the raw value and the allowed set - no soft-default,
+        // no clamping.
+        let cfg = parse_config_str("[inventory]\nmode = \"full\"\n").unwrap();
+        let err = settings(&cfg).unwrap_err();
+        assert!(
+            format!("{err}").contains("inventory.mode"),
+            "unexpected: {err}"
+        );
+        assert!(
+            format!("{err}").contains("\"auto\""),
+            "allowed set not named: {err}"
+        );
+    }
+
+    #[test]
+    fn inventory_config_denies_unknown_fields() {
+        // W231 (issue 45): a typo under `[inventory]` is a loud parse error
+        // (same `deny_unknown_fields` policy as the sibling sections).
+        let err = parse_config_str("[inventory]\nmod = \"auto\"\n").unwrap_err();
+        assert!(
+            format!("{err}").contains("mod"),
+            "unknown inventory key not named: {err}"
+        );
     }
 
     #[test]
