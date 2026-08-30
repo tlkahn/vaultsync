@@ -24,10 +24,11 @@ use crate::plan::{ActionKind, Mode, Plan, PlanOpts};
 use crate::store::ObjectStore;
 
 /// A plan plus the advisory warnings surfaced while building it (dropped
-/// remote keys from the store listing, reserved-namespace leftovers). The CLI
-/// prints `warnings` (one `warning: ...` line each); library consumers may
-/// inspect or ignore them. A struct, not a tuple, so Phase 3 fields extend
-/// without another signature break (H1/W99).
+/// remote keys from the store listing, reserved-namespace leftovers, and
+/// ignore-pattern remote drops). The CLI prints `warnings` (one
+/// `warning: ...` line each); library consumers may inspect or ignore them.
+/// A struct, not a tuple, so Phase 3 fields extend without another signature
+/// break (H1/W99).
 #[derive(Debug, Clone)]
 pub struct PlanReport {
     /// The computed plan.
@@ -51,6 +52,12 @@ pub struct PlanReport {
 /// filter-agnostic - this function narrows the remote list first. An empty
 /// set (the default at most call sites until #34 wires patterns from
 /// settings) matches nothing and behaves exactly like today.
+///
+/// Local entities are **not** filtered by `ignore` in this function - the
+/// local half of D-both-sides is walk-time prune (issue #32). Until #32
+/// lands, a non-empty `IgnoreSet` is remote-only: ignored local paths can
+/// still appear as `Upload` / `DeleteLocal`. Production CLI passes
+/// [`IgnoreSet::empty`] under W25 until #34 wires patterns from settings.
 pub fn build_plan(
     local: &LocalFs,
     store: &dyn ObjectStore,
@@ -251,8 +258,12 @@ fn compute_stats(actions: &[plan::Action]) -> plan::PlanStats {
 
 /// Build a [`Plan`] against a store for a real vault directory (Status mode).
 ///
-/// `ignore` forwards to [`build_plan`]; pass `&IgnoreSet::empty()` if you do
-/// not care (the CLI passes empty under W25 until #34 wires patterns).
+/// This convenience API returns only the [`Plan`] and **discards**
+/// [`PlanReport::warnings`] (store-listing, reserved-namespace, and
+/// ignore-pattern drops). Callers that need warnings must use [`build_plan`]
+/// directly. `ignore` forwards to [`build_plan`]; pass `&IgnoreSet::empty()`
+/// if you do not care (the CLI passes empty under W25 until #34 wires
+/// patterns).
 pub fn status_with_store(
     vault: &Path,
     store: &dyn ObjectStore,
