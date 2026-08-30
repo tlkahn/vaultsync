@@ -232,6 +232,15 @@ pub struct EnvSnapshot {
 
 /// Merge config + env into a [`Settings`]. Pure: no IO, no network.
 ///
+/// Ignore resolution (issue #31, D3/D-w25-seq): `[ignore].profile` selects
+/// the built-in Obsidian default (absent key => `"obsidian"`; `"none"`
+/// disables it; unknown values are loud errors). User `[ignore].patterns`
+/// **extend** the active profile (union, exact-string dedup, validated via
+/// `IgnoreSet` - see [`resolve_ignore`]). `Settings.ignore_patterns` stays
+/// raw user patterns only (W25/M3 gates on it until #34); the fully resolved
+/// list lands on `Settings.resolved_ignore_patterns`, which #34 reads when it
+/// retires W25.
+///
 /// W83/r9 N1: the `--vault`/config merge no longer lives here (the old
 /// `cli: &Cli` parameter was test-only in production - the sole production
 /// call passed `Cli::default()`); the single merge site is
@@ -292,8 +301,8 @@ pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings,
 fn resolve_ignore(ignore: Option<&IgnoreConfig>) -> Result<(Vec<String>, Vec<String>), Error> {
     let user = ignore.map(|i| i.patterns.clone()).unwrap_or_default();
     // D3/D-profile-values: absent profile (or `None`) -> `obsidian`;
-    // `profile = "none"` disables built-ins (escape hatch). Unknown values
-    // become loud errors in W192 (not yet wired).
+    // `profile = "none"` disables built-ins (escape hatch); unknown values
+    // are loud errors (W192, below).
     let profile = ignore.and_then(|i| i.profile.as_deref());
     // W192: unknown profile values (incl. "", "Obsidian", "none ") are
     // loud errors naming the raw value and the allowed set - no soft-default,
