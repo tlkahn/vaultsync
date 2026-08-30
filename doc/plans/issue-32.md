@@ -1,6 +1,9 @@
 # Issue 32 plan: Apply ignore patterns in the local walker
 
-**Status:** planned (not started)
+**Status:** implemented (W195-W201 landed on this worktree: commits
+`5d9048c` W195 .. `aa0e5d6` W200 + W201 docs; offline lib+bin tests 462
+passed / 0 failed / 1 ignored, clippy `-D warnings` and fmt clean at each
+commit)
 **Issue:** https://github.com/tlkahn/vaultsync/issues/32 (OPEN; P1 of epic #9)
 **Branch:** `worktree-apply-ignore-patterns-in-the-local-walker` (this worktree; cut from
 `main` tip `b1af61c` - Issue 30 / PR 35 merged)

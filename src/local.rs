@@ -1,6 +1,16 @@
 //! Local filesystem walker: turns a vault directory tree into [`Entity`] keys.
 //!
 //! Walker omissions (Phase 1, all silent and by design):
+//! - paths matching the configured [`IgnoreSet`] (issue #32) are skipped:
+//!   a matching directory is **pruned** (no folder entity, no recursion -
+//!   D-prune, so `.git/objects/...` is never walked), a matching file is
+//!   skipped; [`WalkReport::skipped_ignored`] counts each pruned directory
+//!   and each skipped file exactly once (D-report). Reserved-namespace
+//!   skips stay in `skipped_temp_files` and are never re-labeled as ignored
+//!   (D-filter-order: reserved first, independent). An empty `IgnoreSet`
+//!   attached via [`LocalFs::with_ignore`] preserves pre-ignore walk
+//!   behavior; the CLI wires `[ignore]` patterns in issue #34, the remote
+//!   half is #33.
 //! - symlinks - files **and** directories - are skipped entirely
 //!   (`--follow-symlinks` is a Phase 2 policy decision, P1r4-symlink);
 //! - a symlinked vault **root** is followed (`fs::metadata` on the root
