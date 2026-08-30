@@ -263,6 +263,139 @@ pub(crate) fn apply_commit_mutations(
     map.into_values().collect()
 }
 
+/// Repair options (issue 45, D-repair / section 10).
+#[derive(Debug, Clone)]
+pub struct RepairOpts {
+    /// Overwrite the manifest unconditionally (no If-Match; used after a
+    /// bootstrap or when the current etag is unknown/skewed).
+    pub force: bool,
+    /// Compute the body and report the entry count but write nothing.
+    pub dry_run: bool,
+    /// Bounds the cold list+head path's heads (via the store).
+    pub concurrency: u32,
+}
+
+/// Report of a repair run (W241).
+#[derive(Debug, Clone)]
+pub struct RepairReport {
+    /// Number of file entities listed via live list+head (pre-ignore,
+    /// post-reserved).
+    pub listed: usize,
+    /// Whether the manifest object was written this run.
+    pub written: bool,
+    /// True when `dry_run` was set (body computed, nothing written).
+    pub dry_run: bool,
+    /// The manifest object's etag after the run (None on dry run / backend
+    /// without etags).
+    pub etag: Option<String>,
+    /// Advisory warnings from the cold listing (reserved drops, store
+    /// warnings).
+    pub warnings: Vec<String>,
+}
+
+/// Rebuild the remote manifest from a live list+head (W241, section 10.2):
+/// I15 stays intact (cold path is authoritative), reserved keys are stripped,
+/// and the body is written conditionally - If-Match the current manifest
+/// etag when one exists (retry once on a lost race), If-None-Match: * when
+/// creating, unconditional under `--force`. Never mutates file bodies
+/// (10.4). `dry_run` computes the body but writes nothing.
+pub fn repair_manifest(
+    store: &dyn ObjectStore,
+    opts: &RepairOpts,
+    _cache: Option<&CachePaths>,
+) -> Result<RepairReport, Error> {
+    let inv = live_list_head(store)?;
+    let files = &inv.base.file_entities;
+    let created_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let manifest = crate::manifest::file_entities_to_manifest(
+        files,
+        created_ms,
+        Some(format!("vaultsync {}", crate::version())),
+        None,
+    )?;
+    let body = crate::manifest::serialize_manifest(&manifest)?;
+    if opts.dry_run {
+        return Ok(RepairReport {
+            listed: files.len(),
+            written: false,
+            dry_run: true,
+            etag: None,
+            warnings: inv.warnings,
+        });
+    }
+    let body_len = body.len() as u64;
+    if opts.force {
+        let mut cursor = std::io::Cursor::new(body);
+        store.put_from_with(
+            crate::local::MANIFEST_KEY,
+            &mut cursor,
+            body_len,
+            crate::store::PutOpts::default(),
+        )?;
+    } else {
+        match store.head(crate::local::MANIFEST_KEY) {
+            Ok(cur) => {
+                let etag = cur.etag;
+                let mut cursor = std::io::Cursor::new(body.clone());
+                match store.put_from_with(
+                    crate::local::MANIFEST_KEY,
+                    &mut cursor,
+                    body_len,
+                    crate::store::PutOpts {
+                        if_match_etag: etag,
+                        ..Default::default()
+                    },
+                ) {
+                    Ok(_) => {}
+                    // Lost the race: retry ONCE against a fresh head.
+                    Err(Error::PreconditionFailed(_)) => {
+                        let cur = store.head(crate::local::MANIFEST_KEY)?;
+                        let mut cursor = std::io::Cursor::new(body);
+                        store.put_from_with(
+                            crate::local::MANIFEST_KEY,
+                            &mut cursor,
+                            body_len,
+                            crate::store::PutOpts {
+                                if_match_etag: cur.etag,
+                                ..Default::default()
+                            },
+                        )?;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            // No manifest yet: create (If-None-Match: *).
+            Err(Error::NotFound(_)) => {
+                let mut cursor = std::io::Cursor::new(body);
+                store.put_from_with(
+                    crate::local::MANIFEST_KEY,
+                    &mut cursor,
+                    body_len,
+                    crate::store::PutOpts {
+                        if_none_match_star: true,
+                        ..Default::default()
+                    },
+                )?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let etag = store
+        .head(crate::local::MANIFEST_KEY)
+        .ok()
+        .and_then(|e| e.etag);
+    Ok(RepairReport {
+        listed: files.len(),
+        written: true,
+        dry_run: false,
+        etag,
+        warnings: inv.warnings,
+    })
+}
+
 /// Commit a new manifest after a mutating push (W238, D-commit-cond):
 /// bodies are already live (transfers ran first); this writes the manifest
 /// LAST (D-commit-order) with a conditional put - If-Match on the base etag
@@ -691,5 +824,141 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(out, GetOutcome::NotModified(_)));
+    }
+
+    #[test]
+    fn repair_writes_valid_manifest_from_live_list() {
+        // W241 (issue 45): repair rebuilds the manifest from live list+head
+        // (I15-authoritative), matching the live files. With no manifest
+        // present it creates via If-None-Match: *; reserved control-plane
+        // keys never become entries.
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"aaa".to_vec());
+        store
+            .put_from("notes/a.md", &mut c, 3, Some(1_600_000_000_000))
+            .unwrap();
+        let mut c = std::io::Cursor::new(b"j".to_vec());
+        store
+            .put_from("b.md", &mut c, 1, Some(1_600_000_000_000))
+            .unwrap();
+        // A stray control-plane object must never become a manifest entry
+        // (reserved strip happens before the body is built).
+        let mut c = std::io::Cursor::new(b"stray".to_vec());
+        store
+            .put_from(
+                ".vaultsync/cache/stale.json",
+                &mut c,
+                "stray".len() as u64,
+                None,
+            )
+            .unwrap();
+        let rep = repair_manifest(
+            &store,
+            &RepairOpts {
+                force: false,
+                dry_run: false,
+                concurrency: 1,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(rep.listed, 2);
+        assert!(rep.written);
+        assert!(!rep.dry_run);
+        assert!(rep.etag.is_some());
+        let mut buf = Vec::new();
+        store.get_to(crate::local::MANIFEST_KEY, &mut buf).unwrap();
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        let keys: Vec<&str> = m.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["b.md", "notes/a.md"]);
+        assert_eq!(m.entries[0].size, 1);
+        assert_eq!(m.entries[1].mtime_ms, Some(1_600_000_000_000));
+    }
+
+    #[test]
+    fn repair_dry_run_writes_nothing() {
+        // W241 (issue 45): `--dry-run` computes the body (entry count) but
+        // writes nothing - no manifest object appears.
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"aaa".to_vec());
+        store
+            .put_from("a.md", &mut c, 3, Some(1_600_000_000_000))
+            .unwrap();
+        let rep = repair_manifest(
+            &store,
+            &RepairOpts {
+                force: false,
+                dry_run: true,
+                concurrency: 1,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(rep.listed, 1);
+        assert!(rep.dry_run);
+        assert!(!rep.written);
+        assert!(matches!(
+            store.head(crate::local::MANIFEST_KEY).unwrap_err(),
+            Error::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn repair_force_overwrites_existing_manifest() {
+        // W241 (issue 45): a manifest that exists is replaced by repair
+        // (conditional If-Match when the etag is current; the mock answers
+        // correctly). `--force` also overwrites without any condition.
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"aaa".to_vec());
+        store
+            .put_from("a.md", &mut c, 3, Some(1_600_000_000_000))
+            .unwrap();
+        // Stale/corrupt manifest body on the remote.
+        let mut c = std::io::Cursor::new(b"corrupt".to_vec());
+        store
+            .put_from(
+                crate::local::MANIFEST_KEY,
+                &mut c,
+                "corrupt".len() as u64,
+                None,
+            )
+            .unwrap();
+        // Without force: conditional If-Match on the CURRENT etag succeeds.
+        let rep = repair_manifest(
+            &store,
+            &RepairOpts {
+                force: false,
+                dry_run: false,
+                concurrency: 1,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(rep.written);
+        let mut buf = Vec::new();
+        store.get_to(crate::local::MANIFEST_KEY, &mut buf).unwrap();
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        assert_eq!(m.entry_count, 1);
+        assert_eq!(m.entries[0].key, "a.md");
+        // Force overwrites a manifest whose etag we don't hold (no
+        // condition at all): simulate by putting a fresh manifest first.
+        let mut c = std::io::Cursor::new(b"zzz".to_vec());
+        store.put_from("z.md", &mut c, 3, Some(2)).unwrap();
+        let rep = repair_manifest(
+            &store,
+            &RepairOpts {
+                force: true,
+                dry_run: false,
+                concurrency: 1,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(rep.written);
+        let mut buf = Vec::new();
+        store.get_to(crate::local::MANIFEST_KEY, &mut buf).unwrap();
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        let keys: Vec<&str> = m.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["a.md", "z.md"]);
     }
 }
