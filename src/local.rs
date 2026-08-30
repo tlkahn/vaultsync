@@ -23,11 +23,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::entity::Entity;
 use crate::error::Error;
+use crate::ignore::IgnoreSet;
 
 /// Walks a vault root directory.
 pub struct LocalFs {
     root: PathBuf,
     follow_symlinks: bool,
+    /// Compiled ignore patterns applied during the walk (issue #32). Empty by
+    /// default (`new` / `with_follow`); attach via [`LocalFs::with_ignore`].
+    /// An empty set preserves today's walk behavior exactly. CLI wiring of
+    /// `[ignore]` patterns is issue #34; the remote filter is #33.
+    ignore: IgnoreSet,
     /// Walk report, mutated at the end of a walk and read by `report()`.
     /// `Mutex` (not `RefCell`) so `LocalFs` is `Send`/`Sync` ahead of Phase 3
     /// concurrency (W82/r8a-2); single-threaded callers see no difference.
@@ -68,6 +74,13 @@ pub struct WalkReport {
     /// crash leftover `.*.vaultsync-tmp-*` or `.vaultsync-check-*` is never
     /// surfaced as a real key. W41 reports this count on stderr.
     pub skipped_temp_files: u32,
+    /// Local paths skipped by the configured [`IgnoreSet`] (issue #32).
+    /// Counting rule (D-report): each ignored **file** counts 1; each
+    /// **pruned directory** counts 1 (the directory key matched; unvisited
+    /// descendants are **not** counted). Reserved-namespace skips stay in
+    /// `skipped_temp_files` and are not double-counted here. CLI printing of
+    /// this count is issue #34.
+    pub skipped_ignored: u32,
     /// Keys of followed *file* symlinks (R4-M1/W38). The planner uses this to
     /// mark such rows `Skip(followed_symlink)` in mutating modes: the walker
     /// follows them (inventory), but transfers refuse to open a symlink, so
@@ -79,8 +92,11 @@ pub struct WalkReport {
 }
 
 /// Walker mode flags.
-struct WalkOpts {
+struct WalkOpts<'a> {
     follow_symlinks: bool,
+    /// Compiled ignore set threaded through the recursion (issue #32). Empty
+    /// set = pre-ignore behavior.
+    ignore: &'a IgnoreSet,
 }
 
 impl LocalFs {
@@ -89,6 +105,7 @@ impl LocalFs {
         LocalFs {
             root: root.into(),
             follow_symlinks: false,
+            ignore: empty_ignore_set(),
             report: std::sync::Mutex::new(WalkReport::default()),
             root_canon: std::sync::OnceLock::new(),
             dir_create_lock: std::sync::Mutex::new(()),
@@ -101,10 +118,27 @@ impl LocalFs {
         LocalFs {
             root: root.into(),
             follow_symlinks,
+            ignore: empty_ignore_set(),
             report: std::sync::Mutex::new(WalkReport::default()),
             root_canon: std::sync::OnceLock::new(),
             dir_create_lock: std::sync::Mutex::new(()),
         }
+    }
+
+    /// Attach a compiled ignore set applied during the walk (issue #32).
+    /// Empty set preserves pre-ignore walk behavior. Chain after `new` /
+    /// `with_follow`; later construction (e.g. issue #34's CLI wiring) sets
+    /// it without a combinatorial constructor explosion.
+    ///
+    /// Pattern shapes follow `IgnoreSet` semantics (issue #30): dir patterns
+    /// are vault-rooted **path prefixes** (`.git/` matches `.git/objects/...`
+    /// but never `nested/.git/` or `foo.git`); basename patterns match the
+    /// final segment anywhere (`.DS_Store` matches `notes/.DS_Store`). The
+    /// match subject is the vault-relative key of the walked path only - a
+    /// followed symlink's canonical target path is not re-matched.
+    pub fn with_ignore(mut self, ignore: IgnoreSet) -> Self {
+        self.ignore = ignore;
+        self
     }
 
     /// Canonicalized vault root, computed once per [`LocalFs`] and cached
@@ -152,6 +186,7 @@ impl LocalFs {
         let mut out = Vec::new();
         let opts = WalkOpts {
             follow_symlinks: self.follow_symlinks,
+            ignore: &self.ignore,
         };
         // W81/r8a-1: the canonicalized root is computed once per LocalFs and
         // threaded through the walk, instead of being re-canonicalized per
@@ -1119,6 +1154,14 @@ fn is_empty_dir(d: &Path) -> std::io::Result<bool> {
     Ok(rd.next().is_none())
 }
 
+/// Empty compiled ignore set: matches nothing (pre-ignore walk behavior).
+/// Used by the default constructors so `new` / `with_follow` stay
+/// non-breaking (D-library-seam); `IgnoreSet` keeps no `Default` impl so
+/// #30's API surface stays stable.
+fn empty_ignore_set() -> IgnoreSet {
+    IgnoreSet::from_patterns(&[]).expect("empty pattern list always compiles")
+}
+
 fn walk(
     dir: &Path,
     root: &Path,
@@ -1128,6 +1171,7 @@ fn walk(
     report: &mut WalkReport,
     visited: &mut std::collections::HashSet<PathBuf>,
 ) -> Result<(), Error> {
+    let _ = opts.ignore; // threaded; matching applied in W196/W197
     // `NotFound` here means the directory vanished after its parent
     // enumerated it (or between `read_dir` and first use): skip silently.
     // All other IO errors (permission, etc.) stay fatal.
@@ -1153,7 +1197,15 @@ fn walk(
                 report.skipped_symlinks += 1;
                 continue;
             }
-            handle_followed_symlink(&entry.path(), root, root_canon, out, report, visited)?;
+            handle_followed_symlink(
+                &entry.path(),
+                root,
+                root_canon,
+                out,
+                report,
+                visited,
+                opts.ignore,
+            )?;
             continue;
         }
         let path = entry.path();
@@ -1197,7 +1249,9 @@ fn handle_followed_symlink(
     out: &mut Vec<Entity>,
     report: &mut WalkReport,
     visited: &mut std::collections::HashSet<PathBuf>,
+    ignore: &IgnoreSet,
 ) -> Result<(), Error> {
+    let _ = ignore; // threaded; matching applied in W200
     let rel = path
         .strip_prefix(root)
         .map_err(|_| Error::Other(format!("walk symlink escaped root: {}", path.display())))?;
@@ -1272,6 +1326,7 @@ fn handle_followed_symlink(
             out,
             &WalkOpts {
                 follow_symlinks: true,
+                ignore,
             },
             report,
             visited,
@@ -1631,6 +1686,7 @@ mod tests {
             &mut out,
             &WalkOpts {
                 follow_symlinks: false,
+                ignore: &empty_ignore_set(),
             },
             &mut report,
             &mut visited,
@@ -2406,6 +2462,36 @@ mod tests {
         let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(keys, vec!["note.md"], "tmp sibling listed: {keys:?}");
         assert_eq!(rep.skipped_temp_files, 1);
+    }
+
+    #[test]
+    fn walk_empty_ignore_set_unchanged() {
+        // W195 back-compat (D-library-seam): an empty `IgnoreSet` attached via
+        // `LocalFs::with_ignore` must produce the exact same inventory and
+        // report as a default `LocalFs` - empty set = pre-ignore walk behavior.
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::write(dir.join("note.md"), "hi").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/a.md"), "yo").unwrap();
+        let fs = LocalFs::new(dir.path());
+        let (ents, rep) = fs.list_report().unwrap();
+        let fs2 = LocalFs::new(dir.path()).with_ignore(IgnoreSet::from_patterns(&[]).unwrap());
+        let (ents2, rep2) = fs2.list_report().unwrap();
+        let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
+        let keys2: Vec<&str> = ents2.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            keys, keys2,
+            "empty ignore set changed the inventory: {keys:?} vs {keys2:?}"
+        );
+        assert_eq!(
+            rep2.skipped_ignored, 0,
+            "empty ignore set must skip nothing"
+        );
+        assert_eq!(rep2.skipped_temp_files, rep.skipped_temp_files);
+        assert_eq!(rep2.skipped_symlinks, rep.skipped_symlinks);
+        assert_eq!(rep2.warnings, rep.warnings);
+        // D-report: the field exists and defaults to 0 (no increments yet).
+        assert_eq!(WalkReport::default().skipped_ignored, 0);
     }
 
     #[test]
