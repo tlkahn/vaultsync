@@ -2264,6 +2264,72 @@ mod tests {
     }
 
     #[test]
+    fn status_user_patterns_extend_default_profile() {
+        // Issue #34 D3-extend: user patterns UNION with the Obsidian
+        // built-ins - `private/` (user pattern) and workspace.json (built-in)
+        // are both pruned while notes/a.md stays listed.
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::create_dir_all(dir.join("private")).unwrap();
+        std::fs::create_dir_all(dir.join(".obsidian")).unwrap();
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join("private/secret.md"), "s").unwrap();
+        std::fs::write(dir.join(".obsidian/workspace.json"), "{}").unwrap();
+        std::fs::write(dir.join("notes/a.md"), "hi").unwrap();
+        let settings = settings_with_ignore(dir.path(), vec!["private/"]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings(
+            Command::status(dir.path().into()),
+            &settings,
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(code, 2, "dirty plan; stderr: {err}");
+        assert!(
+            out.lines().any(|l| l.starts_with("U  notes/a.md")),
+            "notes/a.md kept: {out}"
+        );
+        assert!(!out.contains("private/"), "user pattern pruned: {out}");
+        assert!(
+            !out.contains("workspace.json"),
+            "built-in pattern still pruned: {out}"
+        );
+    }
+
+    #[test]
+    fn check_with_ignore_patterns_does_not_refuse() {
+        // Issue #34 W25 retirement + D-wire: `check` with non-empty user
+        // ignore patterns must NOT be refused for Phase 3 - it falls through
+        // to the store requirement (empty bucket => exit 1, `[store]`
+        // message) with no Phase 3 ignore text.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let settings = settings_with_ignore(dir.path(), vec![".trash/"]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings(
+            Command::check(),
+            &settings,
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(code, 1, "store requirement failure; stderr: {err}");
+        assert!(!err.contains("Phase 3"), "no W25 refusal: {err}");
+        assert!(
+            err.to_lowercase().contains("store"),
+            "failure must be the store requirement: {err}"
+        );
+        assert!(
+            !String::from_utf8(out).unwrap().contains("check: ok"),
+            "must not be a mock green check"
+        );
+    }
+
+    #[test]
     fn status_absent_ignore_resolve_does_not_warn_phase3() {
         // F3/W196 (PR 38 r1): D-w25-seq locked through the CLI gate, not only
         // at B5. A real TOML-less FileConfig (absent `[ignore]`) resolves to
