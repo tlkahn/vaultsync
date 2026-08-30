@@ -28,6 +28,8 @@ pub struct IgnoreSet {
 enum Rule {
     /// Final-segment equality (no `/` in pattern, no `*`).
     Basename(String),
+    /// Full-key equality (has `/`, no trailing `/`, no `*`).
+    Exact(String),
     /// Dir prefix: literal string including trailing `/` when no globs.
     DirPrefix(String),
 }
@@ -53,8 +55,8 @@ impl IgnoreSet {
 
 /// Compile one raw pattern into a [`Rule`]. Slash-free, metachar-free
 /// patterns become basename-anywhere; trailing-slash patterns become a dir
-/// prefix; other shapes are rejected until their work item lands (W181 exact
-/// path, W182 segment `*`).
+/// prefix; slash-bearing non-dir patterns become an exact key; the segment
+/// `*` shape is rejected until W182.
 fn compile_pattern(pat: &str) -> Result<Rule, Error> {
     if pat.ends_with('/') {
         return Ok(Rule::DirPrefix(pat.to_string()));
@@ -62,6 +64,9 @@ fn compile_pattern(pat: &str) -> Result<Rule, Error> {
     let segments: Vec<&str> = pat.split('/').collect();
     if segments.len() == 1 && !pat.contains('*') {
         return Ok(Rule::Basename(pat.to_string()));
+    }
+    if segments.len() > 1 && !pat.contains('*') {
+        return Ok(Rule::Exact(pat.to_string()));
     }
     Err(Error::Other(
         "ignore pattern shape not yet implemented".to_string(),
@@ -72,6 +77,7 @@ impl Rule {
     fn matches(&self, key: &str) -> bool {
         match self {
             Rule::Basename(name) => final_segment(key) == name,
+            Rule::Exact(s) => key == s,
             Rule::DirPrefix(prefix) => key == prefix || key.starts_with(prefix),
         }
     }
@@ -163,6 +169,50 @@ mod tests {
             // the vault-root pattern (unlike basename `.DS_Store`). Pin so
             // #32 cannot invent basename-dir behavior later.
             (&[".trash/"], "notes/.trash/", false),
+        ];
+        for (patterns, key, expect) in cases {
+            let set = set(patterns);
+            assert_eq!(
+                set.matches(key),
+                *expect,
+                "patterns {patterns:?} key {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignore_set_exact_workspace_json() {
+        // Slash-bearing, no trailing `/`, no `*`: exact full-key equality
+        // only. No prefix behavior, no basename behavior.
+        let cases: &[(&[&str], &str, bool)] = &[
+            (
+                &[".obsidian/workspace.json"],
+                ".obsidian/workspace.json",
+                true,
+            ),
+            (&[".obsidian/workspace.json"], ".obsidian/workspace", false),
+            (
+                &[".obsidian/workspace.json"],
+                ".obsidian/workspace-mobile.json",
+                false,
+            ),
+            (
+                &[".obsidian/workspace.json"],
+                ".obsidian/workspace.json/extra",
+                false,
+            ),
+            (
+                &[".obsidian/workspace.json"],
+                ".obsidian/workspace.json/",
+                false,
+            ),
+            (
+                &[".obsidian/workspace.json"],
+                "x/.obsidian/workspace.json",
+                false,
+            ),
+            (&[".obsidian/workspace"], ".obsidian/workspace", true),
+            (&[".obsidian/workspace"], ".obsidian/workspace.json", false),
         ];
         for (patterns, key, expect) in cases {
             let set = set(patterns);
