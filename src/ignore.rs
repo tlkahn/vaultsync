@@ -613,6 +613,11 @@ mod tests {
             (".trash/foo.md", true),
             ("notes/.DS_Store", true),
             ("notes/foo.md", false),
+            // The workspace trio are exact *file* patterns: the folder form
+            // of the same path must NOT match (Exact is string equality).
+            (".obsidian/workspace", true),
+            (".obsidian/workspace/", false),
+            (".obsidian/workspace.json/", false),
         ];
         for (key, expect) in cases {
             assert_eq!(set.matches(key), *expect, "key {key:?}");
