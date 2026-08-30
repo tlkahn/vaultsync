@@ -291,12 +291,21 @@ pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings,
 /// D-w25-seq).
 fn resolve_ignore(ignore: Option<&IgnoreConfig>) -> Result<(Vec<String>, Vec<String>), Error> {
     let user = ignore.map(|i| i.patterns.clone()).unwrap_or_default();
-    // W188 baseline: absent section / absent profile -> the Obsidian built-ins.
-    // (W189 adds `profile = "none"`; W190 appends user patterns.)
-    let resolved: Vec<String> = OBSIDIAN_DEFAULT_IGNORE_PATTERNS
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    // D3/D-profile-values: absent profile (or `None`) -> `obsidian`;
+    // `profile = "none"` disables built-ins (escape hatch). Unknown values
+    // become loud errors in W192 (not yet wired).
+    let profile = ignore.and_then(|i| i.profile.as_deref());
+    let resolved: Vec<String> = match profile {
+        // W189: `none` -> no built-ins; the user list is the whole resolved
+        // list (union with the empty profile).
+        Some("none") => user.clone(),
+        // W188: `obsidian` / absent key -> the built-in Obsidian set.
+        // (W190 appends user patterns after the built-ins.)
+        _ => OBSIDIAN_DEFAULT_IGNORE_PATTERNS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    };
     Ok((user, resolved))
 }
 
@@ -534,6 +543,26 @@ patterns = [".git/"]
                 "unknown ignore key not named in: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn resolve_profile_none_plus_user() {
+        // Issue #31 (D3 escape hatch): `profile = "none"` disables the
+        // built-in Obsidian set; the resolved list is exactly the user
+        // patterns. RED: today `profile` is ignored, so the six built-ins
+        // leak into the resolved list.
+        let text = "[ignore]\nprofile = \"none\"\npatterns = [\"private/\"]\n";
+        let cfg = parse_config_str(text).unwrap();
+        let s = settings(&cfg).unwrap();
+        assert_eq!(s.ignore_patterns, vec!["private/".to_string()]);
+        assert_eq!(s.resolved_ignore_patterns, vec!["private/".to_string()]);
+
+        // `profile = "none"` with no patterns -> both empty.
+        let text = "[ignore]\nprofile = \"none\"\n";
+        let cfg = parse_config_str(text).unwrap();
+        let s = settings(&cfg).unwrap();
+        assert!(s.ignore_patterns.is_empty());
+        assert!(s.resolved_ignore_patterns.is_empty());
     }
 
     #[test]
