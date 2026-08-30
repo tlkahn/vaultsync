@@ -7,6 +7,8 @@ pub mod config;
 pub mod entity;
 pub mod error;
 pub mod exec;
+pub mod ignore;
+pub use ignore::IgnoreSet;
 pub mod local;
 pub mod plan;
 pub(crate) mod pool;
