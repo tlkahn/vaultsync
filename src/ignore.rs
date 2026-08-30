@@ -104,6 +104,12 @@ fn compile_pattern(pat: &str) -> Result<Rule, Error> {
     if pat.contains('?') {
         return Err(invalid(pat, "'?' is not supported"));
     }
+    // Control characters anywhere in the raw pattern (parity with
+    // ensure_valid_key), checked pre-split so e.g. "a/\nb" fails on
+    // `control` rather than a confusing segment split.
+    if pat.chars().any(char::is_control) {
+        return Err(invalid(pat, "control characters are not allowed"));
+    }
     // A single trailing empty segment (the pattern ended with `/`) sets the
     // dir form and is not a match segment; any other empty segment rejects.
     let dir = pat.ends_with('/');
@@ -112,6 +118,12 @@ fn compile_pattern(pat: &str) -> Result<Rule, Error> {
     for seg in &segments {
         if seg.is_empty() {
             return Err(invalid(pat, "pattern contains an empty path segment"));
+        }
+        if *seg == "." || *seg == ".." {
+            return Err(invalid(pat, "'.' or '..' path segments are not allowed"));
+        }
+        if seg.chars().all(char::is_whitespace) {
+            return Err(invalid(pat, "whitespace-only path segment is not allowed"));
         }
     }
     let has_star = segments.iter().any(|s| s.contains('*'));
@@ -452,6 +464,53 @@ mod tests {
             for t in *tokens {
                 assert!(msg.contains(t), "token {t:?} missing in {msg:?}");
             }
+        }
+    }
+
+    #[test]
+    fn ignore_set_rejects_dot_whitespace_control() {
+        // Loud rejects for patterns that could never name a real entity
+        // segment, mirroring `ensure_valid_key` segment rules: `.` / `..`
+        // segments, whitespace-only segments, and control characters.
+        // Dotfile *names* (.DS_Store, .git/, .obsidian/...) stay valid.
+        let cases: &[(&str, &[&str])] = &[
+            (".", &["'.'"]),
+            ("..", &["'..'"]),
+            ("foo/.", &["'.'"]),
+            ("foo/../bar", &["'..'"]),
+            (" ", &["whitespace"]),
+            ("  ", &["whitespace"]),
+            ("a/ /b", &["whitespace"]),
+            ("a/\tb", &["control"]),
+            ("a/\u{0}b", &["control"]),
+            ("a/\nb", &["control"]),
+        ];
+        for (pat, tokens) in cases {
+            let err = IgnoreSet::from_patterns(&[pat.to_string()]).unwrap_err();
+            let msg = err.to_string();
+            // `invalid` names the pattern via `{pat:?}` (control chars appear
+            // Debug-escaped, e.g. `\t`), so match against that form.
+            let named = format!("{pat:?}");
+            assert!(msg.contains(&named), "pattern {pat:?} not named in {msg:?}");
+            for t in *tokens {
+                assert!(msg.contains(t), "token {t:?} missing in {msg:?}");
+            }
+        }
+        // Keep-green: dotfile names and star patterns must still compile.
+        let ok: &[&str] = &[
+            ".DS_Store",
+            ".git/",
+            ".obsidian/workspace.json",
+            "foo.bar",
+            "*",
+            "*.tmp",
+            ".obsidian/workspace*",
+        ];
+        for pat in ok {
+            assert!(
+                IgnoreSet::from_patterns(&[pat.to_string()]).is_ok(),
+                "pattern {pat:?} should compile"
+            );
         }
     }
 
