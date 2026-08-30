@@ -491,6 +491,17 @@ fn print_walk_warnings(local: &crate::local::LocalFs, follow: bool, err: &mut dy
             rep.skipped_temp_files
         );
     }
+    if rep.skipped_ignored > 0 {
+        // Issue #34 D-report local half (locked string): always-on (not
+        // -v-only), count-only (no key dump - a pathological pattern set
+        // must not flood stderr). The remote half is a PlanReport warning
+        // printed by the dispatch loops above.
+        let _ = writeln!(
+            err,
+            "warning: ignored {} local path(s) by ignore patterns",
+            rep.skipped_ignored
+        );
+    }
 }
 
 /// Push/pull value flags bundled so `dispatch_plan` stays under clippy's
@@ -2147,6 +2158,109 @@ mod tests {
             "ignored local file survives the pull --delete"
         );
         assert!(dir.join("notes/a.md").exists(), "a.md intact");
+    }
+
+    #[test]
+    fn status_reports_skipped_ignored() {
+        // Issue #34 D-report local half (issue sketch exact name): when the
+        // walk prunes/skips > 0 paths by ignore patterns, the CLI always
+        // prints the locked count line (not -v-only, no key dump). Fixture
+        // counting (issue #32 D-report): each pruned dir counts 1 (`.trash/`,
+        // `.git/`), each ignored file counts 1 (`workspace.json`,
+        // `.DS_Store`) => exactly 4. RED today: `print_walk_warnings` has no
+        // `skipped_ignored` branch.
+        let dir = TempDir::new("vaultsync-cli-test");
+        write_default_profile_vault(&dir);
+        let settings = no_store_settings(dir.path());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings(
+            Command::status(dir.path().into()),
+            &settings,
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        let _out = String::from_utf8(out).unwrap();
+        assert_eq!(code, 2, "stderr: {err}");
+        assert!(
+            err.contains("warning: ignored 4 local path(s) by ignore patterns"),
+            "exact local ignore count line expected: {err}"
+        );
+        // the warning is count-only - no per-key dump of ignored names
+        assert!(!err.contains("workspace.json"), "no key dump: {err}");
+    }
+
+    #[test]
+    fn push_reports_remote_ignored_count() {
+        // Issue #34 D-report remote half at the CLI: the #33 remote ignore
+        // partition's `PlanReport.warnings` entry must surface as a
+        // `warning: ...` stderr line - count-only (no key names in that
+        // line). Already produced by `ignored_remote_drops_warning` + the
+        // dispatch warning loop once W205 wired the real set; this pins the
+        // CLI half.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = MemoryStore::new();
+        let mut c1 = std::io::Cursor::new(b"{}".to_vec());
+        store
+            .put_from(".obsidian/workspace.json", &mut c1, 2, Some(100))
+            .unwrap();
+        let mut c2 = std::io::Cursor::new(b"x".to_vec());
+        store
+            .put_from(".trash/x.md", &mut c2, 1, Some(100))
+            .unwrap();
+        let mut settings = no_store_settings(dir.path());
+        settings.store.bucket = "b".to_string(); // store injected below
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings_store(
+            Command::push(dir.path().into(), false),
+            &settings,
+            &store,
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        let _out = String::from_utf8(out).unwrap();
+        assert_eq!(code, 0, "stderr: {err}");
+        // `.trash/` folder marker (MemoryStore lists ancestor folders) + the
+        // two keys => 3 dropped.
+        assert!(
+            err.contains("warning: ignored 3 remote key(s) by ignore patterns"),
+            "remote ignore count line expected: {err}"
+        );
+        assert!(
+            !err.contains(".obsidian/workspace.json") && !err.contains(".trash/x.md"),
+            "no per-key dump in the warning: {err}"
+        );
+    }
+
+    #[test]
+    fn status_no_local_ignore_warning_when_zero() {
+        // Issue #34 D-report N==0: no local ignore line when nothing was
+        // skipped by ignore patterns (`profile = "none"` + a clean vault).
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join("notes/a.md"), "hi").unwrap();
+        let settings = settings_profile_none(dir.path(), vec![]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings(
+            Command::status(dir.path().into()),
+            &settings,
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        let _out = String::from_utf8(out).unwrap();
+        assert_eq!(code, 2, "dirty plan; stderr: {err}");
+        assert!(
+            !err.contains("local path(s) by ignore patterns"),
+            "no ignore line when N == 0: {err}"
+        );
     }
 
     #[test]
