@@ -5,15 +5,21 @@ on:
     types: [opened]
 
 permissions:
+  contents: read
+  issues: write
   pull-requests: write
 
 jobs:
   auto-assign:
     runs-on: ubuntu-latest
     steps:
-      - name: Assign lgsunnyvale as assignee
+      - name: Assign and request review from lgsunnyvale
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
         run: |
-          gh pr edit "$PR" --add-assignee lgsunnyvale
+          # GH_REPO is required: this job does not check out the repo, so gh
+          # cannot discover owner/name via git.
+          # issues:write is required: PR assignees are set through the Issues API.
+          gh pr edit "$PR" --add-assignee lgsunnyvale --add-reviewer lgsunnyvale
