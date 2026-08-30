@@ -1751,6 +1751,25 @@ mod tests {
             .expect("valid ignore patterns in W25 helpers must resolve")
     }
 
+    fn settings_profile_none(
+        vault: &std::path::Path,
+        patterns: Vec<&str>,
+    ) -> crate::config::Settings {
+        // F4/W197: real resolve with `[ignore].profile = "none"` - the
+        // escape hatch that disables the Obsidian built-ins (user patterns
+        // still apply when non-empty).
+        let cfg = crate::config::FileConfig {
+            vault_root: Some(vault.to_path_buf()),
+            ignore: Some(crate::config::IgnoreConfig {
+                profile: Some("none".to_string()),
+                patterns: patterns.iter().map(|s| s.to_string()).collect(),
+            }),
+            ..Default::default()
+        };
+        crate::config::resolve_settings(&cfg, &crate::config::EnvSnapshot::default())
+            .expect("valid profile=none settings must resolve")
+    }
+
     /// The issue #34 acceptance fixture vault: the Obsidian built-in profile
     /// must keep `notes/a.md` + `.obsidian/app.json` and hide the workspace
     /// session file, `.trash/`, `.git/`, and `.DS_Store`; `profile = "none"`
@@ -1808,6 +1827,80 @@ mod tests {
         assert!(!out.contains(".trash/"), ".trash/ pruned: {out}");
         assert!(!out.contains(".git/"), ".git/ pruned: {out}");
         assert!(!out.contains(".DS_Store"), ".DS_Store pruned: {out}");
+    }
+
+    #[test]
+    fn status_profile_none_lists_workspace() {
+        // Issue #34 D3 escape hatch (issue sketch exact name):
+        // `profile = "none"` disables the Obsidian built-ins, so the same
+        // fixture vault lists everything - workspace session file, `.trash/`,
+        // `.git/HEAD`, `notes/.DS_Store` - with no Phase 3 text.
+        let dir = TempDir::new("vaultsync-cli-test");
+        write_default_profile_vault(&dir);
+        let settings = settings_profile_none(dir.path(), vec![]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings(
+            Command::status(dir.path().into()),
+            &settings,
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(code, 2, "dirty plan; stderr: {err}");
+        assert!(!err.contains("Phase 3"), "no W25 text: {err}");
+        for expected in [
+            "U  .obsidian/workspace.json",
+            "U  .obsidian/app.json",
+            "U  .trash/x.md",
+            "U  .git/HEAD",
+            "U  notes/.DS_Store",
+            "U  notes/a.md",
+        ] {
+            assert!(
+                out.lines().any(|l| l.starts_with(expected)),
+                "{expected} missing under profile=none: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_profile_none_still_skips_reserved() {
+        // Issue #34 reserved orthogonal: even under `profile = "none"` the
+        // reserved vaultsync temp/probe namespace is still skipped (a
+        // walker-level invariant independent of ignore patterns) - the
+        // reserved name is absent from the plan and surfaced as a temp-file
+        // skip warning, never as an ignore skip.
+        let dir = TempDir::new("vaultsync-cli-test");
+        write_default_profile_vault(&dir);
+        std::fs::write(dir.join(".name.vaultsync-tmp-1-2"), "x").unwrap();
+        let settings = settings_profile_none(dir.path(), vec![]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_settings(
+            Command::status(dir.path().into()),
+            &settings,
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(code, 2, "dirty plan; stderr: {err}");
+        assert!(
+            !out.contains(".name.vaultsync-tmp-1-2"),
+            "reserved name must be absent from plan: {out}"
+        );
+        assert!(
+            err.contains("temp/probe") && err.contains("vaultsync"),
+            "temp skip warning expected: {err}"
+        );
+        assert!(
+            !err.contains("local path(s) by ignore patterns"),
+            "reserved skip is not an ignore skip: {err}"
+        );
     }
 
     #[test]
