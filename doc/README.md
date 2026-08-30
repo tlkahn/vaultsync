@@ -8,7 +8,8 @@
 4. [object-store.md](./object-store.md) - storage abstraction; S3 first
 5. [cli.md](./cli.md) - user-facing commands
 6. [borrowed-from-remotely-save.md](./borrowed-from-remotely-save.md) - inheritance map
-7. [roadmap.md](./roadmap.md) - build order
+7. [identifiers.md](./identifiers.md) - `D-*` / `W###` / `I##-slug` / review finding / plan-local label conventions
+8. [roadmap.md](./roadmap.md) - build order
 
 ## Doc conventions
 
