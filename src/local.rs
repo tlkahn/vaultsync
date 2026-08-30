@@ -2642,6 +2642,46 @@ mod tests {
     }
 
     #[test]
+    fn walk_ignore_does_not_override_reserved() {
+        // D-filter-order (issue acceptance): reserved-namespace stays FIRST
+        // and independent of ignore. The patterns below would match the
+        // leftover basenames if the ignore were consulted, so the precedence
+        // is real: leftovers count as skipped_temp_files (2), never as
+        // ignored (0), and are never emitted.
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::write(dir.join("note.md"), "real").unwrap();
+        std::fs::write(dir.join(".note.md.vaultsync-tmp-123-4"), "crash").unwrap();
+        std::fs::write(dir.join(".vaultsync-check-1-2-3"), "stray").unwrap();
+        let fs = LocalFs::new(dir.path()).with_ignore(
+            IgnoreSet::from_patterns(&[
+                ".note.md.vaultsync-tmp-123-4".to_string(),
+                ".vaultsync-check-1-2-3".to_string(),
+            ])
+            .unwrap(),
+        );
+        let (ents, rep) = fs.list_report().unwrap();
+        let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["note.md"], "keys: {keys:?}");
+        assert_eq!(rep.skipped_temp_files, 2, "reserved count: {rep:?}");
+        assert_eq!(
+            rep.skipped_ignored, 0,
+            "reserved leftovers must not be counted as ignored: {rep:?}"
+        );
+
+        // Mixed tree: one real .DS_Store (ignored, +1) + one reserved
+        // leftover (temp, not ignored) with the .DS_Store pattern.
+        let dir2 = TempDir::new("vaultsync-test");
+        std::fs::write(dir2.join(".DS_Store"), "real-ignore").unwrap();
+        std::fs::write(dir2.join(".vaultsync-check-9-9-9"), "stray").unwrap();
+        let fs2 = LocalFs::new(dir2.path())
+            .with_ignore(IgnoreSet::from_patterns(&[".DS_Store".to_string()]).unwrap());
+        let (ents2, rep2) = fs2.list_report().unwrap();
+        assert!(ents2.is_empty(), "no keys expected: {:?}", ents2);
+        assert!(rep2.skipped_temp_files >= 1, "reserved count: {rep2:?}");
+        assert_eq!(rep2.skipped_ignored, 1, "one real .DS_Store: {rep2:?}");
+    }
+
+    #[test]
     fn walk_skips_check_probe_leftovers() {
         // R4-L4/W42: a `.vaultsync-check-*` probe leftover on the local side
         // (materialized by an earlier stray download) must be skipped and
