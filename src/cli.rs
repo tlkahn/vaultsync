@@ -408,6 +408,8 @@ pub fn run_with_io(
                     for w in &report.warnings {
                         let _ = writeln!(err, "warning: {w}");
                     }
+                    // W236 (issue 45): one always-on inventory source line.
+                    print_inventory_line(&report, err);
                     print_walk_warnings(&local, follow_symlinks, err);
                     let plan = &report.plan;
                     let _ = write!(out, "{}", crate::format_plan_human_verbose(plan, verbose));
@@ -480,6 +482,25 @@ pub fn run_with_io(
                 inventory_mode: ctx.inventory_mode,
             };
             dispatch_plan(&vault, store, Mode::Pull, &opts, &flags, out, err)
+        }
+    }
+}
+
+/// Print the W236 inventory source milestone line to stderr (always-on, like
+/// the ignore warnings, so it is testable and script-visible): locked strings
+/// `inventory: manifest (N entries)` (warm) vs `inventory: list+head (cold)`.
+/// One line per plan build; #42 may later wrap the cold path with progress.
+fn print_inventory_line(report: &crate::PlanReport, err: &mut dyn Write) {
+    match &report.inventory_base.source {
+        crate::inventory::InventorySource::Manifest { .. } => {
+            let _ = writeln!(
+                err,
+                "inventory: manifest ({} entries)",
+                report.inventory_base.file_entities.len()
+            );
+        }
+        crate::inventory::InventorySource::LiveListHead => {
+            let _ = writeln!(err, "inventory: list+head (cold)");
         }
     }
 }
@@ -604,6 +625,9 @@ fn dispatch_plan(
             for w in &report.warnings {
                 let _ = writeln!(err, "warning: {w}");
             }
+            // W236 (issue 45): one always-on inventory source line per plan
+            // build (push/pull too, not just status).
+            print_inventory_line(&report, err);
             print_walk_warnings(&local, flags.follow_symlinks, err);
             let plan = &report.plan;
             let _ = write!(
@@ -1614,6 +1638,81 @@ mod tests {
         let (code, out, _) = run(Command::status(dir.path().into()), &MemoryStore::new());
         assert_eq!(code, 2);
         assert!(out.lines().any(|l| l.starts_with("U  a.md")));
+    }
+
+    #[test]
+    fn status_prints_inventory_source_line() {
+        // W236 (issue 45): every plan build prints one always-on stderr
+        // milestone line naming the inventory source (locked strings):
+        // `inventory: manifest (N entries)` warm vs `inventory: list+head
+        // (cold)`. Always-on (like ignore warnings) so it is testable and
+        // script-visible; #42 may later add progress around the cold path.
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "hi").unwrap();
+        let local = crate::local::LocalFs::new(dir.path());
+        let (local_entities, _) = local.list_report().unwrap();
+        let files: Vec<_> = local_entities
+            .iter()
+            .filter(|e| !e.is_folder())
+            .cloned()
+            .collect();
+
+        // Warm: a store holding only the manifest (mode Auto).
+        let warm = MemoryStore::new();
+        let m = crate::manifest::file_entities_to_manifest(&files, 0, None, None).unwrap();
+        let body = crate::manifest::serialize_manifest(&m).unwrap();
+        let body_len = body.len() as u64;
+        let mut c = std::io::Cursor::new(body);
+        warm.put_from(crate::local::MANIFEST_KEY, &mut c, body_len, None)
+            .unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::status(dir.path().into()),
+            &warm,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::Auto,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0);
+        assert!(
+            String::from_utf8(err.clone())
+                .unwrap()
+                .contains("inventory: manifest (1 entries)"),
+            "err: {}",
+            String::from_utf8_lossy(&err)
+        );
+
+        // Cold: mode list_head on the same local tree (no manifest needed).
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::status(dir.path().into()),
+            &MemoryStore::new(),
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::ListHead,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 2, "local-only rows make status dirty");
+        assert!(
+            String::from_utf8(err.clone())
+                .unwrap()
+                .contains("inventory: list+head (cold)"),
+            "err: {}",
+            String::from_utf8_lossy(&err)
+        );
     }
 
     #[test]
