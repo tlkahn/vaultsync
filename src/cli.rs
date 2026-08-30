@@ -1944,13 +1944,16 @@ mod tests {
         // Issue #34 (D-wire + D3-extend): user patterns (union with the
         // Obsidian defaults) must actually prune the push plan - no W25
         // refusal (exit 0), the ignored key absent from the plan, and the
-        // ignored file never reaches the store. Mutation-checked: an empty
-        // `IgnoreSet` at the compile site makes this RED (.trash/x.md uploads).
+        // ignored file never reaches the store. The fixture uses user-only
+        // `private/` (not one of the six Obsidian built-ins), so a
+        // defaults-only matcher cannot mask a broken user union.
+        // Mutation-checked: built-ins-only at the compile site makes this RED
+        // (private/secret.md uploads).
         let dir = TempDir::new("vaultsync-cli-test");
-        std::fs::create_dir_all(dir.join(".trash")).unwrap();
+        std::fs::create_dir_all(dir.join("private")).unwrap();
         std::fs::write(dir.join("a.md"), "hi").unwrap();
-        std::fs::write(dir.join(".trash/x.md"), "x").unwrap();
-        let mut settings = settings_with_ignore(dir.path(), vec![".trash/"]);
+        std::fs::write(dir.join("private/secret.md"), "s").unwrap();
+        let mut settings = settings_with_ignore(dir.path(), vec!["private/"]);
         settings.store.bucket = "b".to_string(); // store injected below; avoids the no-store refusal
         let store = MemoryStore::new();
         let mut out = Vec::new();
@@ -1972,13 +1975,13 @@ mod tests {
             "a.md planned: {out}"
         );
         assert!(
-            !out.contains(".trash/x.md"),
+            !out.contains("private/secret.md"),
             "ignored key absent from plan: {out}"
         );
         assert!(store.head("a.md").is_ok(), "a.md uploaded");
         assert!(
             matches!(
-                store.head(".trash/x.md"),
+                store.head("private/secret.md"),
                 Err(crate::error::Error::NotFound(_))
             ),
             "ignored file must never reach the store"
@@ -1988,18 +1991,20 @@ mod tests {
     #[test]
     fn pull_with_ignore_patterns_applies() {
         // Issue #34 apply/pull equivalent: a remote-only ignored key
-        // (`.trash/x.md` under user pattern `.trash/`) must be filtered from
-        // the pull plan - no Download row, nothing materialized locally, and
-        // no W25 refusal (exit 0).
+        // (`private/secret.md` under user pattern `private/`) must be
+        // filtered from the pull plan - no Download row, nothing materialized
+        // locally, and no W25 refusal (exit 0). The fixture uses user-only
+        // `private/` (not one of the six Obsidian built-ins), so a
+        // defaults-only matcher cannot mask a broken user union.
         let dir = TempDir::new("vaultsync-cli-test");
         let store = MemoryStore::new();
         let mut c1 = std::io::Cursor::new(b"a".to_vec());
         store.put_from("a.md", &mut c1, 1, Some(100)).unwrap();
-        let mut c2 = std::io::Cursor::new(b"x".to_vec());
+        let mut c2 = std::io::Cursor::new(b"s".to_vec());
         store
-            .put_from(".trash/x.md", &mut c2, 1, Some(100))
+            .put_from("private/secret.md", &mut c2, 1, Some(100))
             .unwrap();
-        let mut settings = settings_with_ignore(dir.path(), vec![".trash/"]);
+        let mut settings = settings_with_ignore(dir.path(), vec!["private/"]);
         settings.store.bucket = "b".to_string(); // store injected below
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -2020,12 +2025,12 @@ mod tests {
             "a.md download planned: {out}"
         );
         assert!(
-            !out.contains(".trash/x.md"),
+            !out.contains("private/secret.md"),
             "ignored remote key absent from plan: {out}"
         );
         assert!(dir.join("a.md").exists(), "a.md materialized");
         assert!(
-            !dir.join(".trash/x.md").exists(),
+            !dir.join("private/secret.md").exists(),
             "ignored remote key must not be downloaded"
         );
     }
@@ -2033,12 +2038,15 @@ mod tests {
     #[test]
     fn status_with_ignore_patterns_applies() {
         // Issue #34 status half: user patterns prune the status plan (ignored
-        // key absent), the run proceeds (exit 0) with NO Phase 3 warning.
+        // key absent) and the run proceeds with exit 2 (dirty plan - a.md
+        // upload pending) and NO Phase 3 warning. The fixture uses user-only
+        // `private/` (not one of the six Obsidian built-ins), so a
+        // defaults-only matcher cannot mask a broken user union.
         let dir = TempDir::new("vaultsync-cli-test");
-        std::fs::create_dir_all(dir.join(".trash")).unwrap();
+        std::fs::create_dir_all(dir.join("private")).unwrap();
         std::fs::write(dir.join("a.md"), "hi").unwrap();
-        std::fs::write(dir.join(".trash/x.md"), "x").unwrap();
-        let settings = settings_with_ignore(dir.path(), vec![".trash/"]);
+        std::fs::write(dir.join("private/secret.md"), "s").unwrap();
+        let settings = settings_with_ignore(dir.path(), vec!["private/"]);
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = run_with_settings(
@@ -2060,7 +2068,7 @@ mod tests {
             "a.md planned: {out}"
         );
         assert!(
-            !out.contains(".trash/x.md"),
+            !out.contains("private/"),
             "ignored key absent from plan: {out}"
         );
     }
