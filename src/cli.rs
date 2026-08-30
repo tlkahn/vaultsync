@@ -2125,12 +2125,15 @@ mod tests {
         // `pull --delete` must never delete a local-only path the ignore
         // patterns prune (it never enters the plan, so no `DL` row) while the
         // walk still sees everything else. Real execution: `.trash/x.md`
-        // survives on disk, `notes/a.md` intact.
+        // survives on disk, `notes/a.md` intact, and a non-ignored local-only
+        // `extra.md` is still DeleteLocal'd (PR 41 F1 positive control -
+        // the pin cannot pass with delete silently off).
         let dir = TempDir::new("vaultsync-cli-test");
         std::fs::create_dir_all(dir.join("notes")).unwrap();
         std::fs::create_dir_all(dir.join(".trash")).unwrap();
         std::fs::write(dir.join("notes/a.md"), "same").unwrap();
         std::fs::write(dir.join(".trash/x.md"), "x").unwrap();
+        std::fs::write(dir.join("extra.md"), "extra").unwrap();
         let store = MemoryStore::new();
         let mut c = std::io::Cursor::new(b"same".to_vec());
         store.put_from("notes/a.md", &mut c, 4, Some(100)).unwrap();
@@ -2158,6 +2161,14 @@ mod tests {
             "ignored local file survives the pull --delete"
         );
         assert!(dir.join("notes/a.md").exists(), "a.md intact");
+        assert!(
+            out.lines().any(|l| l.starts_with("DL extra.md")),
+            "non-ignored local-only key must DeleteLocal: {out}"
+        );
+        assert!(
+            !dir.join("extra.md").exists(),
+            "non-ignored local-only file must be removed by pull --delete"
+        );
     }
 
     #[test]
