@@ -32,6 +32,20 @@ pub const DEFAULT_RETRY_MAX_ATTEMPTS: u32 = 3;
 pub const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 1000;
 pub const DEFAULT_RETRY_MAX_DELAY_MS: u64 = 20000;
 
+/// Built-in Obsidian default ignore profile (issue #31 / roadmap D3).
+/// Vault-relative; exact strings; single source of truth for docs + resolve.
+/// The `obsidian` profile is the default when `[ignore]` is absent or
+/// `profile` is absent; `profile = "none"` disables it. User `[ignore].patterns`
+/// **extend** this set (union), never replace it.
+pub const OBSIDIAN_DEFAULT_IGNORE_PATTERNS: &[&str] = &[
+    ".git/",
+    ".trash/",
+    ".DS_Store",
+    ".obsidian/workspace",
+    ".obsidian/workspace.json",
+    ".obsidian/workspace-mobile.json",
+];
+
 /// On-disk config mirroring [cli.md]. All sections optional; defaults applied
 /// at resolution time. Unknown keys anywhere in the file are rejected loudly
 /// (W56, B nit): a typo like `mtime_tolerance` (missing `_ms`) or a
@@ -69,10 +83,17 @@ pub struct StoreConfig {
     pub path_style: Option<bool>,
 }
 
-/// `[ignore]` section (patterns are a Phase 3 feature; parsed but unused).
+/// `[ignore]` section. `profile` selects the built-in default ignore set
+/// (issue #31 D3/D-profile-values: `"obsidian"` is the default when the key
+/// is absent, `"none"` disables built-ins; unknown values are loud errors at
+/// resolution). `patterns` are user additions that **extend** the active
+/// profile (union). Resolution happens in [`resolve_settings`]; application
+/// lands in #34 - W25/M3 still keys off the raw user list only.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IgnoreConfig {
+    #[serde(default)]
+    pub profile: Option<String>,
     #[serde(default)]
     pub patterns: Vec<String>,
 }
@@ -114,10 +135,17 @@ pub struct Settings {
     /// resolved `[transfer.retry]` policy (I8). Milliseconds at this layer;
     /// `Duration` conversion happens at the S3 boundary.
     pub retry: RetrySettings,
-    /// Parsed non-empty `[ignore].patterns` (W25/M3). A Phase 3 feature that
-    /// is surfaced loudly - never silently applied - so a user copying the
-    /// cli.md example is not let to believe patterns are in effect.
+    /// Raw user `[ignore].patterns` only (no profile injection). W25/M3
+    /// still gates on this field until #34 (issue #31 D-w25-seq): absent
+    /// `[ignore]` leaves it empty even though the resolved list is non-empty,
+    /// so the default profile never trips the Phase 3 refusal.
     pub ignore_patterns: Vec<String>,
+    /// Fully resolved ignore list: active profile built-ins first, then user
+    /// patterns, exact-string deduped, validated via `IgnoreSet`. Unused by
+    /// the CLI until #34 wire-up; present so the Obsidian default can land
+    /// without tripping W25 (issue #31 sequencing note option 2). #34 reads
+    /// this field and retires W25.
+    pub resolved_ignore_patterns: Vec<String>,
 }
 
 /// Resolved retry policy (I8). Milliseconds at this layer; `Duration`
@@ -204,6 +232,15 @@ pub struct EnvSnapshot {
 
 /// Merge config + env into a [`Settings`]. Pure: no IO, no network.
 ///
+/// Ignore resolution (issue #31, D3/D-w25-seq): `[ignore].profile` selects
+/// the built-in Obsidian default (absent key => `"obsidian"`; `"none"`
+/// disables it; unknown values are loud errors). User `[ignore].patterns`
+/// **extend** the active profile (union, exact-string dedup, validated via
+/// `IgnoreSet` - see [`resolve_ignore`]). `Settings.ignore_patterns` stays
+/// raw user patterns only (W25/M3 gates on it until #34); the fully resolved
+/// list lands on `Settings.resolved_ignore_patterns`, which #34 reads when it
+/// retires W25.
+///
 /// W83/r9 N1: the `--vault`/config merge no longer lives here (the old
 /// `cli: &Cli` parameter was test-only in production - the sole production
 /// call passed `Cli::default()`); the single merge site is
@@ -239,11 +276,7 @@ pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings,
             "transfer.concurrency must be <= {MAX_CONCURRENCY} (got {concurrency}); values above the cap are OS-thread cost for zero S3 throughput gain"
         )));
     }
-    let ignore_patterns = cfg
-        .ignore
-        .as_ref()
-        .map(|i| i.patterns.clone())
-        .unwrap_or_default();
+    let (ignore_patterns, resolved_ignore_patterns) = resolve_ignore(cfg.ignore.as_ref())?;
     let retry = resolve_retry(cfg.transfer.as_ref())?;
     Ok(Settings {
         vault_root,
@@ -252,7 +285,63 @@ pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings,
         concurrency,
         retry,
         ignore_patterns,
+        resolved_ignore_patterns,
     })
+}
+
+/// Resolve `[ignore]` into `(user patterns, resolved patterns)` (issue #31).
+///
+/// D3/D-profile-values: the built-in Obsidian set is the default when the
+/// section or `profile` key is absent; `profile = "none"` disables built-ins;
+/// user `patterns` **extend** the active profile (union, never replacement).
+/// The resolved list is built-ins first, then user patterns (W190), exact-
+/// string deduped (W191), profile-validated (W192), and pattern-validated via
+/// `IgnoreSet` (W193). The user list stays raw (W25 gates on it until #34 -
+/// D-w25-seq).
+fn resolve_ignore(ignore: Option<&IgnoreConfig>) -> Result<(Vec<String>, Vec<String>), Error> {
+    let user = ignore.map(|i| i.patterns.clone()).unwrap_or_default();
+    // D3/D-profile-values: absent profile (or `None`) -> `obsidian`;
+    // `profile = "none"` disables built-ins (escape hatch); unknown values
+    // are loud errors (W192, below).
+    let profile = ignore.and_then(|i| i.profile.as_deref());
+    // W192: unknown profile values (incl. "", "Obsidian", "none ") are
+    // loud errors naming the raw value and the allowed set - no soft-default,
+    // no clamping, no trim (D-profile-values).
+    if let Some(other) = profile
+        && other != "obsidian"
+        && other != "none"
+    {
+        return Err(Error::Other(format!(
+            "ignore.profile: unknown profile {other:?} (allowed: \"obsidian\" | \"none\")"
+        )));
+    }
+    let mut resolved: Vec<String> = match profile {
+        // W189: `none` -> no built-ins; the user list is the whole resolved
+        // list (union with the empty profile).
+        Some("none") => Vec::new(),
+        // W188: `obsidian` / absent key -> the built-in Obsidian set.
+        Some("obsidian") | None => OBSIDIAN_DEFAULT_IGNORE_PATTERNS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        // W192 guarded above (unknown profiles already Err); arm kept for
+        // exhaustiveness readability so the guard and match cannot drift.
+        Some(_) => unreachable!("unknown ignore.profile must Err before match"),
+    };
+    // W190: user patterns extend the active profile (union; stable order:
+    // built-ins first, user next). W191: exact-string dedup, first wins - a
+    // user entry repeating a built-in (or an earlier user entry) is dropped.
+    for p in user.iter() {
+        if !resolved.contains(p) {
+            resolved.push(p.clone());
+        }
+    }
+    // W193 (D-validate-seam): validate the full resolved list via
+    // `IgnoreSet::from_patterns` and discard the matcher - the matcher's own
+    // message (naming the bad pattern + reason) is reused verbatim; no
+    // reimplementation of pattern rules here, no new Error variant.
+    crate::IgnoreSet::from_patterns(&resolved)?;
+    Ok((user, resolved))
 }
 
 /// Resolve + validate `[transfer.retry]` (I8): each absent field falls back
@@ -409,7 +498,8 @@ mod tests {
     #[test]
     fn config_parse_full_example() {
         // Mirrors the cli.md example. Store buckets/prefix and transfer fields
-        // all deserialize; unknown sections like `[ignore]` parse fine.
+        // all deserialize; the known `[ignore]` section deserializes `patterns`
+        // (profile optional; resolution is tested elsewhere).
         let text = r#"
 vault_root = "/Users/me/Notes"
 
@@ -453,6 +543,258 @@ max_delay_ms = 4000
         assert_eq!(retry.max_attempts, Some(5));
         assert_eq!(retry.base_delay_ms, Some(250));
         assert_eq!(retry.max_delay_ms, Some(4000));
+    }
+
+    #[test]
+    fn config_parse_ignore_profile_field() {
+        // Issue #31 (D-config-surface): `[ignore].profile` parses as an
+        // optional string; absent key -> `None` (resolves to `"obsidian"`
+        // at resolution time). `deny_unknown_fields` stays: a typo like
+        // `profil` is a loud parse error naming the key. RED: `IgnoreConfig`
+        // has no `profile` field, so serde rejects it as an unknown field.
+        let text = r#"
+[ignore]
+profile = "obsidian"
+patterns = [".git/"]
+"#;
+        let cfg = parse_config_str(text).unwrap();
+        let ig = cfg.ignore.as_ref().unwrap();
+        assert_eq!(ig.profile.as_deref(), Some("obsidian"));
+        assert_eq!(ig.patterns.len(), 1);
+
+        // No profile key -> None (default resolved later).
+        let cfg = parse_config_str("[ignore]\npatterns = []\n").unwrap();
+        let ig = cfg.ignore.as_ref().unwrap();
+        assert_eq!(ig.profile, None);
+        assert!(ig.patterns.is_empty());
+
+        // Unknown key under `[ignore]` is rejected loudly, naming the key
+        // (W56 / deny_unknown_fields).
+        for bad in ["profil = \"obsidian\"", "foo = 1"] {
+            let text = format!("[ignore]\n{bad}\n");
+            let err = parse_config_str(&text).unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("profil") || msg.contains("foo"),
+                "unknown ignore key not named in: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_absent_ignore_does_not_populate_user_field() {
+        // Issue #31 (D-w25-seq, W194): the sequencing invariant - absent
+        // `[ignore]` leaves the user-only field empty (so W25/M3 never trips
+        // on the built-in default profile) while the resolved field carries
+        // the built-ins. A future mistaken merge of the two fields fails
+        // loudly here (mutation-checked: reverting `resolve_ignore` to the
+        // W186 `ignore_patterns.clone()` baseline flips this RED).
+        let cfg = FileConfig::default();
+        let s = settings(&cfg).unwrap();
+        assert!(s.ignore_patterns.is_empty(), "user field must stay empty");
+        assert!(
+            !s.resolved_ignore_patterns.is_empty(),
+            "resolved field must carry the built-in default"
+        );
+        assert_eq!(
+            s.resolved_ignore_patterns.len(),
+            OBSIDIAN_DEFAULT_IGNORE_PATTERNS.len()
+        );
+    }
+
+    #[test]
+    fn resolve_bad_pattern_errors() {
+        // Issue #31 (D-validate-seam): the full resolved list is validated
+        // through `IgnoreSet::from_patterns` (single seam, matcher messages
+        // reused verbatim - no parallel vocabulary, no new Error variant).
+        // `profile = "none"` isolates the user patterns from built-ins. RED:
+        // no validation at resolution today - bad patterns resolve silently.
+        let cases: &[(&[&str], &str)] = &[
+            (&[""], "empty"),
+            (&["/abs"], "leading"),
+            (&["a/**/b"], "**"),
+            (&["!foo"], "!"),
+            (&["foo?"], "?"),
+            (&["a//b"], "empty"),
+        ];
+        for (patterns, reason) in cases {
+            let list = patterns
+                .iter()
+                .map(|p| format!("\"{p}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let text = format!("[ignore]\nprofile = \"none\"\npatterns = [{list}]\n");
+            let cfg = parse_config_str(&text).unwrap();
+            let err = settings(&cfg).unwrap_err();
+            let msg = format!("{err}");
+            let bad = patterns[0];
+            assert!(
+                msg.contains(&format!("{bad:?}")),
+                "{bad:?} must be named in: {msg}"
+            );
+            assert!(
+                msg.contains(reason),
+                "{bad:?} must carry reason {reason:?}: {msg}"
+            );
+        }
+
+        // Under the default profile, a bad *user* pattern still fails even
+        // though the six built-ins are valid.
+        let text = "[ignore]\npatterns = [\"private/\", \"\"]\n";
+        let cfg = parse_config_str(text).unwrap();
+        let err = settings(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("\"\"") && msg.contains("empty"),
+            "bad user pattern under default profile must fail naming it: {msg}"
+        );
+
+        // Built-ins alone are valid (constant is load-bearing): no error.
+        let cfg = FileConfig::default();
+        assert!(settings(&cfg).is_ok());
+    }
+
+    #[test]
+    fn resolve_unknown_profile_errors() {
+        // Issue #31 (D-profile-values): exact codepoint match, case-sensitive,
+        // no trim. Anything other than `"obsidian"` | `"none"` (including
+        // `""`, `"Obsidian"`, `"none "`) is a loud error naming the raw
+        // value and the allowed set (prefer also naming `ignore.profile`).
+        // No soft-default, no clamping. RED: unknown values currently fall
+        // through to the obsidian default silently.
+        // (toml_value, raw_value): the newline case must be written as the
+        // TOML escape `\n` (a literal newline is not representable in a TOML
+        // basic string); TOML parses it back into the newline character.
+        let cases: &[(&str, &str)] = &[
+            ("git", "git"),
+            ("", ""),
+            ("Obsidian", "Obsidian"),
+            ("none ", "none "),
+            ("obsidian\\n", "obsidian\n"),
+        ];
+        for (toml_value, raw_value) in cases {
+            let text = format!("[ignore]\nprofile = \"{toml_value}\"\n");
+            let cfg = parse_config_str(&text).unwrap();
+            let err = settings(&cfg).unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("ignore.profile"),
+                "{raw_value:?} error must name ignore.profile: {msg}"
+            );
+            assert!(
+                msg.contains("obsidian") && msg.contains("none"),
+                "{raw_value:?} error must mention the allowed set obsidian|none: {msg}"
+            );
+            assert!(
+                msg.contains(&format!("{raw_value:?}")),
+                "{raw_value:?} error must name the raw value: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_ignore_dedup_exact_string() {
+        // Issue #31 (D-dedup): exact `String` equality, first occurrence
+        // wins. Built-ins first means a user entry repeating a built-in is
+        // dropped; a repeated user entry is dropped too. Order of first
+        // occurrence preserved. Not path-semantic (`.git` vs `.git/` stay
+        // distinct if both present). RED: no dedup yet - user `.git/` and the
+        // second user `.git/` duplicate built-ins.
+        let text =
+            "[ignore]\nprofile = \"obsidian\"\npatterns = [\".git/\", \"private/\", \".git/\"]\n";
+        let cfg = parse_config_str(text).unwrap();
+        let s = settings(&cfg).unwrap();
+        let expected: Vec<String> = OBSIDIAN_DEFAULT_IGNORE_PATTERNS
+            .iter()
+            .map(|s| s.to_string())
+            .chain(std::iter::once("private/".to_string()))
+            .collect();
+        assert_eq!(s.resolved_ignore_patterns, expected);
+
+        // User-only dup under `profile = "none"`: exact-string first wins.
+        let text = "[ignore]\nprofile = \"none\"\npatterns = [\"a/\", \"b/\", \"a/\"]\n";
+        let cfg = parse_config_str(text).unwrap();
+        let s = settings(&cfg).unwrap();
+        assert_eq!(
+            s.resolved_ignore_patterns,
+            vec!["a/".to_string(), "b/".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_user_extends_obsidian() {
+        // Issue #31 (D3): user `patterns` **extend** the active profile
+        // (union, never replacement). With no `profile` key (default
+        // obsidian) or an explicit `obsidian`, the resolved list is the six
+        // built-ins followed by the user patterns. RED: the obsidian arm does
+        // not append user patterns yet.
+        let expected: Vec<String> = OBSIDIAN_DEFAULT_IGNORE_PATTERNS
+            .iter()
+            .map(|s| s.to_string())
+            .chain(std::iter::once("private/".to_string()))
+            .collect();
+
+        // No profile key -> default obsidian.
+        let text = "[ignore]\npatterns = [\"private/\"]\n";
+        let cfg = parse_config_str(text).unwrap();
+        let s = settings(&cfg).unwrap();
+        assert_eq!(s.ignore_patterns, vec!["private/".to_string()]);
+        assert_eq!(s.resolved_ignore_patterns, expected);
+
+        // Explicit `profile = "obsidian"` behaves identically.
+        let text = "[ignore]\nprofile = \"obsidian\"\npatterns = [\"private/\"]\n";
+        let cfg = parse_config_str(text).unwrap();
+        let s = settings(&cfg).unwrap();
+        assert_eq!(s.ignore_patterns, vec!["private/".to_string()]);
+        assert_eq!(s.resolved_ignore_patterns, expected);
+    }
+
+    #[test]
+    fn resolve_profile_none_plus_user() {
+        // Issue #31 (D3 escape hatch): `profile = "none"` disables the
+        // built-in Obsidian set; the resolved list is exactly the user
+        // patterns. RED: today `profile` is ignored, so the six built-ins
+        // leak into the resolved list.
+        let text = "[ignore]\nprofile = \"none\"\npatterns = [\"private/\"]\n";
+        let cfg = parse_config_str(text).unwrap();
+        let s = settings(&cfg).unwrap();
+        assert_eq!(s.ignore_patterns, vec!["private/".to_string()]);
+        assert_eq!(s.resolved_ignore_patterns, vec!["private/".to_string()]);
+
+        // `profile = "none"` with no patterns -> both empty.
+        let text = "[ignore]\nprofile = \"none\"\n";
+        let cfg = parse_config_str(text).unwrap();
+        let s = settings(&cfg).unwrap();
+        assert!(s.ignore_patterns.is_empty());
+        assert!(s.resolved_ignore_patterns.is_empty());
+    }
+
+    #[test]
+    fn resolve_default_profile_is_obsidian() {
+        // Issue #31 (D3/D-w25-seq): absent `[ignore]` (or an empty section)
+        // resolves the built-in Obsidian default set in constant order on the
+        // *resolved* field, while the user-only field stays empty so W25 never
+        // trips (the critical sequencing hazard). RED: `resolved_ignore_patterns`
+        // mirrors the user list today (W186 baseline), so the six built-ins are
+        // missing.
+        let expected: Vec<String> = OBSIDIAN_DEFAULT_IGNORE_PATTERNS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let cfg = FileConfig::default();
+        let s = settings(&cfg).unwrap();
+        assert!(
+            s.ignore_patterns.is_empty(),
+            "user field stays empty (W25-safe)"
+        );
+        assert_eq!(s.resolved_ignore_patterns, expected);
+
+        // Empty `[ignore]` section (present, no keys) resolves identically.
+        let cfg = parse_config_str("[ignore]\n").unwrap();
+        let s = settings(&cfg).unwrap();
+        assert!(s.ignore_patterns.is_empty());
+        assert_eq!(s.resolved_ignore_patterns, expected);
     }
 
     #[test]
