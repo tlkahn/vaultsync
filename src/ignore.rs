@@ -167,20 +167,27 @@ impl Rule {
     }
 }
 
+// Match path is collect-free so #32/#33 can call matches per entity without
+// per-query Vec churn.
+
 /// Segment-count equality + per-segment match. An exact non-dir pattern never
 /// matches a folder key (folder form has one more, trailing-empty segment).
 fn exact_segs_match(key: &str, segs: &[Segment]) -> bool {
     if key.ends_with('/') {
         return false;
     }
-    let key_segs: Vec<&str> = key.split('/').collect();
-    if key_segs.len() != segs.len() {
-        return false;
+    let mut parts = key.split('/');
+    for seg in segs {
+        let Some(ks) = parts.next() else {
+            return false;
+        };
+        match seg {
+            Segment::Exact(s) if s.as_str() != ks => return false,
+            Segment::Glob(g) if !segment_glob_matches(ks, g) => return false,
+            _ => {}
+        }
     }
-    segs.iter().zip(key_segs).all(|(seg, ks)| match seg {
-        Segment::Exact(s) => s == ks,
-        Segment::Glob(g) => segment_glob_matches(ks, g),
-    })
+    parts.next().is_none()
 }
 
 /// Dir form with per-segment globs: at least as many key segments as pattern
@@ -189,17 +196,27 @@ fn exact_segs_match(key: &str, segs: &[Segment]) -> bool {
 /// match).
 fn dir_prefix_segs_match(key: &str, segs: &[Segment]) -> bool {
     let folder = key.ends_with('/');
-    let key_segs: Vec<&str> = key.strip_suffix('/').unwrap_or(key).split('/').collect();
-    if key_segs.len() < segs.len() {
+    let body = key.strip_suffix('/').unwrap_or(key);
+    let mut parts = body.split('/');
+    for seg in segs {
+        let Some(ks) = parts.next() else {
+            return false;
+        };
+        match seg {
+            Segment::Exact(s) if s.as_str() != ks => return false,
+            Segment::Glob(g) if !segment_glob_matches(ks, g) => return false,
+            _ => {}
+        }
+    }
+    // Equal segment count requires a folder key so a file equal to the dir
+    // path without slash does not match (same rule as before).
+    let has_more = parts.next().is_some();
+    if !has_more && !folder {
         return false;
     }
-    if key_segs.len() == segs.len() && !folder {
-        return false;
-    }
-    segs.iter().zip(key_segs).all(|(seg, ks)| match seg {
-        Segment::Exact(s) => s == ks,
-        Segment::Glob(g) => segment_glob_matches(ks, g),
-    })
+    // has_more already peeked one; further key segments are fine (prefix
+    // match). No need to consume the rest.
+    true
 }
 
 impl SegmentGlob {
