@@ -10,6 +10,7 @@
 6. [borrowed-from-remotely-save.md](./borrowed-from-remotely-save.md) - inheritance map
 7. [identifiers.md](./identifiers.md) - `D-*` / `W###` / `I##-slug` / review finding / plan-local label conventions
 8. [roadmap.md](./roadmap.md) - build order
+9. [inventory-manifest.md](./inventory-manifest.md) - design note: remote manifest (+ local cache) for large-vault plan build (#42)
 
 ## Doc conventions
 
