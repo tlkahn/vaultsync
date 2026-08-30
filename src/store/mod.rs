@@ -355,14 +355,42 @@ mod tests {
         assert_ss::<dyn ObjectStore>();
     }
 
+    /// Stub wrapping MemoryStore WITHOUT overriding `put_from_with` /
+    /// `get_to_with`, so the trait's DEFAULT bodies are exercised (W222).
+    /// Every existing impl has this shape: the 5 required methods only.
+    struct DefaultWithStore(MemoryStore);
+    impl ObjectStore for DefaultWithStore {
+        fn list(&self, prefix: &str) -> Result<Listing, Error> {
+            self.0.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<Entity, Error> {
+            self.0.head(key)
+        }
+        fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            self.0.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime_ms: Option<u64>,
+        ) -> Result<Entity, Error> {
+            self.0.put_from(key, r, size, mtime_ms)
+        }
+        fn delete(&self, key: &str) -> Result<(), Error> {
+            self.0.delete(key)
+        }
+    }
+
     #[test]
     fn put_from_with_default_methods_delegate_or_reject() {
         // W222 (issue 45): the trait extension's default bodies keep every
         // existing impl compiling. No precondition -> delegate to
         // `put_from`/`get_to`; any precondition -> a loud unsupported error.
-        // MemoryStore does not override `_with` yet (that is W223/W224), so
-        // this test exercises the DEFAULTS.
-        let store = MemoryStore::new();
+        // `DefaultWithStore` does not override `_with`, so this test
+        // exercises the DEFAULTS (MemoryStore overrides them since W223).
+        let store = DefaultWithStore(MemoryStore::new());
         let mut c = std::io::Cursor::new(b"x".to_vec());
         let e = store
             .put_from_with("a.md", &mut c, 1, PutOpts::default())
