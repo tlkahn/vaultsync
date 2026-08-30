@@ -324,6 +324,11 @@ fn resolve_ignore(ignore: Option<&IgnoreConfig>) -> Result<(Vec<String>, Vec<Str
             resolved.push(p.clone());
         }
     }
+    // W193 (D-validate-seam): validate the full resolved list via
+    // `IgnoreSet::from_patterns` and discard the matcher - the matcher's own
+    // message (naming the bad pattern + reason) is reused verbatim; no
+    // reimplementation of pattern rules here, no new Error variant.
+    let _ = crate::IgnoreSet::from_patterns(&resolved)?;
     Ok((user, resolved))
 }
 
@@ -561,6 +566,58 @@ patterns = [".git/"]
                 "unknown ignore key not named in: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn resolve_bad_pattern_errors() {
+        // Issue #31 (D-validate-seam): the full resolved list is validated
+        // through `IgnoreSet::from_patterns` (single seam, matcher messages
+        // reused verbatim - no parallel vocabulary, no new Error variant).
+        // `profile = "none"` isolates the user patterns from built-ins. RED:
+        // no validation at resolution today - bad patterns resolve silently.
+        let cases: &[(&[&str], &str)] = &[
+            (&[""], "empty"),
+            (&["/abs"], "leading"),
+            (&["a/**/b"], "**"),
+            (&["!foo"], "!"),
+            (&["foo?"], "?"),
+            (&["a//b"], "empty"),
+        ];
+        for (patterns, reason) in cases {
+            let list = patterns
+                .iter()
+                .map(|p| format!("\"{p}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let text = format!("[ignore]\nprofile = \"none\"\npatterns = [{list}]\n");
+            let cfg = parse_config_str(&text).unwrap();
+            let err = settings(&cfg).unwrap_err();
+            let msg = format!("{err}");
+            let bad = patterns[0];
+            assert!(
+                msg.contains(&format!("{bad:?}")),
+                "{bad:?} must be named in: {msg}"
+            );
+            assert!(
+                msg.contains(reason),
+                "{bad:?} must carry reason {reason:?}: {msg}"
+            );
+        }
+
+        // Under the default profile, a bad *user* pattern still fails even
+        // though the six built-ins are valid.
+        let text = "[ignore]\npatterns = [\"private/\", \"\"]\n";
+        let cfg = parse_config_str(text).unwrap();
+        let err = settings(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("\"\"") && msg.contains("empty"),
+            "bad user pattern under default profile must fail naming it: {msg}"
+        );
+
+        // Built-ins alone are valid (constant is load-bearing): no error.
+        let cfg = FileConfig::default();
+        assert!(settings(&cfg).is_ok());
     }
 
     #[test]
