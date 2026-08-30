@@ -152,6 +152,12 @@ mtime_tolerance_ms = 1000
 > `warning: ignored N local path(s) by ignore patterns` / `warning: ignored
 > N remote key(s) by ignore patterns`.
 >
+> Upgrade note: keys already uploaded under these patterns before the
+> defaults activated stay on the remote - they are ignored on both sides, so
+> `push --delete` will not remove them (delete invariant); remove them
+> manually in the store, or temporarily set `profile = "none"` for a run
+> (built-ins are disabled for that run).
+>
 > Pattern shapes (issue #30 matcher; `IgnoreSet` is the single source of
 > truth):
 >

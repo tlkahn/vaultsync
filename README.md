@@ -85,15 +85,20 @@ action a plan - or delete files - against a non-existent store).
   dir (e.g. an intentional `attachments/`) is kept.
 - **`[ignore]` is live end-to-end (issue #34, epic #9 closed).** The default
   Obsidian profile applies with no config: the Obsidian six
-  (`.git/`, `.trash/`, `.DS_Store`, `.obsidian/workspace*`) are pruned from
-  local walks **and** dropped from remote listings, so a `--delete` run never
-  removes an ignored path/key. `profile = "none"` disables the built-ins;
-  user `patterns` **extend** the active profile (union). Reserved vaultsync
-  names (`.*.vaultsync-tmp-*`, `.vaultsync-check-*`) are always skipped
-  regardless of profile. Skipped paths/keys are reported on stderr as
+  (`.git/`, `.trash/`, `.DS_Store`, `.obsidian/workspace`,
+  `.obsidian/workspace.json`, `.obsidian/workspace-mobile.json`) are pruned
+  from local walks **and** dropped from remote listings, so a `--delete` run
+  never removes an ignored path/key. `profile = "none"` disables the
+  built-ins; user `patterns` **extend** the active profile (union). Reserved
+  vaultsync names (`.*.vaultsync-tmp-*`, `.vaultsync-check-*`) are always
+  skipped regardless of profile. Skipped paths/keys are reported on stderr as
   count-only warnings (`ignored N local path(s) / remote key(s) by ignore
-  patterns`). Config-only: there is no `--profile` / `--exclude` /
-  `--include` CLI flag.
+  patterns`). Upgrade note: keys already uploaded under these patterns before
+  the defaults activated stay on the remote - they are ignored on both sides,
+  so `push --delete` will not remove them (delete invariant); remove them
+  manually in the store, or temporarily set `profile = "none"` for a run
+  (built-ins are disabled for that run). Config-only: there is no
+  `--profile` / `--exclude` / `--include` CLI flag.
 - **`[transfer].concurrency` is live (issue 20).** It bounds how many
   transfers and list-enrichment heads run in flight (default 4, valid range
   `1..=256`; `1` = sequential; the `256` cap is I20-r1 config-layer - library
