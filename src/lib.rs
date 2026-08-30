@@ -9,6 +9,7 @@ pub mod error;
 pub mod exec;
 pub mod ignore;
 pub use ignore::IgnoreSet;
+pub mod inventory;
 pub mod local;
 pub mod manifest;
 pub mod plan;
