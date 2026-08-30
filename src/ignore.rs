@@ -28,6 +28,8 @@ pub struct IgnoreSet {
 enum Rule {
     /// Final-segment equality (no `/` in pattern, no `*`).
     Basename(String),
+    /// Dir prefix: literal string including trailing `/` when no globs.
+    DirPrefix(String),
 }
 
 impl IgnoreSet {
@@ -50,9 +52,13 @@ impl IgnoreSet {
 }
 
 /// Compile one raw pattern into a [`Rule`]. Slash-free, metachar-free
-/// patterns become basename-anywhere; other shapes are rejected until their
-/// work item lands (W180 dir prefix, W181 exact path, W182 segment `*`).
+/// patterns become basename-anywhere; trailing-slash patterns become a dir
+/// prefix; other shapes are rejected until their work item lands (W181 exact
+/// path, W182 segment `*`).
 fn compile_pattern(pat: &str) -> Result<Rule, Error> {
+    if pat.ends_with('/') {
+        return Ok(Rule::DirPrefix(pat.to_string()));
+    }
     let segments: Vec<&str> = pat.split('/').collect();
     if segments.len() == 1 && !pat.contains('*') {
         return Ok(Rule::Basename(pat.to_string()));
@@ -66,6 +72,7 @@ impl Rule {
     fn matches(&self, key: &str) -> bool {
         match self {
             Rule::Basename(name) => final_segment(key) == name,
+            Rule::DirPrefix(prefix) => key == prefix || key.starts_with(prefix),
         }
     }
 }
@@ -132,5 +139,38 @@ mod tests {
     fn set(patterns: &[&str]) -> IgnoreSet {
         IgnoreSet::from_patterns(&patterns.iter().map(|s| s.to_string()).collect::<Vec<_>>())
             .unwrap()
+    }
+
+    #[test]
+    fn ignore_set_dir_prefix_git() {
+        // Trailing-slash patterns are vault-rooted **path prefixes**, not
+        // basenames: `.git/` ignores that folder and everything under it,
+        // and never a sibling false friend (`.gitignore`, `.github/`, ...).
+        let cases: &[(&[&str], &str, bool)] = &[
+            (&[".git/"], ".git/", true),
+            (&[".git/"], ".git/objects/aa", true),
+            (&[".git/"], ".git/objects/aa/bb", true),
+            (&[".git/"], ".gitignore", false),
+            (&[".git/"], "git/", false),
+            (&[".git/"], ".github/workflows/x", false),
+            (&[".git/"], "foo.git/", false),
+            (&[".trash/"], ".trash/", true),
+            (&[".trash/"], ".trash/foo.md", true),
+            (&[".trash/"], "not-trash.md", false),
+            (&[".trash/"], "foo.trash", false),
+            (&[".trash/"], ".trashfile", false),
+            // Path-prefix, not basename: a nested `.trash/` is NOT ignored by
+            // the vault-root pattern (unlike basename `.DS_Store`). Pin so
+            // #32 cannot invent basename-dir behavior later.
+            (&[".trash/"], "notes/.trash/", false),
+        ];
+        for (patterns, key, expect) in cases {
+            let set = set(patterns);
+            assert_eq!(
+                set.matches(key),
+                *expect,
+                "patterns {patterns:?} key {key:?}"
+            );
+        }
     }
 }
