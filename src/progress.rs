@@ -1209,4 +1209,15 @@ mod tests {
         assert!(!r.contains("B/s"), "{r}");
         assert!(!r.contains("ETA"), "{r}");
     }
+
+    // PR 28 r2 F3: pin the hour ETA formatting. `format_eta` renders `m:ss`
+    // under an hour and `h:mm:ss` from an hour up (PR 28 r1 F2).
+    // Characterization pin: GREEN on arrival; mutation-check the hour branch.
+    #[test]
+    fn format_eta_renders_hours_as_h_mm_ss() {
+        assert_eq!(format_eta(3600.0), "1:00:00");
+        assert_eq!(format_eta(3661.0), "1:01:01");
+        // just below an hour stays `m:ss` (the m:ss -> h:mm:ss transition)
+        assert_eq!(format_eta(3599.4), "59:59");
+    }
 }
