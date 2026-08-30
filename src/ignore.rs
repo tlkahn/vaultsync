@@ -28,10 +28,29 @@ pub struct IgnoreSet {
 enum Rule {
     /// Final-segment equality (no `/` in pattern, no `*`).
     Basename(String),
+    /// Final-segment glob (no `/` in pattern, has `*`).
+    BasenameGlob(SegmentGlob),
     /// Full-key equality (has `/`, no trailing `/`, no `*`).
     Exact(String),
+    /// Segment zip (has `/`, no trailing `/`, has `*`).
+    ExactSegs(Vec<Segment>),
     /// Dir prefix: literal string including trailing `/` when no globs.
     DirPrefix(String),
+    /// Dir prefix with per-segment globs.
+    DirPrefixSegs(Vec<Segment>),
+}
+
+#[derive(Debug, Clone)]
+enum Segment {
+    Exact(String),
+    Glob(SegmentGlob),
+}
+
+/// Pre-split on `*` so match is allocation-light at query time.
+#[derive(Debug, Clone)]
+struct SegmentGlob {
+    /// Literal pieces between `*` wildcards (len = star_count + 1).
+    parts: Vec<String>,
 }
 
 impl IgnoreSet {
@@ -92,18 +111,35 @@ fn compile_pattern(pat: &str) -> Result<Rule, Error> {
         }
     }
     let has_star = segments.iter().any(|s| s.contains('*'));
+    let segments: Vec<Segment> = segments
+        .iter()
+        .map(|s| {
+            if s.contains('*') {
+                Segment::Glob(SegmentGlob::from(s))
+            } else {
+                Segment::Exact(s.to_string())
+            }
+        })
+        .collect();
     if dir {
-        return Ok(Rule::DirPrefix(pat.to_string()));
+        return Ok(if has_star {
+            Rule::DirPrefixSegs(segments)
+        } else {
+            Rule::DirPrefix(pat.to_string())
+        });
     }
-    if segments.len() == 1 && !has_star {
-        return Ok(Rule::Basename(pat.to_string()));
+    if !has_star {
+        return Ok(if segments.len() == 1 {
+            Rule::Basename(pat.to_string())
+        } else {
+            Rule::Exact(pat.to_string())
+        });
     }
-    if segments.len() > 1 && !has_star {
-        return Ok(Rule::Exact(pat.to_string()));
+    if segments.len() == 1 {
+        Ok(Rule::BasenameGlob(SegmentGlob::from(pat)))
+    } else {
+        Ok(Rule::ExactSegs(segments))
     }
-    Err(Error::Other(
-        "ignore pattern shape not yet implemented".to_string(),
-    ))
 }
 
 fn invalid(pat: &str, reason: &str) -> Error {
@@ -114,10 +150,79 @@ impl Rule {
     fn matches(&self, key: &str) -> bool {
         match self {
             Rule::Basename(name) => final_segment(key) == name,
+            Rule::BasenameGlob(glob) => segment_glob_matches(final_segment(key), glob),
             Rule::Exact(s) => key == s,
+            Rule::ExactSegs(segs) => exact_segs_match(key, segs),
             Rule::DirPrefix(prefix) => key == prefix || key.starts_with(prefix),
+            Rule::DirPrefixSegs(segs) => dir_prefix_segs_match(key, segs),
         }
     }
+}
+
+/// Segment-count equality + per-segment match. An exact non-dir pattern never
+/// matches a folder key (folder form has one more, trailing-empty segment).
+fn exact_segs_match(key: &str, segs: &[Segment]) -> bool {
+    if key.ends_with('/') {
+        return false;
+    }
+    let key_segs: Vec<&str> = key.split('/').collect();
+    if key_segs.len() != segs.len() {
+        return false;
+    }
+    segs.iter().zip(key_segs).all(|(seg, ks)| match seg {
+        Segment::Exact(s) => s == ks,
+        Segment::Glob(g) => segment_glob_matches(ks, g),
+    })
+}
+
+/// Dir form with per-segment globs: at least as many key segments as pattern
+/// segments, matching in order; a key with exactly the pattern's segment count
+/// must be a folder key (a file equal to the dir path without slash does not
+/// match).
+fn dir_prefix_segs_match(key: &str, segs: &[Segment]) -> bool {
+    let folder = key.ends_with('/');
+    let key_segs: Vec<&str> = key.strip_suffix('/').unwrap_or(key).split('/').collect();
+    if key_segs.len() < segs.len() {
+        return false;
+    }
+    if key_segs.len() == segs.len() && !folder {
+        return false;
+    }
+    segs.iter().zip(key_segs).all(|(seg, ks)| match seg {
+        Segment::Exact(s) => s == ks,
+        Segment::Glob(g) => segment_glob_matches(ks, g),
+    })
+}
+
+impl SegmentGlob {
+    fn from(seg: &str) -> Self {
+        SegmentGlob {
+            parts: seg.split('*').map(str::to_string).collect(),
+        }
+    }
+}
+
+/// Match one key segment against a pre-split glob: literal parts must appear
+/// in order; `*` fills the gaps (leading/trailing/interior), never crossing
+/// `/` (a key segment never contains `/`).
+fn segment_glob_matches(seg: &str, glob: &SegmentGlob) -> bool {
+    let parts = &glob.parts;
+    let mut start = 0usize;
+    for (i, part) in parts.iter().enumerate() {
+        match seg[start..].find(part.as_str()) {
+            Some(rel) => {
+                let pos = start + rel;
+                if i + 1 == parts.len() {
+                    // The final literal must consume the remainder (an empty
+                    // final part is a trailing `*`, which allows anything).
+                    return part.is_empty() || pos + part.len() == seg.len();
+                }
+                start = pos + part.len();
+            }
+            None => return false,
+        }
+    }
+    unreachable!("a glob always has at least one part")
 }
 
 /// The final segment of a vault-relative key: strip **one** trailing `/`
@@ -303,5 +408,49 @@ mod tests {
             IgnoreSet::from_patterns(&[".DS_Store".to_string(), "a//b".to_string()]).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("a//b"), "second pattern not named: {msg:?}");
+    }
+
+    #[test]
+    fn ignore_set_star_segment() {
+        // `*` is the only v1 metacharacter: any run of non-`/` chars inside
+        // one segment, including empty; never crossing `/`.
+        let cases: &[(&[&str], &str, bool)] = &[
+            (&[".obsidian/workspace*"], ".obsidian/workspace", true),
+            (&[".obsidian/workspace*"], ".obsidian/workspace.json", true),
+            (
+                &[".obsidian/workspace*"],
+                ".obsidian/workspace-mobile.json",
+                true,
+            ),
+            (&[".obsidian/workspace*"], ".obsidian/app.json", false),
+            (&[".obsidian/workspace*"], ".obsidian/workspaces/x", false),
+            (&[".obsidian/workspace*"], "workspace", false),
+            (&["*.tmp"], "foo.tmp", true),
+            (&["*.tmp"], "notes/foo.tmp", true),
+            (&["*.tmp"], "foo.tmp.x", false),
+            (&["*.tmp"], "fooxtmp", false),
+            (&["pre*mid*suf"], "premidXsuf", true),
+            (&["pre*mid*suf"], "preXsuf", false),
+            (&["*"], "a", true),
+            (&["*"], "a/b", true),
+            (&["*"], "a/b/", true),
+            (&["foo/*/bar"], "foo/x/bar", true),
+            (&["foo/*/bar"], "foo/x/y/bar", false),
+            (&["foo/*/bar"], "foo/bar", false),
+            // Dir form with a glob segment: `cache/<any>/` and everything
+            // under it, never a file equal to the dir path without slash.
+            (&["cache/*/"], "cache/x/", true),
+            (&["cache/*/"], "cache/x/y/", true),
+            (&["cache/*/"], "cache/x", false),
+            (&["cache/*/"], "cache/", false),
+        ];
+        for (patterns, key, expect) in cases {
+            let set = set(patterns);
+            assert_eq!(
+                set.matches(key),
+                *expect,
+                "patterns {patterns:?} key {key:?}"
+            );
+        }
     }
 }
