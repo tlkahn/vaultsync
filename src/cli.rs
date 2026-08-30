@@ -642,7 +642,8 @@ fn dispatch_plan(
                 // (1 = sequential). I27: the executor's progress events feed
                 // the resolved renderer (bar on TTY/Auto or Always; no-op
                 // otherwise); stdout never sees progress bytes (I27-shape).
-                let report = {
+                let inventory_base = report.inventory_base;
+                let exec_report = {
                     let renderer = build_progress_renderer(resolved, err);
                     crate::exec::execute_plan_with_progress(
                         &local,
@@ -654,13 +655,45 @@ fn dispatch_plan(
                         renderer.as_ref(),
                     )
                 };
-                for w in &report.warnings {
+                for w in &exec_report.warnings {
                     let _ = writeln!(err, "warning: {w}");
                 }
-                for f in &report.failed {
+                for f in &exec_report.failed {
                     let _ = writeln!(err, "error: {}\n  {}", f.key, f.message);
                 }
-                if !report.failed.is_empty() {
+                // W240 (issue 45, D-commit-when): after a push with at least
+                // one successful remote mutation, commit the manifest LAST
+                // (bodies first, manifest last - D-commit-order). Pull and
+                // status never commit; a dry run mutated nothing so it never
+                // commits; zero mutations skip the write (SkippedNoMutations).
+                if mode == Mode::Push && !exec_report.mutations.is_empty() {
+                    match crate::inventory::commit_manifest(
+                        store,
+                        &inventory_base,
+                        &exec_report.mutations,
+                        None,
+                    ) {
+                        Ok(crate::inventory::CommitOutcome::Written { .. })
+                        | Ok(crate::inventory::CommitOutcome::SkippedNoMutations) => {}
+                        Ok(crate::inventory::CommitOutcome::PreconditionFailed) => {
+                            // Q2: a lost conditional race is a warning, not an
+                            // error - the transfers succeeded (bodies are
+                            // live); another writer's manifest won. Suggest
+                            // repair. Exit code stays 0 when transfers are ok.
+                            let _ = writeln!(
+                                err,
+                                "warning: manifest not committed (lost race or changed under us); run vaultsync repair if status looks wrong"
+                            );
+                        }
+                        Err(e) => {
+                            // Transfers already done; bodies may be ahead of
+                            // the manifest. Surface loudly, keep the data
+                            // exit code (repair story).
+                            let _ = writeln!(err, "warning: manifest commit failed: {e}");
+                        }
+                    }
+                }
+                if !exec_report.failed.is_empty() {
                     1
                 } else if plan
                     .actions
@@ -1731,6 +1764,193 @@ mod tests {
         assert!(err.contains("--json"), "err: {err}");
     }
 
+    #[test]
+    fn push_commits_manifest_with_uploaded_entries() {
+        // W240 (issue 45, D-commit-when/order): a push that uploads writes
+        // the manifest LAST - bodies first - with the uploaded files as
+        // entries. A second push that is clean (zero mutations) skips the
+        // commit (manifest unchanged).
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "hi").unwrap();
+        let store = MemoryStore::new();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::push(dir.path().into(), false),
+            &store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::Auto,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0, "err: {}", String::from_utf8_lossy(&err));
+        // Body uploaded and manifest written with one entry.
+        let mut buf = Vec::new();
+        let ent = store
+            .get_to(crate::local::MANIFEST_KEY, &mut buf)
+            .expect("manifest written");
+        assert!(ent.etag.is_some());
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        assert_eq!(m.entry_count, 1);
+        assert_eq!(m.entries[0].key, "a.md");
+        assert_eq!(m.entries[0].size, 2);
+        let etag1 = ent.etag;
+        // Second clean push: zero mutations -> no commit (etag unchanged).
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::push(dir.path().into(), false),
+            &store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::Auto,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0);
+        let h = store.head(crate::local::MANIFEST_KEY).unwrap();
+        assert_eq!(h.etag, etag1, "clean push must skip the commit");
+    }
+
+    #[test]
+    fn push_delete_removes_key_from_manifest() {
+        // W240 (issue 45): `push --delete` folds successful DeleteRemote
+        // keys out of the committed manifest.
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "hi").unwrap();
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"x".to_vec());
+        store.put_from("gone.md", &mut c, 1, Some(1)).unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::push(dir.path().into(), true),
+            &store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::Auto,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0, "err: {}", String::from_utf8_lossy(&err));
+        assert!(
+            matches!(
+                store.head("gone.md").unwrap_err(),
+                crate::error::Error::NotFound(_)
+            ),
+            "remote extra must be deleted"
+        );
+        let mut buf = Vec::new();
+        store.get_to(crate::local::MANIFEST_KEY, &mut buf).unwrap();
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        let keys: Vec<&str> = m.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["a.md"],
+            "deleted key must be absent from manifest"
+        );
+    }
+
+    #[test]
+    fn pull_does_not_write_manifest() {
+        // W240 / Q6 (issue 45): pull never commits the manifest - the body
+        // arrives but the manifest etag/body stay untouched.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"hi".to_vec());
+        store
+            .put_from("a.md", &mut c, 2, Some(1_600_000_000_000))
+            .unwrap();
+        let body = br#"{"schema":"vaultsync.manifest.v1","created_ms":0,"entry_count":1,"entries":[{"key":"a.md","size":2,"mtime_ms":1600000000000}]}"#;
+        let mut c = std::io::Cursor::new(body.to_vec());
+        let put = store
+            .put_from(crate::local::MANIFEST_KEY, &mut c, body.len() as u64, None)
+            .unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::pull(dir.path().into(), false),
+            &store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::Auto,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0, "err: {}", String::from_utf8_lossy(&err));
+        assert!(dir.join("a.md").exists(), "body pulled");
+        let h = store.head(crate::local::MANIFEST_KEY).unwrap();
+        assert_eq!(h.etag, put.etag, "pull must not rewrite the manifest");
+    }
+
+    #[test]
+    fn push_race_warning_exit_0_with_warning() {
+        // W240 / Q2 (issue 45): when the manifest commit loses its
+        // conditional race, the CLI prints the locked warning (substring
+        // `manifest not committed`), suggests repair, and exits 0 when the
+        // transfers succeeded (bodies are live; data ok).
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "hi").unwrap();
+        let store = RaceCommitStore {
+            inner: MemoryStore::new(),
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::push(dir.path().into(), false),
+            &store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::Auto,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0, "race warning must not fail a successful push");
+        let err = String::from_utf8(err).unwrap();
+        assert!(
+            err.contains("manifest not committed"),
+            "locked warning substring missing: {err}"
+        );
+        assert!(err.contains("repair"), "suggests repair: {err}");
+        // Body is live; manifest was NOT written (no clobber).
+        let body = store.inner.list("").unwrap();
+        assert!(
+            body.entities
+                .iter()
+                .any(|e| e.key == "a.md" && !e.is_folder()),
+            "uploaded body must be live: {:?}",
+            body.entities
+        );
+        assert!(
+            !body
+                .entities
+                .iter()
+                .any(|e| e.key == crate::local::MANIFEST_KEY),
+            "manifest must not be written on a lost race"
+        );
+    }
+
     /// A store whose `put_from` always fails, to inject a transfer failure.
     struct FailPutStore {
         inner: MemoryStore,
@@ -1759,6 +1979,55 @@ mod tests {
             Err(crate::error::Error::Other(format!(
                 "injected put failure for {key}"
             )))
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// Store whose CONDITIONAL put always loses the race (W240): plain puts
+    /// (file bodies) succeed, but any `put_from_with` with a precondition
+    /// answers PreconditionFailed - simulating another writer committing the
+    /// manifest between our plan and our commit.
+    struct RaceCommitStore {
+        inner: MemoryStore,
+    }
+    impl ObjectStore for RaceCommitStore {
+        fn list(&self, prefix: &str) -> Result<crate::store::Listing, crate::error::Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.head(key)
+        }
+        fn get_to(
+            &self,
+            key: &str,
+            w: &mut dyn std::io::Write,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime_ms: Option<u64>,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.put_from(key, r, size, mtime_ms)
+        }
+        fn put_from_with(
+            &self,
+            key: &str,
+            _r: &mut dyn std::io::Read,
+            _size: u64,
+            opts: crate::store::PutOpts,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            if opts.if_match_etag.is_some() || opts.if_none_match_star {
+                return Err(crate::error::Error::PreconditionFailed(format!(
+                    "lost race on {key}"
+                )));
+            }
+            self.inner.put_from(key, _r, _size, opts.mtime_ms)
         }
         fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
             self.inner.delete(key)

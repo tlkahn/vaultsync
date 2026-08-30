@@ -14,6 +14,7 @@
 //!   a per-key error, the run continues, and exit is non-zero at dispatch;
 //! - per-key failures are isolated; the report collects `(key, error)`.
 
+use crate::entity::Entity;
 use crate::error::Error;
 use crate::local::LocalFs;
 use crate::plan::{ActionKind, Mode, Plan};
@@ -30,6 +31,10 @@ pub struct ExecReport {
     /// Non-fatal warnings (e.g. an empty-dir cleanup error, W16/A-L3)
     /// surfaced to stderr; do not affect the exit code.
     pub warnings: Vec<String>,
+    /// Successful remote mutations in plan order (W239, issue 45): uploaded
+    /// Entities (size/mtime/etag from the put result) and deleted remote
+    /// keys. The CLI folds these into the manifest commit after a push.
+    pub mutations: Vec<crate::inventory::CommitMutation>,
 }
 
 /// A single failed key.
@@ -176,7 +181,7 @@ fn run_pass<F>(
     exec_item: F,
     fold: &mut FoldState<'_>,
 ) where
-    F: Fn(&crate::plan::Action) -> Result<(), Error> + Sync,
+    F: Fn(&crate::plan::Action) -> Result<Option<crate::entity::Entity>, Error> + Sync,
 {
     let items: Vec<&crate::plan::Action> = plan.actions.iter().filter(|a| a.kind == kind).collect();
     if items.is_empty() {
@@ -200,8 +205,28 @@ fn run_pass<F>(
     });
     for (a, r) in items.iter().zip(results) {
         match r {
-            Ok(()) => {
+            Ok(maybe_entity) => {
                 fold.rep.executed += 1;
+                // W239 (issue 45): record the successful remote mutations
+                // the manifest commit needs - upload entities (with the put
+                // result's etag) and deleted remote keys - in plan order.
+                match kind {
+                    ActionKind::Upload => {
+                        if let Some(e) = maybe_entity {
+                            fold.rep
+                                .mutations
+                                .push(crate::inventory::CommitMutation::Upload(e));
+                        }
+                    }
+                    ActionKind::DeleteRemote => {
+                        fold.rep
+                            .mutations
+                            .push(crate::inventory::CommitMutation::DeleteRemote(
+                                a.key.clone(),
+                            ));
+                    }
+                    _ => {}
+                }
                 if pass == PassKind::DeleteLocal {
                     fold.deleted_keys.push(a.key.clone());
                 }
@@ -244,7 +269,7 @@ fn exec_delete_remote(
     store: &dyn ObjectStore,
     a: &crate::plan::Action,
     opts: &crate::plan::PlanOpts,
-) -> Result<(), Error> {
+) -> Result<Option<Entity>, Error> {
     let Some(planned_remote) = &a.remote else {
         return Err(Error::Other(format!(
             "delete-remote planned without remote entity: {}",
@@ -276,15 +301,15 @@ fn exec_delete_remote(
         }
         Err(Error::NotFound(_)) => {
             // goal state already achieved (W10 idempotent-delete arm)
-            return Ok(());
+            return Ok(None);
         }
         Err(e) => return Err(e),
     }
     match store.delete(&a.key) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(None),
         // W10: head is best-effort; a delete-time NotFound still means
         // the goal state was reached.
-        Err(Error::NotFound(_)) => Ok(()),
+        Err(Error::NotFound(_)) => Ok(None),
         Err(e) => Err(e),
     }
 }
@@ -299,7 +324,7 @@ fn exec_delete_local(
     local: &LocalFs,
     a: &crate::plan::Action,
     opts: &crate::plan::PlanOpts,
-) -> Result<(), Error> {
+) -> Result<Option<Entity>, Error> {
     let Some(planned_local) = &a.local else {
         return Err(Error::Other(format!(
             "delete-local planned without local entity: {}",
@@ -312,14 +337,14 @@ fn exec_delete_local(
         planned_local.mtime_ms,
         opts.mtime_tolerance_ms,
     ) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(None),
         Err(Error::NotFound(_)) => {
             // W32: the goal state (file absent) is achieved, so count a
             // no-op delete as reaching it and keep the empty-dir cleanup
             // pass active for this key's ancestor chain. (The guarded
             // delete reports NotFound before any freshness check,
             // matching the old delete_file contract.)
-            Ok(())
+            Ok(None)
         }
         Err(e) => Err(e),
     }
@@ -434,7 +459,7 @@ fn exec_download(
     store: &dyn ObjectStore,
     a: &crate::plan::Action,
     tolerance_ms: u64,
-) -> Result<(), Error> {
+) -> Result<Option<Entity>, Error> {
     // W106/M1: a Download row must carry the remote entity the plan recorded
     // - the mid-stream cap's planned-size bound is derived from it (fail
     // closed like exec_upload does for `a.local`).
@@ -491,7 +516,7 @@ fn exec_download(
         local.finalize_write(&a.key, &tmp, remote_mtime)
     })();
     match result {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(None),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             // I20-r1/F3: route the created-dir cleanup through the
@@ -511,7 +536,7 @@ fn exec_upload(
     store: &dyn ObjectStore,
     a: &crate::plan::Action,
     tolerance_ms: u64,
-) -> Result<(), Error> {
+) -> Result<Option<Entity>, Error> {
     let local_ent = a
         .local
         .as_ref()
@@ -520,8 +545,11 @@ fn exec_upload(
     // changed between walk and open fails here (per-key), not silently.
     let expected_mtime = local_ent.mtime_ms;
     let mut f = local.open_verified(&a.key, local_ent.size, expected_mtime, tolerance_ms)?;
-    store.put_from(&a.key, &mut f, local_ent.size, expected_mtime)?;
-    Ok(())
+    // W239 (issue 45): return the remote entity from the put result (its
+    // etag is the authoritative remote etag) so the manifest commit copies
+    // the true remote identity.
+    let entity = store.put_from(&a.key, &mut f, local_ent.size, expected_mtime)?;
+    Ok(Some(entity))
 }
 
 #[cfg(test)]
@@ -1650,6 +1678,93 @@ mod tests {
             assert_eq!(body, format!("body-{i:02}").as_bytes());
         }
         assert_eq!(rep4, rep1);
+    }
+
+    #[test]
+    fn exec_report_carries_successful_remote_mutations() {
+        // W239 (issue 45): after a push, `ExecReport.mutations` carries the
+        // successful remote mutations in plan order - uploads as Entities
+        // (with the put result's etag) and DeleteRemote as keys - so the CLI
+        // can commit the manifest without re-listing. Failed uploads are
+        // absent (a failing store proves it).
+        let dir = TempDir::new("vaultsync-exec-test");
+        std::fs::write(dir.join("a.md"), "aaa").unwrap();
+        std::fs::write(dir.join("b.md"), "bbb").unwrap();
+        let local = LocalFs::new(dir.path());
+        let (local_entities, _) = local.list_report().unwrap();
+        let files: Vec<Entity> = local_entities
+            .iter()
+            .filter(|e| !e.is_folder())
+            .cloned()
+            .collect();
+        let plan = crate::plan::plan(
+            &local_entities,
+            &[],
+            Mode::Push,
+            &crate::plan::PlanOpts::default(),
+        );
+        // a.md uploads; b.md fails (put failure injected).
+        let store = FailPutStore::new();
+        store.poison("b.md");
+        let rep = execute_plan(
+            &local,
+            &store,
+            &plan,
+            Mode::Push,
+            &crate::plan::PlanOpts::default(),
+            1,
+        );
+        use crate::inventory::CommitMutation;
+        assert_eq!(rep.executed, 1, "only a.md succeeds");
+        assert_eq!(rep.failed.len(), 1);
+        assert_eq!(rep.failed[0].key, "b.md");
+        assert_eq!(rep.mutations.len(), 1, "only successful uploads reported");
+        match &rep.mutations[0] {
+            CommitMutation::Upload(e) => {
+                assert_eq!(e.key, "a.md");
+                assert_eq!(e.size, 3);
+                assert_eq!(e.size, files[0].size);
+                // etag comes from the put result (content-derived mock etag).
+                assert!(e.etag.is_some());
+            }
+            other => panic!("expected Upload, got {other:?}"),
+        }
+
+        // DeleteRemote keys are reported too (push --delete shape: remote
+        // extras removed).
+        let plan = crate::plan::plan(
+            &[],
+            &[Entity {
+                key: "gone.md".to_string(),
+                size: 1,
+                mtime_ms: Some(1),
+                etag: None,
+            }],
+            Mode::Push,
+            &crate::plan::PlanOpts {
+                delete: true,
+                ..Default::default()
+            },
+        );
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"x".to_vec());
+        store.put_from("gone.md", &mut c, 1, Some(1)).unwrap();
+        let rep = execute_plan(
+            &local,
+            &store,
+            &plan,
+            Mode::Push,
+            &crate::plan::PlanOpts {
+                delete: true,
+                ..Default::default()
+            },
+            1,
+        );
+        assert_eq!(rep.executed, 1);
+        assert_eq!(
+            rep.mutations,
+            vec![CommitMutation::DeleteRemote("gone.md".to_string())]
+        );
     }
 
     #[test]
