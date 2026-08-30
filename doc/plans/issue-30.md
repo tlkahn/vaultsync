@@ -1,6 +1,6 @@
 # Issue 30 plan: IgnoreSet matcher (pure pattern language)
 
-**Status:** planned (not yet implemented)
+**Status:** implemented (W178-W185 landed on this worktree)
 **Issue:** https://github.com/tlkahn/vaultsync/issues/30 (OPEN; P0 of epic #9)
 **Branch:** `worktree-ignoreset-matcher-pure-pattern-language` (this worktree; cut from
 `main` tip `25b88a5`)

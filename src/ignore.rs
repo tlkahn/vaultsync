@@ -19,6 +19,10 @@ use crate::error::Error;
 ///
 /// Construct once with [`IgnoreSet::from_patterns`], then query repeatedly
 /// with [`IgnoreSet::matches`]. No re-parsing happens after construction.
+///
+/// This issue ships only the pure matcher (issue #30); application - walk
+/// prune (#32), remote filter (#33), W25 retirement (#34) - is later epic #9
+/// work that filters entity lists through this type before planning.
 #[derive(Debug, Clone)]
 pub struct IgnoreSet {
     rules: Vec<Rule>,
