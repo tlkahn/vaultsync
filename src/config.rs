@@ -295,17 +295,19 @@ fn resolve_ignore(ignore: Option<&IgnoreConfig>) -> Result<(Vec<String>, Vec<Str
     // `profile = "none"` disables built-ins (escape hatch). Unknown values
     // become loud errors in W192 (not yet wired).
     let profile = ignore.and_then(|i| i.profile.as_deref());
-    let resolved: Vec<String> = match profile {
+    let mut resolved: Vec<String> = match profile {
         // W189: `none` -> no built-ins; the user list is the whole resolved
         // list (union with the empty profile).
-        Some("none") => user.clone(),
+        Some("none") => Vec::new(),
         // W188: `obsidian` / absent key -> the built-in Obsidian set.
-        // (W190 appends user patterns after the built-ins.)
         _ => OBSIDIAN_DEFAULT_IGNORE_PATTERNS
             .iter()
             .map(|s| s.to_string())
             .collect(),
     };
+    // W190: user patterns extend the active profile (union; stable order:
+    // built-ins first, user next). Exact-string dedup lands in W191.
+    resolved.extend(user.iter().cloned());
     Ok((user, resolved))
 }
 
@@ -543,6 +545,34 @@ patterns = [".git/"]
                 "unknown ignore key not named in: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn resolve_user_extends_obsidian() {
+        // Issue #31 (D3): user `patterns` **extend** the active profile
+        // (union, never replacement). With no `profile` key (default
+        // obsidian) or an explicit `obsidian`, the resolved list is the six
+        // built-ins followed by the user patterns. RED: the obsidian arm does
+        // not append user patterns yet.
+        let expected: Vec<String> = OBSIDIAN_DEFAULT_IGNORE_PATTERNS
+            .iter()
+            .map(|s| s.to_string())
+            .chain(std::iter::once("private/".to_string()))
+            .collect();
+
+        // No profile key -> default obsidian.
+        let text = "[ignore]\npatterns = [\"private/\"]\n";
+        let cfg = parse_config_str(text).unwrap();
+        let s = settings(&cfg).unwrap();
+        assert_eq!(s.ignore_patterns, vec!["private/".to_string()]);
+        assert_eq!(s.resolved_ignore_patterns, expected);
+
+        // Explicit `profile = "obsidian"` behaves identically.
+        let text = "[ignore]\nprofile = \"obsidian\"\npatterns = [\"private/\"]\n";
+        let cfg = parse_config_str(text).unwrap();
+        let s = settings(&cfg).unwrap();
+        assert_eq!(s.ignore_patterns, vec!["private/".to_string()]);
+        assert_eq!(s.resolved_ignore_patterns, expected);
     }
 
     #[test]
