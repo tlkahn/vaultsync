@@ -296,7 +296,9 @@ pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings,
 /// user `patterns` **extend** the active profile (union, never replacement).
 /// The resolved list is built-ins first, then user patterns (W190), exact-
 /// string deduped (W191), profile-validated (W192), and pattern-validated via
-/// `IgnoreSet` (W193). The user list stays raw (diagnostics; D-w25-seq).
+/// `IgnoreSet` (W193). The user list stays raw (kept for the user-vs-resolved
+/// split, D-w25-seq; not read by the CLI production path after W25
+/// retirement).
 fn resolve_ignore(ignore: Option<&IgnoreConfig>) -> Result<(Vec<String>, Vec<String>), Error> {
     let user = ignore.map(|i| i.patterns.clone()).unwrap_or_default();
     // D3/D-profile-values: absent profile (or `None`) -> `obsidian`;

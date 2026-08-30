@@ -259,11 +259,13 @@ fn compute_stats(actions: &[plan::Action]) -> plan::PlanStats {
 /// Build a [`Plan`] against a store for a real vault directory (Status mode).
 ///
 /// This convenience API returns only the [`Plan`] and **discards**
-/// [`PlanReport::warnings`] (store-listing, reserved-namespace, and
+/// [`PlanReport::warnings`] (store-listing drops, reserved leftovers, and
 /// ignore-pattern drops). Callers that need warnings must use [`build_plan`]
-/// directly. `ignore` forwards to [`build_plan`]; pass `&IgnoreSet::empty()`
-/// if you do not care (the CLI compiles its set from
-/// `Settings.resolved_ignore_patterns`, issue #34 D-wire).
+/// directly. The production CLI status path does not use this helper - it
+/// calls [`build_plan`] and prints the warnings itself. `ignore` forwards to
+/// [`build_plan`]; pass `&IgnoreSet::empty()` if you do not care (the CLI
+/// compiles its set from `Settings.resolved_ignore_patterns`, issue #34
+/// D-wire).
 pub fn status_with_store(
     vault: &Path,
     store: &dyn ObjectStore,
