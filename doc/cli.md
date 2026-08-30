@@ -57,6 +57,35 @@ vaultsync push --force-local
 vaultsync push --dry-run         # plan only, no mutations (push/pull only, not a global flag)
 ```
 
+### Progress output (push/pull)
+
+Push and pull render a live progress bar on stderr while the executor runs
+(issue 27), e.g. one `\r`-refreshed line per active pass:
+
+```text
+Uploading   notes/foo.md  847/1204  [=====>--]   70% 12.4 MiB/s ETA 1:12
+```
+
+The fixed layout is budgeted for an 80-column terminal: a 12-column verb
+field, a 12-column key field, and an 8-cell bar, with one-space rate/ETA
+suffixes. Terminal-width detection (rendering below 80 columns on narrow
+ttys) remains a follow-up option.
+
+- **stderr only, TTY only.** The bar appears only when stderr is a terminal
+  (`std::io::stderr().is_terminal()`); piped or redirected stderr stays quiet.
+  stdout is never touched: it carries the plan text (and the `--json` stream
+  later, Phase 3).
+- Passes with nothing to do render nothing; each pass ends with a newline.
+- `status`, `check`, `--dry-run` and `--json` never render progress.
+- Rate is cumulative (`bytes / elapsed`); ETA is `remaining / rate` - no
+  sliding window, so a mixed-size vault shows a jittery ETA (accepted v1).
+- Rate/ETA count bytes of **successful** transfers only: a failed key still
+  advances the key count, but its planned size is removed from the pass
+  total, so a pass with failures still ends at a clean 100% with no leftover
+  ETA.
+- There is no `--progress=` flag yet; the mode seam (`Auto`/`Off`/`Always`)
+  is the extension point for one.
+
 ### `vaultsync check`
 
 Connectivity probe: put/get/delete a tiny probe object under the prefix (no

@@ -15,13 +15,14 @@
 //! - Every parse error includes usage (clap does this natively).
 
 use std::ffi::OsString;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use clap::builder::ArgAction;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 
 use crate::plan::{Mode, PlanOpts};
+use crate::progress::{Progress, ProgressMode, ResolvedMode};
 use crate::store::ObjectStore;
 use crate::store::mock::MemoryStore;
 
@@ -292,13 +293,30 @@ fn reject_json(err: &mut dyn Write) -> i32 {
 /// Dispatch a command against a store, writing to `out`/`err`. Returns exit code.
 /// `tolerance_ms` is the resolved `transfer.mtime_tolerance_ms` threaded into
 /// every `PlanOpts` (W2, PR2 A-H2/B-M1).
+///
+/// I27-test: `progress_mode` selects the push/pull progress renderer - tests
+/// pass `Off` so their captured-stderr contracts stay untouched; the real
+/// binary path passes `Auto` (resolved against `stderr().is_terminal()` in
+/// dispatch); `Always` forces the bar for CLI progress tests.
+///
+/// `err` is `&mut (dyn Write + Send)` (not bare `dyn Write`) so the I27
+/// renderer built over it can satisfy `Progress: Send + Sync`. In-tree `Send`
+/// writers include `Vec<u8>`, `String`, and `Stderr` (the process handle);
+/// `StderrLock` is `!Send`, so pass `std::io::stderr()` here (as
+/// [`run_from_env`] does) rather than a `stderr().lock()`.
+///
+/// I27 (F7): `ProgressMode::Auto` probes the *process* stderr
+/// (`std::io::stderr().is_terminal()`), so `Auto` is only meaningful when
+/// `err` is the process stderr; captured-writer callers should pass
+/// `Off`/`Always` explicitly.
 pub fn run_with_io(
     cmd: Command,
     store: &dyn ObjectStore,
     tolerance_ms: u64,
     concurrency: u32,
+    progress_mode: ProgressMode,
     out: &mut dyn Write,
-    err: &mut dyn Write,
+    err: &mut (dyn Write + Send),
 ) -> i32 {
     match cmd {
         Command::Version => {
@@ -398,6 +416,7 @@ pub fn run_with_io(
                 follow_symlinks,
                 verbose,
                 concurrency,
+                progress: progress_mode,
             };
             dispatch_plan(&vault, store, Mode::Push, &opts, &flags, out, err)
         }
@@ -426,6 +445,7 @@ pub fn run_with_io(
                 follow_symlinks,
                 verbose,
                 concurrency,
+                progress: progress_mode,
             };
             dispatch_plan(&vault, store, Mode::Pull, &opts, &flags, out, err)
         }
@@ -461,11 +481,27 @@ fn print_walk_warnings(local: &crate::local::LocalFs, follow: bool, err: &mut dy
 /// 7-argument limit (W18/B-L9) while keeping the dry-run/verbosity/symlink
 /// plumbing in one place. `concurrency` rides along (I20: resolved
 /// `[transfer].concurrency`, bounds the transfer passes; 1 = sequential).
+/// `progress` is the I27 renderer selection (I27-test).
 struct PlanFlags {
     dry_run: bool,
     follow_symlinks: bool,
     verbose: u8,
     concurrency: u32,
+    progress: ProgressMode,
+}
+
+/// Build the I27 progress renderer for a resolved mode (I27 cycle 8 refactor:
+/// one small helper so a future `--progress=` flag lands in one place). The
+/// renderer borrows `err` for the duration of the run; `Box<dyn Progress>`
+/// keeps the two concrete renderers type-erased behind the executor's sink.
+fn build_progress_renderer<'w>(
+    resolved: ResolvedMode,
+    err: &'w mut (dyn Write + Send),
+) -> Box<dyn Progress + 'w> {
+    match resolved {
+        ResolvedMode::Render => Box::new(crate::progress::TermProgress::new(err)),
+        ResolvedMode::Quiet => Box::new(crate::progress::QuietProgress::new(err)),
+    }
 }
 
 /// Build a plan and dispatch push/pull execution.
@@ -476,6 +512,10 @@ struct PlanFlags {
 ///
 /// With `--dry-run`: print the plan, mutate nothing, exit like status
 /// (2 if dirty/conflicts, else 0).
+///
+/// I27: the resolved progress mode selects a `TermProgress`/`QuietProgress`
+/// renderer over `err`; `--json` runs never reach here (rejected earlier in
+/// `run_with_io`, I27-json).
 fn dispatch_plan(
     vault: &PathBuf,
     store: &dyn ObjectStore,
@@ -483,9 +523,14 @@ fn dispatch_plan(
     opts: &PlanOpts,
     flags: &PlanFlags,
     out: &mut dyn Write,
-    err: &mut dyn Write,
+    err: &mut (dyn Write + Send),
 ) -> i32 {
     let local = crate::local::LocalFs::with_follow(vault, flags.follow_symlinks);
+    // I27-tty: resolve the progress mode against the real stderr terminal
+    // status once per dispatch (Auto follows it; tests inject Off/Always via
+    // the seam).
+    let resolved =
+        crate::progress::resolve_progress_mode(flags.progress, std::io::stderr().is_terminal());
     match crate::build_plan(&local, store, mode, opts) {
         Ok(report) => {
             // H1 (W99): build_plan + store-listing warnings surface here, at
@@ -504,9 +549,21 @@ fn dispatch_plan(
                 if is_clean(plan) { 0 } else { 2 }
             } else {
                 // I20: `[transfer].concurrency` bounds the transfer passes
-                // (1 = sequential).
-                let report =
-                    crate::exec::execute_plan(&local, store, plan, mode, opts, flags.concurrency);
+                // (1 = sequential). I27: the executor's progress events feed
+                // the resolved renderer (bar on TTY/Auto or Always; no-op
+                // otherwise); stdout never sees progress bytes (I27-shape).
+                let report = {
+                    let renderer = build_progress_renderer(resolved, err);
+                    crate::exec::execute_plan_with_progress(
+                        &local,
+                        store,
+                        plan,
+                        mode,
+                        opts,
+                        flags.concurrency,
+                        renderer.as_ref(),
+                    )
+                };
                 for w in &report.warnings {
                     let _ = writeln!(err, "warning: {w}");
                 }
@@ -648,8 +705,9 @@ fn command_name(cmd: &Command) -> &'static str {
 fn run_with_settings(
     cmd: Command,
     settings: &crate::config::Settings,
+    progress_mode: ProgressMode,
     out: &mut dyn Write,
-    err: &mut dyn Write,
+    err: &mut (dyn Write + Send),
 ) -> i32 {
     // Build the store: a real `[store]` bucket -> S3Store; otherwise the mock.
     let store: Box<dyn ObjectStore> = if settings.store.bucket.is_empty() {
@@ -664,7 +722,7 @@ fn run_with_settings(
             }
         }
     };
-    run_with_settings_store(cmd, settings, store.as_ref(), out, err)
+    run_with_settings_store(cmd, settings, store.as_ref(), progress_mode, out, err)
 }
 
 /// The dispatch body of [`run_with_settings`] with an externally-provided
@@ -674,8 +732,9 @@ fn run_with_settings_store(
     cmd: Command,
     settings: &crate::config::Settings,
     store: &dyn ObjectStore,
+    progress_mode: ProgressMode,
     out: &mut dyn Write,
-    err: &mut dyn Write,
+    err: &mut (dyn Write + Send),
 ) -> i32 {
     // W25/M3: `[ignore].patterns` is a Phase 3 feature (parsed but not yet
     // applied). A mutating command that would silently not apply it must
@@ -716,6 +775,7 @@ fn run_with_settings_store(
         store,
         settings.mtime_tolerance_ms,
         settings.concurrency,
+        progress_mode,
         out,
         err,
     )
@@ -737,9 +797,12 @@ pub fn run_from_env() -> i32 {
         }
     };
     let stdout = std::io::stdout();
-    let stderr = std::io::stderr();
     let mut out = stdout.lock();
-    let mut err = stderr.lock();
+    // I27: use the `Stderr` handle (Send + Sync), not `StderrLock` (!Send),
+    // so the progress renderer built over it satisfies `Progress: Send +
+    // Sync`; `Stderr::write` locks internally per call, so worker-thread
+    // emission serializes on it.
+    let mut err = std::io::stderr();
 
     let cmd = match parse_args(&args) {
         Ok(c) => c,
@@ -752,7 +815,15 @@ pub fn run_from_env() -> i32 {
     // help/version need no config and must not fail on a bad config file.
     if matches!(cmd, Command::Help | Command::Version) {
         // help/version need no tolerance; the value is unused for these.
-        return run_with_io(cmd, &MemoryStore::new(), 0, 1, &mut out, &mut err);
+        return run_with_io(
+            cmd,
+            &MemoryStore::new(),
+            0,
+            1,
+            ProgressMode::Auto,
+            &mut out,
+            &mut err,
+        );
     }
 
     // Load + resolve config.
@@ -779,7 +850,7 @@ pub fn run_from_env() -> i32 {
             }
         }
     };
-    run_with_settings(cmd, &settings, &mut out, &mut err)
+    run_with_settings(cmd, &settings, ProgressMode::Auto, &mut out, &mut err)
 }
 
 #[cfg(test)]
@@ -1177,12 +1248,243 @@ mod tests {
     fn run_tol(cmd: Command, store: &dyn ObjectStore, tolerance_ms: u64) -> (i32, String, String) {
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_with_io(cmd, store, tolerance_ms, 1, &mut out, &mut err);
+        let code = run_with_io(
+            cmd,
+            store,
+            tolerance_ms,
+            1,
+            // I27-test: the existing suite captures stderr and must stay
+            // progress-silent; only progress tests opt into Always.
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
         (
             code,
             String::from_utf8(out).unwrap(),
             String::from_utf8(err).unwrap(),
         )
+    }
+
+    #[test]
+    fn run_seam_defaults_progress_off_for_captured_io() {
+        // I27-test no-change guard: a push over the captured-stderr seam with
+        // ProgressMode::Off must not emit any bar/refresh bytes - the existing
+        // suite's captured-stderr contracts stay untouched. The run still
+        // executes and stdout still carries the plan text.
+        let dir = TempDir::new("vaultsync-cli-test");
+        for i in 0..4 {
+            std::fs::write(dir.join(format!("n{i}.md")), format!("body-{i}")).unwrap();
+        }
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::push(dir.path().into(), false),
+            &MemoryStore::new(),
+            crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+            1,
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0);
+        let out = String::from_utf8(out).unwrap();
+        let err = String::from_utf8(err).unwrap();
+        assert!(!err.contains('\r'), "no carriage-return frames: {err:?}");
+        assert!(!err.contains("\x1b[K"), "no clear-to-EOL: {err:?}");
+        assert!(!err.contains("Uploading"), "no bar verb: {err:?}");
+        assert!(out.contains("U  n0.md"), "plan text still on stdout: {out}");
+    }
+
+    /// I27 cycle 8 helper: run a command over the seam with an explicit
+    /// progress mode and captured stdout/stderr buffers.
+    fn run_mode(
+        cmd: Command,
+        store: &dyn ObjectStore,
+        mode: ProgressMode,
+    ) -> (i32, String, String) {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            cmd,
+            store,
+            crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+            1,
+            mode,
+            &mut out,
+            &mut err,
+        );
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    }
+
+    #[test]
+    fn push_always_progress_writes_bar_frames_to_stderr() {
+        // I27 cycle 8: under ProgressMode::Always a push writes \r refresh
+        // frames with the pass verb to stderr, ending with an n/n frame;
+        // stdout keeps only the plan text (I27-shape: progress never touches
+        // stdout).
+        let dir = TempDir::new("vaultsync-cli-test");
+        for i in 0..4 {
+            std::fs::write(dir.join(format!("n{i}.md")), format!("body-{i}")).unwrap();
+        }
+        let (code, out, err) = run_mode(
+            Command::push(dir.path().into(), false),
+            &MemoryStore::new(),
+            ProgressMode::Always,
+        );
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(err.contains('\r'), "expected \r frames: {err:?}");
+        assert!(err.contains("\x1b[K"), "expected clear-to-EOL: {err:?}");
+        assert!(err.contains("Uploading"), "expected pass verb: {err:?}");
+        assert!(err.contains("4/4"), "expected final n/n frame: {err:?}");
+        assert!(out.contains("U  n0.md"), "plan text on stdout: {out}");
+        assert!(
+            !out.contains('\r'),
+            "stdout must stay progress-free: {out:?}"
+        );
+        assert!(
+            !out.contains("\x1b[K"),
+            "stdout must stay progress-free: {out:?}"
+        );
+    }
+
+    #[test]
+    fn push_off_progress_writes_nothing() {
+        // I27 cycle 8: the same push under ProgressMode::Off writes no bar/
+        // refresh bytes to stderr and leaves stdout byte-identical to the
+        // Always run (the renderer is the only difference).
+        let dir = TempDir::new("vaultsync-cli-test");
+        for i in 0..4 {
+            std::fs::write(dir.join(format!("n{i}.md")), format!("body-{i}")).unwrap();
+        }
+        // Two fresh stores: each leg must plan the same 4-upload push (a
+        // shared store would let the Always leg mutate it first).
+        let cmd = Command::push(dir.path().into(), false);
+        let (code_on, out_on, err_on) =
+            run_mode(cmd.clone(), &MemoryStore::new(), ProgressMode::Always);
+        let (code_off, out_off, err_off) = run_mode(cmd, &MemoryStore::new(), ProgressMode::Off);
+        assert_eq!(code_on, code_off);
+        assert_eq!(out_on, out_off, "stdout must be byte-identical");
+        assert!(!err_off.contains('\r'), "no frames under Off: {err_off:?}");
+        assert!(
+            !err_off.contains("Uploading"),
+            "no verb under Off: {err_off:?}"
+        );
+        assert!(
+            err_on.contains('\r') && !err_on.is_empty(),
+            "sanity: the Always leg does render"
+        );
+    }
+
+    #[test]
+    fn pull_always_progress_writes_download_frames() {
+        // I27 cycle 8: a pull renders Downloading frames.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = MemoryStore::new();
+        for i in 0..3 {
+            let mut cursor = std::io::Cursor::new(format!("remote-{i}").into_bytes());
+            store
+                .put_from(
+                    &format!("r{i}.md"),
+                    &mut cursor,
+                    format!("remote-{i}").len() as u64,
+                    Some(1_700_000_000_000 + i),
+                )
+                .unwrap();
+        }
+        let (code, out, err) = run_mode(
+            Command::pull(dir.path().into(), false),
+            &store,
+            ProgressMode::Always,
+        );
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(err.contains('\r'), "expected \r frames: {err:?}");
+        assert!(err.contains("Downloading"), "expected pass verb: {err:?}");
+        assert!(err.contains("3/3"), "expected final n/n frame: {err:?}");
+        assert!(out.contains("D  r0.md"), "plan text on stdout: {out}");
+        assert!(
+            !out.contains("\x1b[K"),
+            "stdout must stay progress-free: {out:?}"
+        );
+    }
+
+    #[test]
+    fn dry_run_and_status_emit_no_progress() {
+        // I27 cycle 8: --dry-run push and status never construct a renderer
+        // (the executor does not run / is not dispatched), so even
+        // ProgressMode::Always produces no frames.
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "hello").unwrap();
+        let dry_run_cmd = Command::Push {
+            vault: dir.path().into(),
+            delete: false,
+            dry_run: true,
+            force_local: false,
+            force_remote: false,
+            json: false,
+            config: None,
+            verbose: 0,
+            follow_symlinks: false,
+        };
+        let (code_dry, _, err_dry) =
+            run_mode(dry_run_cmd, &MemoryStore::new(), ProgressMode::Always);
+        assert_eq!(code_dry, 2, "dry run of a dirty push exits 2 (like status)");
+        assert!(
+            !err_dry.contains('\r') && !err_dry.contains("Uploading"),
+            "dry-run must not render: {err_dry:?}"
+        );
+        let (code_st, _, err_st) = run_mode(
+            Command::status(dir.path().into()),
+            &MemoryStore::new(),
+            ProgressMode::Always,
+        );
+        assert!(
+            !err_st.contains('\r')
+                && !err_st.contains("Downloading")
+                && !err_st.contains("Uploading"),
+            "status must not render: {err_st:?}"
+        );
+        assert_eq!(code_st, 2, "dirty status exits 2");
+    }
+
+    #[test]
+    fn progress_does_not_change_exit_codes() {
+        // I27 cycle 8: the 0/1/2 exit-code table is unchanged under
+        // ProgressMode::Always (conflict -> 2, transfer failure -> 1).
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("c.md"), "x").unwrap();
+        let mt = std::fs::metadata(dir.join("c.md"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let ms = mt
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let store = MemoryStore::new();
+        let mut cursor = std::io::Cursor::new(b"xx".to_vec());
+        store.put_from("c.md", &mut cursor, 2, Some(ms)).unwrap();
+        let (code_conflict, _, _) = run_mode(
+            Command::push(dir.path().into(), false),
+            &store,
+            ProgressMode::Always,
+        );
+        assert_eq!(code_conflict, 2, "conflict -> exit 2");
+
+        let dir2 = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir2.join("a.md"), "hello").unwrap();
+        let (code_fail, _, err) = run_mode(
+            Command::push(dir2.path().into(), false),
+            &FailPutStore {
+                inner: MemoryStore::new(),
+            },
+            ProgressMode::Always,
+        );
+        assert_eq!(code_fail, 1, "transfer failure -> exit 1, stderr: {err}");
     }
 
     #[test]
@@ -1432,6 +1734,7 @@ mod tests {
         let code = run_with_settings(
             Command::push(dir.path().into(), false),
             &settings,
+            ProgressMode::Off,
             &mut out,
             &mut err,
         );
@@ -1452,6 +1755,7 @@ mod tests {
         let code = run_with_settings(
             Command::pull(dir.path().into(), false),
             &settings,
+            ProgressMode::Off,
             &mut out,
             &mut err,
         );
@@ -1474,6 +1778,7 @@ mod tests {
         let code = run_with_settings(
             Command::status(dir.path().into()),
             &settings,
+            ProgressMode::Off,
             &mut out,
             &mut err,
         );
@@ -1501,6 +1806,7 @@ mod tests {
         let code = run_with_settings(
             Command::status(dir.path().into()),
             &settings,
+            ProgressMode::Off,
             &mut out,
             &mut err,
         );
@@ -1544,6 +1850,7 @@ mod tests {
         let code = run_with_settings(
             Command::pull(dir.path().into(), true),
             &settings,
+            ProgressMode::Off,
             &mut out,
             &mut err,
         );
@@ -1565,7 +1872,13 @@ mod tests {
         let settings = no_store_settings(dir.path());
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_with_settings(Command::check(), &settings, &mut out, &mut err);
+        let code = run_with_settings(
+            Command::check(),
+            &settings,
+            ProgressMode::Off,
+            &mut out,
+            &mut err,
+        );
         let err = String::from_utf8(err).unwrap();
         assert_eq!(code, 1);
         assert!(
@@ -1615,6 +1928,7 @@ mod tests {
             Command::push(dir.path().into(), false),
             &settings,
             &store,
+            ProgressMode::Off,
             &mut out,
             &mut err,
         );
@@ -1635,6 +1949,7 @@ mod tests {
             Command::push(dir.path().into(), false),
             &defaults,
             &store,
+            ProgressMode::Off,
             &mut out2,
             &mut err2,
         );

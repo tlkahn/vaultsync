@@ -124,7 +124,10 @@ Applies a `Plan` using LocalFs + ObjectStore:
 
 - bounded concurrency
 - dry-run short-circuits before mutating calls
-- streams progress events to the CLI
+- streams progress events to the CLI (issue 27: coarse, completion-driven
+  `PassStart`/`KeyDone`/`PassEnd`/`RunEnd` events via the `Progress` trait in
+  [src/progress.rs](../src/progress.rs); `exec` emits, `cli` renders - the
+  renderers (TTY bar / quiet) and the `ProgressMode` seam live there too)
 
 ### 6. CLI
 
