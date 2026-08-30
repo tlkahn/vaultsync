@@ -1219,6 +1219,16 @@ fn walk(
         // an invalid name must not abort the walk (P1r7-special-node-key).
         if ft.is_dir() {
             let key = format!("{}/", path_to_key(rel)?);
+            // D-prune (issue #32): a directory whose vault-relative key
+            // matches an ignore pattern is pruned - no folder entity, no
+            // recursion into it (descendants are never enumerated, so
+            // `.git/objects/...` is never walked). Count 1 for the pruned
+            // directory key only; unvisited descendants are not counted
+            // (D-report).
+            if opts.ignore.matches(&key) {
+                report.skipped_ignored += 1;
+                continue;
+            }
             if let Some(e) = folder_entity(&path, &key)? {
                 out.push(e);
             }
@@ -2492,6 +2502,65 @@ mod tests {
         assert_eq!(rep2.warnings, rep.warnings);
         // D-report: the field exists and defaults to 0 (no increments yet).
         assert_eq!(WalkReport::default().skipped_ignored, 0);
+    }
+
+    #[test]
+    fn walk_prunes_git_dir() {
+        // D-prune (issue acceptance): a directory whose key matches a
+        // dir-prefix pattern is pruned - no folder entity, no recursion. The
+        // planted `.git/objects/aa/bb` proves the subtree is never enumerated
+        // (entity absence is the acceptance bar; counting rule W198 owns
+        // exact counts).
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::write(dir.join("note.md"), "hi").unwrap();
+        std::fs::create_dir_all(dir.join(".git/objects/aa")).unwrap();
+        std::fs::write(dir.join(".git/objects/aa/bb"), "x").unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "ref").unwrap();
+        let fs = LocalFs::new(dir.path())
+            .with_ignore(IgnoreSet::from_patterns(&[".git/".to_string()]).unwrap());
+        let (ents, rep) = fs.list_report().unwrap();
+        let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
+        assert!(keys.contains(&"note.md"), "keep file missing: {keys:?}");
+        for absent in [
+            ".git/",
+            ".git/HEAD",
+            ".git/objects/",
+            ".git/objects/aa/",
+            ".git/objects/aa/bb",
+        ] {
+            assert!(
+                !keys.contains(&absent),
+                "{absent:?} still listed after prune: {keys:?}"
+            );
+        }
+        assert!(rep.skipped_ignored >= 1, "pruned dir not counted: {rep:?}");
+    }
+
+    #[test]
+    fn walk_dir_prefix_no_false_friends() {
+        // D-prune sharpness (PR 35 r2 heads-up, locked here): `.trash/` is a
+        // vault-rooted dir **prefix** - not a basename, not a substring.
+        // Siblings that merely contain the text must stay listed.
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::write(dir.join("not-trash.md"), "x").unwrap();
+        std::fs::write(dir.join("foo.trash"), "y").unwrap();
+        std::fs::write(dir.join(".trashfile"), "z").unwrap();
+        std::fs::create_dir_all(dir.join(".trash")).unwrap();
+        std::fs::write(dir.join(".trash/real.md"), "t").unwrap();
+        let fs = LocalFs::new(dir.path())
+            .with_ignore(IgnoreSet::from_patterns(&[".trash/".to_string()]).unwrap());
+        let (ents, rep) = fs.list_report().unwrap();
+        let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
+        for keep in ["not-trash.md", "foo.trash", ".trashfile"] {
+            assert!(keys.contains(&keep), "{keep:?} must remain: {keys:?}");
+        }
+        assert!(
+            !keys
+                .iter()
+                .any(|k| *k == ".trash/" || k.starts_with(".trash/")),
+            "trash dir listed: {keys:?}"
+        );
+        assert_eq!(rep.skipped_ignored, 1, "only .trash/ pruned: {rep:?}");
     }
 
     #[test]
