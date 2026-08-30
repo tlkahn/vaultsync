@@ -10,6 +10,7 @@ pub mod exec;
 pub mod ignore;
 pub use ignore::IgnoreSet;
 pub mod local;
+pub mod manifest;
 pub mod plan;
 pub(crate) mod pool;
 pub mod progress;
