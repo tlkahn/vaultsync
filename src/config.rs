@@ -295,6 +295,17 @@ fn resolve_ignore(ignore: Option<&IgnoreConfig>) -> Result<(Vec<String>, Vec<Str
     // `profile = "none"` disables built-ins (escape hatch). Unknown values
     // become loud errors in W192 (not yet wired).
     let profile = ignore.and_then(|i| i.profile.as_deref());
+    // W192: unknown profile values (incl. "", "Obsidian", "none ") are
+    // loud errors naming the raw value and the allowed set - no soft-default,
+    // no clamping, no trim (D-profile-values).
+    if let Some(other) = profile
+        && other != "obsidian"
+        && other != "none"
+    {
+        return Err(Error::Other(format!(
+            "ignore.profile: unknown profile {other:?} (allowed: \"obsidian\" | \"none\")"
+        )));
+    }
     let mut resolved: Vec<String> = match profile {
         // W189: `none` -> no built-ins; the user list is the whole resolved
         // list (union with the empty profile).
@@ -548,6 +559,44 @@ patterns = [".git/"]
             assert!(
                 msg.contains("profil") || msg.contains("foo"),
                 "unknown ignore key not named in: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_unknown_profile_errors() {
+        // Issue #31 (D-profile-values): exact codepoint match, case-sensitive,
+        // no trim. Anything other than `"obsidian"` | `"none"` (including
+        // `""`, `"Obsidian"`, `"none "`) is a loud error naming the raw
+        // value and the allowed set (prefer also naming `ignore.profile`).
+        // No soft-default, no clamping. RED: unknown values currently fall
+        // through to the obsidian default silently.
+        // (toml_value, raw_value): the newline case must be written as the
+        // TOML escape `\n` (a literal newline is not representable in a TOML
+        // basic string); TOML parses it back into the newline character.
+        let cases: &[(&str, &str)] = &[
+            ("git", "git"),
+            ("", ""),
+            ("Obsidian", "Obsidian"),
+            ("none ", "none "),
+            ("obsidian\\n", "obsidian\n"),
+        ];
+        for (toml_value, raw_value) in cases {
+            let text = format!("[ignore]\nprofile = \"{toml_value}\"\n");
+            let cfg = parse_config_str(&text).unwrap();
+            let err = settings(&cfg).unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("ignore.profile"),
+                "{raw_value:?} error must name ignore.profile: {msg}"
+            );
+            assert!(
+                msg.contains("obsidian") && msg.contains("none"),
+                "{raw_value:?} error must mention the allowed set obsidian|none: {msg}"
+            );
+            assert!(
+                msg.contains(&format!("{raw_value:?}")),
+                "{raw_value:?} error must name the raw value: {msg}"
             );
         }
     }
