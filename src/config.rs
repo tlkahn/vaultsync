@@ -32,6 +32,20 @@ pub const DEFAULT_RETRY_MAX_ATTEMPTS: u32 = 3;
 pub const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 1000;
 pub const DEFAULT_RETRY_MAX_DELAY_MS: u64 = 20000;
 
+/// Built-in Obsidian default ignore profile (issue #31 / roadmap D3).
+/// Vault-relative; exact strings; single source of truth for docs + resolve.
+/// The `obsidian` profile is the default when `[ignore]` is absent or
+/// `profile` is absent; `profile = "none"` disables it. User `[ignore].patterns`
+/// **extend** this set (union), never replace it.
+pub const OBSIDIAN_DEFAULT_IGNORE_PATTERNS: &[&str] = &[
+    ".git/",
+    ".trash/",
+    ".DS_Store",
+    ".obsidian/workspace",
+    ".obsidian/workspace.json",
+    ".obsidian/workspace-mobile.json",
+];
+
 /// On-disk config mirroring [cli.md]. All sections optional; defaults applied
 /// at resolution time. Unknown keys anywhere in the file are rejected loudly
 /// (W56, B nit): a typo like `mtime_tolerance` (missing `_ms`) or a
@@ -253,11 +267,7 @@ pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings,
             "transfer.concurrency must be <= {MAX_CONCURRENCY} (got {concurrency}); values above the cap are OS-thread cost for zero S3 throughput gain"
         )));
     }
-    let ignore_patterns = cfg
-        .ignore
-        .as_ref()
-        .map(|i| i.patterns.clone())
-        .unwrap_or_default();
+    let (ignore_patterns, resolved_ignore_patterns) = resolve_ignore(cfg.ignore.as_ref())?;
     let retry = resolve_retry(cfg.transfer.as_ref())?;
     Ok(Settings {
         vault_root,
@@ -265,11 +275,29 @@ pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings,
         mtime_tolerance_ms,
         concurrency,
         retry,
-        // W186 baseline: the resolved field mirrors the user list for now;
-        // W188+ replace this with real profile resolution.
-        ignore_patterns: ignore_patterns.clone(),
-        resolved_ignore_patterns: ignore_patterns,
+        ignore_patterns,
+        resolved_ignore_patterns,
     })
+}
+
+/// Resolve `[ignore]` into `(user patterns, resolved patterns)` (issue #31).
+///
+/// D3/D-profile-values: the built-in Obsidian set is the default when the
+/// section or `profile` key is absent; `profile = "none"` disables built-ins;
+/// user `patterns` **extend** the active profile (union, never replacement).
+/// The resolved list is built-ins first, then user patterns (W190), exact-
+/// string deduped (W191), profile-validated (W192), and pattern-validated via
+/// `IgnoreSet` (W193). The user list stays raw (W25 gates on it until #34 -
+/// D-w25-seq).
+fn resolve_ignore(ignore: Option<&IgnoreConfig>) -> Result<(Vec<String>, Vec<String>), Error> {
+    let user = ignore.map(|i| i.patterns.clone()).unwrap_or_default();
+    // W188 baseline: absent section / absent profile -> the Obsidian built-ins.
+    // (W189 adds `profile = "none"`; W190 appends user patterns.)
+    let resolved: Vec<String> = OBSIDIAN_DEFAULT_IGNORE_PATTERNS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    Ok((user, resolved))
 }
 
 /// Resolve + validate `[transfer.retry]` (I8): each absent field falls back
@@ -506,6 +534,34 @@ patterns = [".git/"]
                 "unknown ignore key not named in: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn resolve_default_profile_is_obsidian() {
+        // Issue #31 (D3/D-w25-seq): absent `[ignore]` (or an empty section)
+        // resolves the built-in Obsidian default set in constant order on the
+        // *resolved* field, while the user-only field stays empty so W25 never
+        // trips (the critical sequencing hazard). RED: `resolved_ignore_patterns`
+        // mirrors the user list today (W186 baseline), so the six built-ins are
+        // missing.
+        let expected: Vec<String> = OBSIDIAN_DEFAULT_IGNORE_PATTERNS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let cfg = FileConfig::default();
+        let s = settings(&cfg).unwrap();
+        assert!(
+            s.ignore_patterns.is_empty(),
+            "user field stays empty (W25-safe)"
+        );
+        assert_eq!(s.resolved_ignore_patterns, expected);
+
+        // Empty `[ignore]` section (present, no keys) resolves identically.
+        let cfg = parse_config_str("[ignore]\n").unwrap();
+        let s = settings(&cfg).unwrap();
+        assert!(s.ignore_patterns.is_empty());
+        assert_eq!(s.resolved_ignore_patterns, expected);
     }
 
     #[test]
