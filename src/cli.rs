@@ -64,6 +64,12 @@ pub enum Command {
         verbose: u8,
         json: bool,
     },
+    Repair {
+        config: Option<PathBuf>,
+        verbose: u8,
+        dry_run: bool,
+        force: bool,
+    },
     Version,
     Help,
 }
@@ -113,6 +119,15 @@ impl Command {
             config: None,
             verbose: 0,
             json: false,
+        }
+    }
+    /// Repair with defaults (dry-run off, force off).
+    pub fn repair() -> Command {
+        Command::Repair {
+            config: None,
+            verbose: 0,
+            dry_run: false,
+            force: false,
         }
     }
 }
@@ -175,6 +190,17 @@ struct TransferArgs {
     force_remote: bool,
 }
 
+#[derive(Args, Debug, Clone, PartialEq)]
+struct RepairArgs {
+    /// Rebuild the manifest body and report the entry count, but write
+    /// nothing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Overwrite the manifest unconditionally (no If-Match precondition).
+    #[arg(long)]
+    force: bool,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Show diff between local vault and remote prefix
@@ -185,6 +211,8 @@ enum Commands {
     Pull(TransferArgs),
     /// Connectivity probe against the configured store
     Check,
+    /// Rebuild the remote inventory manifest from a live list+head
+    Repair(RepairArgs),
     /// Print version
     Version,
     /// Show help
@@ -230,6 +258,12 @@ impl Cli {
                 config,
                 verbose,
                 json: self.json,
+            },
+            Some(Commands::Repair(a)) => Command::Repair {
+                config,
+                verbose,
+                dry_run: a.dry_run,
+                force: a.force,
             },
             Some(Commands::Version) => Command::Version,
             Some(Commands::Help) => Command::Help,
@@ -369,6 +403,58 @@ pub fn run_with_io(
                 }
                 Err(e) => {
                     let _ = writeln!(err, "check failed: {e}");
+                    1
+                }
+            }
+        }
+        Command::Repair {
+            config: _c,
+            verbose: _v,
+            dry_run,
+            force,
+        } => {
+            // W242 (issue 45, D-repair): rebuild the manifest from a live
+            // list+head. No plan table; short summary lines on stdout. Exit
+            // 0 on success (including dry-run), 1 on store errors. `--json`
+            // is not a Repair flag (schema stability is Phase 3).
+            let opts = crate::inventory::RepairOpts {
+                force,
+                dry_run,
+                concurrency: ctx.concurrency,
+            };
+            match crate::inventory::repair_manifest(store, &opts, None) {
+                Ok(report) => {
+                    for w in &report.warnings {
+                        let _ = writeln!(err, "warning: {w}");
+                    }
+                    let _ = writeln!(
+                        out,
+                        "repair: listed {} objects via list+head",
+                        report.listed
+                    );
+                    if report.dry_run {
+                        let _ = writeln!(
+                            out,
+                            "repair: dry-run ({} entries would be written)",
+                            report.listed
+                        );
+                    } else {
+                        let etag_suffix = match &report.etag {
+                            Some(e) => format!(" etag={e}"),
+                            None => String::new(),
+                        };
+                        let _ = writeln!(
+                            out,
+                            "repair: wrote {} ({} entries{})",
+                            crate::local::MANIFEST_KEY,
+                            report.listed,
+                            etag_suffix
+                        );
+                    }
+                    0
+                }
+                Err(e) => {
+                    let _ = writeln!(err, "error: {e}");
                     1
                 }
             }
@@ -726,7 +812,8 @@ fn cmd_config_path(cmd: &Command) -> Option<&Path> {
         Command::Status { config, .. }
         | Command::Push { config, .. }
         | Command::Pull { config, .. }
-        | Command::Check { config, .. } => config.as_deref(),
+        | Command::Check { config, .. }
+        | Command::Repair { config, .. } => config.as_deref(),
         Command::Version | Command::Help => None,
     }
 }
@@ -803,7 +890,10 @@ fn resolve_vault_from_config(cmd: Command, settings: &crate::config::Settings) -
 fn requires_real_store(cmd: &Command) -> bool {
     matches!(
         cmd,
-        Command::Push { .. } | Command::Pull { .. } | Command::Check { .. }
+        Command::Push { .. }
+            | Command::Pull { .. }
+            | Command::Check { .. }
+            | Command::Repair { .. }
     )
 }
 
@@ -813,6 +903,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::Push { .. } => "push",
         Command::Pull { .. } => "pull",
         Command::Check { .. } => "check",
+        Command::Repair { .. } => "repair",
         _ => "this command",
     }
 }
@@ -1948,6 +2039,141 @@ mod tests {
                 .iter()
                 .any(|e| e.key == crate::local::MANIFEST_KEY),
             "manifest must not be written on a lost race"
+        );
+    }
+
+    #[test]
+    fn repair_parses_and_runs_with_summary() {
+        // W242 (issue 45, D-repair): `vaultsync repair` parses with
+        // `--dry-run` / `--force`, and the run prints the locked summary
+        // substrings: `repair: listed N objects via list+head` and
+        // `repair: wrote .vaultsync/manifest/v1.json (N entries`. Exit 0 on
+        // success; dry-run writes nothing.
+        match parse_args(&["vaultsync".into(), "repair".into()]).unwrap() {
+            Command::Repair {
+                dry_run: false,
+                force: false,
+                ..
+            } => {}
+            other => panic!("expected plain repair, got {other:?}"),
+        }
+        match parse_args(&["vaultsync".into(), "repair".into(), "--dry-run".into()]).unwrap() {
+            Command::Repair { dry_run: true, .. } => {}
+            other => panic!("expected --dry-run, got {other:?}"),
+        }
+        match parse_args(&["vaultsync".into(), "repair".into(), "--force".into()]).unwrap() {
+            Command::Repair { force: true, .. } => {}
+            other => panic!("expected --force, got {other:?}"),
+        }
+
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"hi".to_vec());
+        store
+            .put_from("a.md", &mut c, 2, Some(1_600_000_000_000))
+            .unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::repair(),
+            &store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::ListHead,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0, "err: {}", String::from_utf8_lossy(&err));
+        let out = String::from_utf8(out).unwrap();
+        let err = String::from_utf8(err).unwrap();
+        assert!(
+            out.contains("repair: listed 1 objects via list+head"),
+            "out: {out}"
+        );
+        assert!(
+            out.contains("repair: wrote .vaultsync/manifest/v1.json (1 entries"),
+            "out: {out}"
+        );
+        assert!(!err.contains("error"), "no error expected: {err}");
+        // Manifest written and valid.
+        let mut buf = Vec::new();
+        store.get_to(crate::local::MANIFEST_KEY, &mut buf).unwrap();
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        assert_eq!(m.entry_count, 1);
+    }
+
+    #[test]
+    fn repair_dry_run_prints_count_and_writes_nothing() {
+        // W242 (issue 45): `repair --dry-run` prints the entry count but
+        // never writes the manifest object.
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"hi".to_vec());
+        store
+            .put_from("a.md", &mut c, 2, Some(1_600_000_000_000))
+            .unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::Repair {
+                config: None,
+                verbose: 0,
+                dry_run: true,
+                force: false,
+            },
+            &store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::ListHead,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0);
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("repair: listed 1 objects via list+head"),
+            "out: {out}"
+        );
+        assert!(out.contains("dry-run"), "dry-run must be named: {out}");
+        assert!(matches!(
+            store.head(crate::local::MANIFEST_KEY).unwrap_err(),
+            crate::error::Error::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn repair_fails_loudly_on_store_error() {
+        // W242 (issue 45): a store error during repair exits 1 with the
+        // error text (list failure propagates).
+        let store = crate::testutil::FailListStore {
+            inner: MemoryStore::new(),
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::repair(),
+            &store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::ListHead,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 1);
+        assert!(
+            String::from_utf8(err.clone()).unwrap().contains("error"),
+            "err: {}",
+            String::from_utf8_lossy(&err)
         );
     }
 

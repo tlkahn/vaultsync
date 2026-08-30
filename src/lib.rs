@@ -610,6 +610,41 @@ pub(crate) mod testutil {
             self.inner.delete(key)
         }
     }
+
+    /// Store whose `list` always fails (W242): injects a store error into
+    /// repair's cold listing so the CLI fail-loud path is testable offline.
+    pub(crate) struct FailListStore {
+        pub(crate) inner: crate::store::mock::MemoryStore,
+    }
+    impl crate::store::ObjectStore for FailListStore {
+        fn list(&self, _prefix: &str) -> Result<crate::store::Listing, crate::error::Error> {
+            Err(crate::error::Error::Unavailable(
+                "injected list failure".to_string(),
+            ))
+        }
+        fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.head(key)
+        }
+        fn get_to(
+            &self,
+            key: &str,
+            w: &mut dyn std::io::Write,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime_ms: Option<u64>,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.put_from(key, r, size, mtime_ms)
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
+            self.inner.delete(key)
+        }
+    }
 }
 
 #[cfg(test)]
