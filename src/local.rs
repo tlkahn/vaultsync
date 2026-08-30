@@ -2604,6 +2604,43 @@ mod tests {
     }
 
     #[test]
+    fn walk_dir_prefix_does_not_prune_nested_git() {
+        // W204/F4 (review 5467761913, low/optional): walk-level pin that
+        // `IgnoreSet` dir-prefix semantics hold end-to-end through the walk.
+        // `.git/` is a vault-rooted PATH PREFIX - it prunes the root `.git/`
+        // but must NEVER prune `nested/.git/` (the matcher pins this in #30;
+        // this row stops a future walk-layer "basename dir" helper from
+        // drifting under #10/#34).
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::write(dir.join("note.md"), "hi").unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "ref").unwrap();
+        std::fs::create_dir_all(dir.join("nested/.git")).unwrap();
+        std::fs::write(dir.join("nested/.git/HEAD"), "ref").unwrap();
+        std::fs::write(dir.join("nested/keep.md"), "keep").unwrap();
+        let fs = LocalFs::new(dir.path())
+            .with_ignore(IgnoreSet::from_patterns(&[".git/".to_string()]).unwrap());
+        let (ents, rep) = fs.list_report().unwrap();
+        let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
+        for keep in [
+            "note.md",
+            "nested/",
+            "nested/keep.md",
+            "nested/.git/",
+            "nested/.git/HEAD",
+        ] {
+            assert!(keys.contains(&keep), "{keep:?} must remain: {keys:?}");
+        }
+        for absent in [".git/", ".git/HEAD"] {
+            assert!(!keys.contains(&absent), "{absent:?} still listed: {keys:?}");
+        }
+        assert_eq!(
+            rep.skipped_ignored, 1,
+            "only root .git/ pruned, got: {rep:?}"
+        );
+    }
+
+    #[test]
     fn walk_skips_ignored_file() {
         // Issue acceptance (D-both-sides local half): a file whose
         // vault-relative key matches an ignore pattern is absent from the
