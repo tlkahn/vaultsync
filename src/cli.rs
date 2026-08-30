@@ -290,14 +290,29 @@ fn reject_json(err: &mut dyn Write) -> i32 {
     1
 }
 
+/// Resolved dispatch knobs bundled so `run_with_io` stays under clippy's
+/// 7-argument limit (W18/B-L9, W203) while keeping the public test seam
+/// callable without an arg explosion. `tolerance_ms` is the resolved
+/// `transfer.mtime_tolerance_ms` threaded into every `PlanOpts` (W2, PR2
+/// A-H2/B-M1); `concurrency` bounds the transfer passes (I20);
+/// `progress_mode` selects the push/pull progress renderer (I27-test);
+/// `ignore` is the compiled `[ignore]` set threaded into both the local walk
+/// (`LocalFs::with_ignore`, issue #32) and `build_plan` (issue #33) so the
+/// two halves always see the same matcher (D-both-sides, issue #34).
+#[derive(Debug, Clone)]
+pub struct DispatchCtx {
+    pub tolerance_ms: u64,
+    pub concurrency: u32,
+    pub progress_mode: ProgressMode,
+    pub ignore: crate::IgnoreSet,
+}
+
 /// Dispatch a command against a store, writing to `out`/`err`. Returns exit code.
-/// `tolerance_ms` is the resolved `transfer.mtime_tolerance_ms` threaded into
-/// every `PlanOpts` (W2, PR2 A-H2/B-M1).
 ///
-/// I27-test: `progress_mode` selects the push/pull progress renderer - tests
-/// pass `Off` so their captured-stderr contracts stay untouched; the real
-/// binary path passes `Auto` (resolved against `stderr().is_terminal()` in
-/// dispatch); `Always` forces the bar for CLI progress tests.
+/// I27-test: `ctx.progress_mode` selects the push/pull progress renderer -
+/// tests pass `Off` so their captured-stderr contracts stay untouched; the
+/// real binary path passes `Auto` (resolved against `stderr().is_terminal()`
+/// in dispatch); `Always` forces the bar for CLI progress tests.
 ///
 /// `err` is `&mut (dyn Write + Send)` (not bare `dyn Write`) so the I27
 /// renderer built over it can satisfy `Progress: Send + Sync`. In-tree `Send`
@@ -312,9 +327,7 @@ fn reject_json(err: &mut dyn Write) -> i32 {
 pub fn run_with_io(
     cmd: Command,
     store: &dyn ObjectStore,
-    tolerance_ms: u64,
-    concurrency: u32,
-    progress_mode: ProgressMode,
+    ctx: &DispatchCtx,
     out: &mut dyn Write,
     err: &mut (dyn Write + Send),
 ) -> i32 {
@@ -368,17 +381,12 @@ pub fn run_with_io(
                 return reject_json(err);
             }
             let opts = PlanOpts {
-                mtime_tolerance_ms: tolerance_ms,
+                mtime_tolerance_ms: ctx.tolerance_ms,
                 ..Default::default()
             };
-            let local = crate::local::LocalFs::with_follow(&vault, follow_symlinks);
-            match crate::build_plan(
-                &local,
-                store,
-                Mode::Status,
-                &opts,
-                &crate::IgnoreSet::empty(),
-            ) {
+            let local = crate::local::LocalFs::with_follow(&vault, follow_symlinks)
+                .with_ignore(ctx.ignore.clone());
+            match crate::build_plan(&local, store, Mode::Status, &opts, &ctx.ignore) {
                 Ok(report) => {
                     // H1 (W99): build_plan + store-listing warnings surface
                     // here, at the CLI layer - library code never writes to
@@ -412,7 +420,7 @@ pub fn run_with_io(
                 return reject_json(err);
             }
             let opts = PlanOpts {
-                mtime_tolerance_ms: tolerance_ms,
+                mtime_tolerance_ms: ctx.tolerance_ms,
                 delete,
                 force_local,
                 force_remote,
@@ -421,8 +429,9 @@ pub fn run_with_io(
                 dry_run,
                 follow_symlinks,
                 verbose,
-                concurrency,
-                progress: progress_mode,
+                concurrency: ctx.concurrency,
+                progress: ctx.progress_mode,
+                ignore: ctx.ignore.clone(),
             };
             dispatch_plan(&vault, store, Mode::Push, &opts, &flags, out, err)
         }
@@ -441,7 +450,7 @@ pub fn run_with_io(
                 return reject_json(err);
             }
             let opts = PlanOpts {
-                mtime_tolerance_ms: tolerance_ms,
+                mtime_tolerance_ms: ctx.tolerance_ms,
                 delete,
                 force_local,
                 force_remote,
@@ -450,8 +459,9 @@ pub fn run_with_io(
                 dry_run,
                 follow_symlinks,
                 verbose,
-                concurrency,
-                progress: progress_mode,
+                concurrency: ctx.concurrency,
+                progress: ctx.progress_mode,
+                ignore: ctx.ignore.clone(),
             };
             dispatch_plan(&vault, store, Mode::Pull, &opts, &flags, out, err)
         }
@@ -487,13 +497,17 @@ fn print_walk_warnings(local: &crate::local::LocalFs, follow: bool, err: &mut dy
 /// 7-argument limit (W18/B-L9) while keeping the dry-run/verbosity/symlink
 /// plumbing in one place. `concurrency` rides along (I20: resolved
 /// `[transfer].concurrency`, bounds the transfer passes; 1 = sequential).
-/// `progress` is the I27 renderer selection (I27-test).
+/// `progress` is the I27 renderer selection (I27-test). `ignore` is the
+/// compiled `[ignore]` set (W203, issue #34) threaded into both
+/// [`LocalFs::with_ignore`] and `build_plan` so the local walk and the
+/// remote filter always see the same matcher (D-both-sides).
 struct PlanFlags {
     dry_run: bool,
     follow_symlinks: bool,
     verbose: u8,
     concurrency: u32,
     progress: ProgressMode,
+    ignore: crate::IgnoreSet,
 }
 
 /// Build the I27 progress renderer for a resolved mode (I27 cycle 8 refactor:
@@ -531,13 +545,14 @@ fn dispatch_plan(
     out: &mut dyn Write,
     err: &mut (dyn Write + Send),
 ) -> i32 {
-    let local = crate::local::LocalFs::with_follow(vault, flags.follow_symlinks);
+    let local = crate::local::LocalFs::with_follow(vault, flags.follow_symlinks)
+        .with_ignore(flags.ignore.clone());
     // I27-tty: resolve the progress mode against the real stderr terminal
     // status once per dispatch (Auto follows it; tests inject Off/Always via
     // the seam).
     let resolved =
         crate::progress::resolve_progress_mode(flags.progress, std::io::stderr().is_terminal());
-    match crate::build_plan(&local, store, mode, opts, &crate::IgnoreSet::empty()) {
+    match crate::build_plan(&local, store, mode, opts, &flags.ignore) {
         Ok(report) => {
             // H1 (W99): build_plan + store-listing warnings surface here, at
             // the CLI layer - library code never writes to stderr.
@@ -779,9 +794,17 @@ fn run_with_settings_store(
     run_with_io(
         cmd,
         store,
-        settings.mtime_tolerance_ms,
-        settings.concurrency,
-        progress_mode,
+        &DispatchCtx {
+            tolerance_ms: settings.mtime_tolerance_ms,
+            concurrency: settings.concurrency,
+            progress_mode,
+            // W203: the seam is threaded (empty-compatible); real patterns
+            // from `settings.resolved_ignore_patterns` are wired in W204/W205
+            // together with the W25 gate removal. Today the W25 gate above
+            // still refuses/warns on a non-empty raw user list, so an empty
+            // set here is behavior-preserving.
+            ignore: crate::IgnoreSet::empty(),
+        },
         out,
         err,
     )
@@ -820,16 +843,15 @@ pub fn run_from_env() -> i32 {
 
     // help/version need no config and must not fail on a bad config file.
     if matches!(cmd, Command::Help | Command::Version) {
-        // help/version need no tolerance; the value is unused for these.
-        return run_with_io(
-            cmd,
-            &MemoryStore::new(),
-            0,
-            1,
-            ProgressMode::Auto,
-            &mut out,
-            &mut err,
-        );
+        // help/version need no tolerance; the value is unused for these. The
+        // ignore set stays empty (W203): help/version never walk or plan.
+        let ctx = DispatchCtx {
+            tolerance_ms: 0,
+            concurrency: 1,
+            progress_mode: ProgressMode::Auto,
+            ignore: crate::IgnoreSet::empty(),
+        };
+        return run_with_io(cmd, &MemoryStore::new(), &ctx, &mut out, &mut err);
     }
 
     // Load + resolve config.
@@ -1258,11 +1280,14 @@ mod tests {
         let code = run_with_io(
             cmd,
             store,
-            tolerance_ms,
-            1,
-            // I27-test: the existing suite captures stderr and must stay
-            // progress-silent; only progress tests opt into Always.
-            ProgressMode::Off,
+            &DispatchCtx {
+                tolerance_ms,
+                concurrency: 1,
+                // I27-test: the existing suite captures stderr and must stay
+                // progress-silent; only progress tests opt into Always.
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+            },
             &mut out,
             &mut err,
         );
@@ -1288,9 +1313,12 @@ mod tests {
         let code = run_with_io(
             Command::push(dir.path().into(), false),
             &MemoryStore::new(),
-            crate::config::DEFAULT_MTIME_TOLERANCE_MS,
-            1,
-            ProgressMode::Off,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+            },
             &mut out,
             &mut err,
         );
@@ -1315,9 +1343,12 @@ mod tests {
         let code = run_with_io(
             cmd,
             store,
-            crate::config::DEFAULT_MTIME_TOLERANCE_MS,
-            1,
-            mode,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: mode,
+                ignore: crate::IgnoreSet::empty(),
+            },
             &mut out,
             &mut err,
         );
