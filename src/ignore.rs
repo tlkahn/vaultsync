@@ -53,24 +53,61 @@ impl IgnoreSet {
     }
 }
 
-/// Compile one raw pattern into a [`Rule`]. Slash-free, metachar-free
-/// patterns become basename-anywhere; trailing-slash patterns become a dir
-/// prefix; slash-bearing non-dir patterns become an exact key; the segment
-/// `*` shape is rejected until W182.
+/// Compile one raw pattern into a [`Rule`]. Validation is loud (every reject
+/// names the offending pattern); the accepted shapes are basename-anywhere,
+/// dir prefix, exact key, and (W182) per-segment `*`.
 fn compile_pattern(pat: &str) -> Result<Rule, Error> {
-    if pat.ends_with('/') {
+    if pat.is_empty() {
+        return Err(invalid(pat, "pattern must not be empty"));
+    }
+    if pat.starts_with('/') {
+        return Err(invalid(pat, "leading '/' is not allowed"));
+    }
+    if pat.contains("**") {
+        return Err(invalid(pat, "'**' is not supported"));
+    }
+    if pat.contains('!') {
+        return Err(invalid(pat, "'!' (negation) is not supported"));
+    }
+    if pat.contains('\\') {
+        return Err(invalid(pat, "'\\' (escape) is not supported"));
+    }
+    if pat.contains('[') || pat.contains(']') {
+        return Err(invalid(
+            pat,
+            "character classes ('[' / ']') are not supported",
+        ));
+    }
+    if pat.contains('?') {
+        return Err(invalid(pat, "'?' is not supported"));
+    }
+    // A single trailing empty segment (the pattern ended with `/`) sets the
+    // dir form and is not a match segment; any other empty segment rejects.
+    let dir = pat.ends_with('/');
+    let body = if dir { &pat[..pat.len() - 1] } else { pat };
+    let segments: Vec<&str> = body.split('/').collect();
+    for seg in &segments {
+        if seg.is_empty() {
+            return Err(invalid(pat, "pattern contains an empty path segment"));
+        }
+    }
+    let has_star = segments.iter().any(|s| s.contains('*'));
+    if dir {
         return Ok(Rule::DirPrefix(pat.to_string()));
     }
-    let segments: Vec<&str> = pat.split('/').collect();
-    if segments.len() == 1 && !pat.contains('*') {
+    if segments.len() == 1 && !has_star {
         return Ok(Rule::Basename(pat.to_string()));
     }
-    if segments.len() > 1 && !pat.contains('*') {
+    if segments.len() > 1 && !has_star {
         return Ok(Rule::Exact(pat.to_string()));
     }
     Err(Error::Other(
         "ignore pattern shape not yet implemented".to_string(),
     ))
+}
+
+fn invalid(pat: &str, reason: &str) -> Error {
+    Error::Other(format!("invalid ignore pattern {pat:?}: {reason}"))
 }
 
 impl Rule {
@@ -222,5 +259,49 @@ mod tests {
                 "patterns {patterns:?} key {key:?}"
             );
         }
+    }
+
+    #[test]
+    fn ignore_set_rejects_doublestar_negation_empty_abs() {
+        // Every reject is loud: Err naming the offending pattern (raw chars;
+        // backslash appears Debug-escaped) plus a reason token.
+        let cases: &[(&str, &[&str])] = &[
+            ("", &["empty"]),
+            ("/abs", &["leading", "/"]),
+            ("/.DS_Store", &["leading", "/"]),
+            ("**", &["**"]),
+            ("./**/x", &["**"]),
+            ("a/**/b", &["**"]),
+            ("!foo", &["!", "negation"]),
+            ("foo!", &["!"]),
+            ("a/!b", &["!"]),
+            ("foo[bar]", &["class", "["]),
+            ("foo\\bar", &["escape", "\\"]),
+            ("foo?", &["?"]),
+            ("a//b", &["empty"]),
+            // Dir-form variant of the empty-segment reject: `a//b/` strips
+            // one trailing `/` then splits `a//b` -> interior empty segment.
+            ("a//b/", &["empty"]),
+            ("/", &["leading"]),
+        ];
+        for (pat, tokens) in cases {
+            let err = IgnoreSet::from_patterns(&[pat.to_string()]).unwrap_err();
+            let msg = err.to_string();
+            let named = msg.contains(pat) || msg.contains(&pat.replace('\\', "\\\\"));
+            assert!(named, "pattern {pat:?} not named in {msg:?}");
+            for t in *tokens {
+                assert!(msg.contains(t), "token {t:?} missing in {msg:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn ignore_set_invalid_second_pattern_names_it() {
+        // A later invalid pattern still errors, naming the offending one
+        // (the first, valid pattern compiles fine first).
+        let err =
+            IgnoreSet::from_patterns(&[".DS_Store".to_string(), "a//b".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("a//b"), "second pattern not named: {msg:?}");
     }
 }
