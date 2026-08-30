@@ -1269,7 +1269,6 @@ fn handle_followed_symlink(
     visited: &mut std::collections::HashSet<PathBuf>,
     ignore: &IgnoreSet,
 ) -> Result<(), Error> {
-    let _ = ignore; // threaded; matching applied in W200
     let rel = path
         .strip_prefix(root)
         .map_err(|_| Error::Other(format!("walk symlink escaped root: {}", path.display())))?;
@@ -1315,6 +1314,17 @@ fn handle_followed_symlink(
             report.skipped_symlinks += 1;
             return Ok(()); // cycle guard / duplicate-target guard
         }
+        // Issue #32 (D-prune on followed dir symlinks): the same ignore
+        // check as the plain dir arm, against the link entry's OWN
+        // vault-relative key (D-match-subject - the canonical target path is
+        // never re-matched). Match: count 1, no emit, no recurse into the
+        // link path. The "duplicates" warning below is skipped too: nothing
+        // is listed under the alias, so nothing duplicates.
+        let key = format!("{}/", path_to_key(rel)?);
+        if ignore.matches(&key) {
+            report.skipped_ignored += 1;
+            return Ok(());
+        }
         // W67/A-L5: an in-vault dir-symlink target is always independently
         // walked (out-of-vault targets are skipped earlier), so the alias
         // always double-lists the target's content under both keys - push a
@@ -1331,7 +1341,6 @@ fn handle_followed_symlink(
             path_to_key(rel)?,
             target_rel
         ));
-        let key = format!("{}/", path_to_key(rel)?);
         if let Some(e) = folder_entity(path, &key)? {
             out.push(e);
         }
@@ -1357,6 +1366,14 @@ fn handle_followed_symlink(
             return Ok(());
         }
         let key = path_to_key(rel)?;
+        // Issue #32: same file-arm ignore check as the plain walk, against
+        // the link entry's own vault-relative key. Match: count 1, no emit,
+        // and do NOT insert into `followed_files` (no plan row exists under
+        // that key).
+        if ignore.matches(&key) {
+            report.skipped_ignored += 1;
+            return Ok(());
+        }
         // R4-M1/W38: record that this file key came from a followed *file*
         // symlink. Transfers refuse to open a symlink, so the planner marks
         // these rows Skip(followed_symlink) in mutating modes; `--follow-
@@ -3237,6 +3254,67 @@ mod tests {
                 && w.contains("realdir/")),
             "no in-vault alias warning: {:?}",
             report.warnings
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_follow_symlink_into_ignored_dir() {
+        // D-match-subject: the same ignore checks apply on the
+        // followed-symlink arms, against the link entry's OWN vault-relative
+        // key (never the canonical target's path). The link is named `.git`
+        // so its key matches the `.git/` dir-prefix pattern; the real target
+        // is walked under its own key unless separately ignored. Must not
+        // hang (cycle/visited guards unchanged).
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::create_dir_all(dir.join("realdir")).unwrap();
+        std::fs::write(dir.join("realdir/child.md"), "c").unwrap();
+        std::fs::write(dir.join("keep.md"), "k").unwrap();
+        std::os::unix::fs::symlink("realdir", dir.join(".git")).unwrap();
+        let fs = LocalFs::with_follow(dir.path(), true)
+            .with_ignore(IgnoreSet::from_patterns(&[".git/".to_string()]).unwrap());
+        let (ents, rep) = fs.list_report().unwrap();
+        let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
+        assert!(keys.contains(&"keep.md"), "keep missing: {keys:?}");
+        assert!(
+            keys.contains(&"realdir/child.md"),
+            "real target missing: {keys:?}"
+        );
+        assert!(!keys.contains(&".git/"), "alias dir listed: {keys:?}");
+        assert!(
+            !keys.contains(&".git/child.md"),
+            "alias child listed: {keys:?}"
+        );
+        assert!(rep.skipped_ignored >= 1, "pruned link not counted: {rep:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_follow_skips_ignored_file_symlink() {
+        // D-match-subject, file arm: a followed FILE symlink whose own key
+        // matches an ignore pattern is skipped - absent from entities AND
+        // from `followed_files` (no plan row exists under that key); the
+        // real target still lists.
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::write(dir.join("real.md"), "r").unwrap();
+        std::os::unix::fs::symlink("real.md", dir.join(".DS_Store")).unwrap();
+        let fs = LocalFs::with_follow(dir.path(), true)
+            .with_ignore(IgnoreSet::from_patterns(&[".DS_Store".to_string()]).unwrap());
+        let (ents, rep) = fs.list_report().unwrap();
+        let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
+        assert!(keys.contains(&"real.md"), "real target missing: {keys:?}");
+        assert!(
+            !keys.contains(&".DS_Store"),
+            "ignored file symlink listed: {keys:?}"
+        );
+        assert!(
+            !rep.followed_files.contains(".DS_Store"),
+            "followed_files polluted: {:?}",
+            rep.followed_files
+        );
+        assert!(
+            rep.skipped_ignored >= 1,
+            "skipped link not counted: {rep:?}"
         );
     }
 
