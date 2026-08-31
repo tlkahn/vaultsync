@@ -417,7 +417,7 @@ pub fn run_with_io(
         }
         Command::Repair {
             vault,
-            json: _json,
+            json,
             config: _c,
             verbose: _v,
             dry_run,
@@ -426,8 +426,11 @@ pub fn run_with_io(
             // W242 (issue 45, D-repair): rebuild the manifest from a live
             // list+head. No plan table; short summary lines on stdout. Exit
             // 0 on success (including dry-run), 1 on store errors. `--json`
-            // is not a Repair flag (schema stability is Phase 3; W252 adds
-            // the reject).
+            // is not a Repair flag (schema stability is Phase 3; W252 makes
+            // it loud like status/push/pull/check).
+            if json {
+                return reject_json(err);
+            }
             let opts = crate::inventory::RepairOpts {
                 force,
                 dry_run,
@@ -2352,6 +2355,44 @@ mod tests {
             "err: {}",
             String::from_utf8_lossy(&err)
         );
+    }
+
+    #[test]
+    fn repair_json_is_rejected() {
+        // W252 (F2, review 5472033449): `repair --json` is loud, not silent -
+        // the flag parses (Phase 3 schema stability) but dispatch rejects it
+        // with the locked substring like status/push/pull/check.
+        match parse_args(&["vaultsync".into(), "repair".into(), "--json".into()]).unwrap() {
+            Command::Repair { json: true, .. } => {}
+            other => panic!("expected --json carried on Repair, got {other:?}"),
+        }
+        let store = MemoryStore::new();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::Repair {
+                vault: PathBuf::from(VAULT_UNSET),
+                json: true,
+                config: None,
+                verbose: 0,
+                dry_run: false,
+                force: false,
+            },
+            &store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::ListHead,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 1);
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.contains("--json"), "err: {err}");
+        assert!(err.contains("not implemented"), "err: {err}");
     }
 
     /// A store whose `put_from` always fails, to inject a transfer failure.
