@@ -2005,6 +2005,60 @@ mod tests {
         store
     }
 
+    /// W371 double: wraps [`crate::testutil::S3LikeListStore`] but overrides
+    /// `list_with_progress` to first paint a live `ListPage` (Listing frame)
+    /// through the CLI's real `progress` sink, then delegate to `inner.list`
+    /// whose head-enrichment fails closed via `fail_head` - so a cold status
+    /// under Always paints a non-empty plan frame and then hits a mid-cold
+    /// hard error (no `PlanEnd`).
+    struct PaintedListingFailStore {
+        inner: crate::testutil::S3LikeListStore,
+    }
+    impl crate::store::ObjectStore for PaintedListingFailStore {
+        fn list(&self, prefix: &str) -> Result<crate::store::Listing, crate::error::Error> {
+            self.inner.list(prefix)
+        }
+        fn list_with_progress(
+            &self,
+            prefix: &str,
+            progress: &dyn crate::progress::Progress,
+        ) -> Result<crate::store::Listing, crate::error::Error> {
+            // Paint one cumulative listing frame to the renderer BEFORE the
+            // enrichment fails, so the mid-cold finalize has a real bar.
+            let raw = self.inner.inner().list(prefix)?;
+            let keys_so_far = raw.entities.iter().filter(|e| !e.is_folder()).count() as u64;
+            progress.event(crate::progress::ProgressEvent::ListPage {
+                page: 1,
+                keys_so_far,
+            });
+            // inner.list runs the REAL enrichment (NoProgress internally) and
+            // fails closed on the configured fail_head key.
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.head(key)
+        }
+        fn get_to(
+            &self,
+            key: &str,
+            w: &mut dyn std::io::Write,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime_ms: Option<u64>,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.put_from(key, r, size, mtime_ms)
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
+            self.inner.delete(key)
+        }
+    }
+
     #[test]
     fn status_cold_always_shows_plan_progress() {
         // W351: cold status under ProgressMode::Always renders Listing/Heading
@@ -2188,6 +2242,50 @@ mod tests {
         let last_nl = err[..idx]
             .rfind('\n')
             .expect("W236 must follow a finalized progress frame");
+        for (i, ch) in err.char_indices() {
+            if ch == '\r' {
+                assert!(i < last_nl, "\r frame after the plan finalize: {err:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn status_cold_always_mid_cold_failure_finalizes_before_error() {
+        // W371 (H1/M2 E2E): cold status under Always paints a live Listing
+        // frame, then the head-enrichment fails closed (fail_head) so no
+        // `PlanEnd` reaches the renderer - the CLI must newline-finalize the
+        // partial bar before printing `error:`. The assertion `err[..idx]
+        // .ends_with('\n')` proves `finish_plan` ran through the trait object
+        // (before W370 the trait default no-op left no newline, so this
+        // failed - RED on tip 8a48b03).
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "aaa").unwrap();
+        let mut inner = crate::testutil::S3LikeListStore::new();
+        let mut c = std::io::Cursor::new(b"remote".to_vec());
+        inner
+            .inner()
+            .put_from("r.md", &mut c, 6, Some(1_600_000_000_000))
+            .unwrap();
+        inner.fail_head("r.md");
+        let store = PaintedListingFailStore { inner };
+        let (code, _out, err) = run_mode(
+            Command::status(dir.path().into()),
+            &store,
+            ProgressMode::Always,
+        );
+        assert_eq!(code, 1, "mid-cold head failure exits 1; stderr: {err}");
+        assert!(
+            err.contains("Listing"),
+            "a live plan frame was painted before the head failure: {err:?}"
+        );
+        let idx = err.find("error:").expect("hard error line");
+        assert!(
+            err[..idx].ends_with('\n'),
+            "finalize newline before the error line: {err:?}"
+        );
+        let last_nl = err[..idx]
+            .rfind('\n')
+            .expect("a newline precedes the error line");
         for (i, ch) in err.char_indices() {
             if ch == '\r' {
                 assert!(i < last_nl, "\r frame after the plan finalize: {err:?}");

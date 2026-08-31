@@ -436,28 +436,43 @@ impl<'w> TermProgress<'w> {
             start: std::time::Instant::now(),
         }
     }
+}
 
-    /// Issue 42 belt-and-braces (I42-finalize): finalize a partial plan bar
-    /// with a newline so later stderr lines (warnings, W236, errors) never
-    /// collide with a mid-line `\r` frame. No-op when the plan line was
-    /// already finalized via `PlanEnd` or there is nothing to render.
-    pub fn finish_plan(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.plan_finalized {
-            return;
-        }
-        let rendered = inner.plan_line.render();
-        if rendered.is_empty() {
-            return;
-        }
-        inner.plan_finalized = true;
-        let frame = format!("\r{rendered}\x1b[K\n");
-        let _ = inner.writer.write_all(frame.as_bytes());
-        let _ = inner.writer.flush();
+/// Issue 42 finalize (I42-finalize, W370/W372): write the single plan
+/// finalize frame - `\r{rendered}\x1b[K\n` - exactly once. Idempotent (guards
+/// on `plan_finalized`); marks `plan_finalized` even when there is nothing to
+/// render (L1: a `PlanEnd` with an empty render still finalizes, so a later
+/// belt-and-braces call cannot race a future non-empty state). Shared by both
+/// the `PlanEnd` path in `event` and the `finish_plan` trait override so the
+/// finalize frame format string lives in one place (no drift).
+fn finalize_plan_frame(inner: &mut TermInner) {
+    if inner.plan_finalized {
+        return;
     }
+    inner.plan_finalized = true;
+    let rendered = inner.plan_line.render();
+    if rendered.is_empty() {
+        return;
+    }
+    let frame = format!("\r{rendered}\x1b[K\n");
+    let _ = inner.writer.write_all(frame.as_bytes());
+    let _ = inner.writer.flush();
 }
 
 impl Progress for TermProgress<'_> {
+    /// Issue 42 belt-and-braces (I42-finalize, W370): finalize a partial plan
+    /// bar with a newline so later stderr lines (warnings, W236, errors) never
+    /// collide with a mid-line `\r` frame - even when the library could not
+    /// emit `PlanEnd` (mid-cold failure). No-op when the plan line was already
+    /// finalized via `PlanEnd` or there is nothing to render. This override is
+    /// what makes `Box<dyn Progress>::finish_plan()` (the CLI's renderer
+    /// boundary) run the real body; before it, dispatch hit the trait default
+    /// no-op (H1).
+    fn finish_plan(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        finalize_plan_frame(&mut inner);
+    }
+
     fn event(&self, ev: ProgressEvent) {
         if matches!(ev, ProgressEvent::RunEnd { .. }) {
             // The pass line was finalized with a newline at PassEnd; a RunEnd
@@ -471,20 +486,20 @@ impl Progress for TermProgress<'_> {
             let finalize = matches!(ev, ProgressEvent::PlanEnd);
             let mut inner = self.inner.lock().unwrap();
             inner.plan_line.on_event(ev);
-            let rendered = inner.plan_line.render();
-            if rendered.is_empty() {
-                return;
-            }
             if finalize {
-                inner.plan_finalized = true;
-            }
-            let frame = if finalize {
-                format!("\r{rendered}\x1b[K\n")
+                // PlanEnd updates the line state first (keeps the last frame);
+                // the shared helper writes the single finalize frame. L1: it
+                // marks finalize even when the render is empty.
+                finalize_plan_frame(&mut inner);
             } else {
-                format!("\r{rendered}\x1b[K")
-            };
-            let _ = inner.writer.write_all(frame.as_bytes());
-            let _ = inner.writer.flush();
+                let rendered = inner.plan_line.render();
+                if rendered.is_empty() {
+                    return;
+                }
+                let frame = format!("\r{rendered}\x1b[K");
+                let _ = inner.writer.write_all(frame.as_bytes());
+                let _ = inner.writer.flush();
+            }
             return;
         }
         let finalize = matches!(ev, ProgressEvent::PassEnd { .. });
@@ -1765,5 +1780,87 @@ mod tests {
         assert_eq!(format_eta(3661.0), "1:01:01");
         // just below an hour stays `m:ss` (the m:ss -> h:mm:ss transition)
         assert_eq!(format_eta(3599.4), "59:59");
+    }
+
+    // I42-finalize (W369, H1 RED): `finish_plan` called through `Box<dyn
+    // Progress>` - the exact dispatch boundary the CLI uses - must finalize a
+    // partial plan bar (no `PlanEnd`) with a newline. Today the trait default
+    // no-op leaves only `\r` refreshes with no trailing newline, so the
+    // finalize assertions fail (RED). This is characterization-GREEN on the
+    // W370 trait override.
+    #[test]
+    fn finish_plan_via_dyn_progress_finalizes_partial_bar() {
+        let mut buf = Vec::new();
+        {
+            let boxed: Box<dyn Progress> = Box::new(TermProgress::new(&mut buf));
+            boxed.event(ProgressEvent::PlanStart);
+            boxed.event(ProgressEvent::ListPage {
+                page: 1,
+                keys_so_far: 1000,
+            });
+            boxed.event(ProgressEvent::ListPage {
+                page: 2,
+                keys_so_far: 2000,
+            });
+            // belt-and-braces finalize with NO PlanEnd (mid-cold failure)
+            boxed.finish_plan();
+            // second finalize must be idempotent (no extra newline)
+            boxed.finish_plan();
+        }
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("Listing"), "last frame state: {s:?}");
+        assert!(s.contains("2000 keys"), "latest frame content: {s:?}");
+        assert!(
+            s.ends_with("\x1b[K\n"),
+            "finalize must clear then newline: {s:?}"
+        );
+        assert_eq!(
+            s.matches('\r').count(),
+            3,
+            "two refreshes + one finalize frame: {s:?}"
+        );
+        assert_eq!(
+            s.matches('\n').count(),
+            1,
+            "exactly one finalize newline (idempotent): {s:?}"
+        );
+    }
+
+    // I42-finalize (W369 characterization): after a success-path `PlanEnd`
+    // (which writes its own newline), a subsequent belt-and-braces
+    // `finish_plan` is a no-op - still a single plan-line newline.
+    #[test]
+    fn plan_end_then_finish_plan_is_idempotent() {
+        let mut buf = Vec::new();
+        {
+            let boxed: Box<dyn Progress> = Box::new(TermProgress::new(&mut buf));
+            boxed.event(ProgressEvent::PlanStart);
+            boxed.event(ProgressEvent::ListPage {
+                page: 1,
+                keys_so_far: 1000,
+            });
+            boxed.event(ProgressEvent::PlanEnd);
+            boxed.finish_plan(); // belt-and-braces after success: no-op
+        }
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s.matches('\n').count(), 1, "single plan newline: {s:?}");
+        assert!(s.ends_with("\x1b[K\n"), "{s:?}");
+    }
+
+    // I42-finalize (L1 fold): `PlanEnd` with an empty render (PlanStart only,
+    // no ListPage/HeadsStart) must still mark the plan finalized, so a later
+    // belt-and-braces `finish_plan` writes nothing extra rather than racing a
+    // future non-empty state.
+    #[test]
+    fn finish_plan_after_empty_plan_end_writes_nothing() {
+        let mut buf = Vec::new();
+        {
+            let boxed: Box<dyn Progress> = Box::new(TermProgress::new(&mut buf));
+            boxed.event(ProgressEvent::PlanStart);
+            boxed.event(ProgressEvent::PlanEnd);
+            boxed.finish_plan();
+        }
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s, "", "empty plan must render nothing: {s:?}");
     }
 }
