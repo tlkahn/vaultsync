@@ -1172,6 +1172,58 @@ mod tests {
         }
     }
 
+    // I42-line (W329): `PlanEnd` keeps the last frame state (the renderer
+    // prints it with a trailing newline, I42-finalize); foreign executor
+    // events never mutate `PlanProgressLine`.
+    #[test]
+    fn plan_line_plan_end_keeps_frame_and_ignores_executor_events() {
+        let mut line = PlanProgressLine::new();
+        line.on_event(ProgressEvent::ListPage {
+            page: 1,
+            keys_so_far: 1000,
+        });
+        line.on_event(ProgressEvent::PlanEnd);
+        assert_eq!(
+            line.render(),
+            "Listing     page 1  1000 keys",
+            "PlanEnd keeps the last frame state"
+        );
+
+        // foreign executor events do not mutate the plan line
+        line.on_event(ProgressEvent::PassStart {
+            kind: PassKind::Upload,
+            total_keys: 3,
+            total_bytes: 60,
+        });
+        line.on_event(ProgressEvent::KeyDone {
+            kind: PassKind::Upload,
+            key: "a.md".to_string(),
+            bytes: 20,
+            ok: true,
+        });
+        line.on_event(ProgressEvent::PassEnd {
+            kind: PassKind::Upload,
+        });
+        line.on_event(ProgressEvent::RunEnd {
+            executed: 1,
+            failed: 0,
+        });
+        assert_eq!(
+            line.render(),
+            "Listing     page 1  1000 keys",
+            "executor events must not mutate the plan line"
+        );
+
+        // a fresh line stays empty under only executor events
+        let mut fresh = PlanProgressLine::new();
+        fresh.on_event(ProgressEvent::PassStart {
+            kind: PassKind::Upload,
+            total_keys: 1,
+            total_bytes: 1,
+        });
+        assert_eq!(fresh.render(), "");
+    }
+
     // I42-line (W328): `HeadsStart` arms heading mode with a 0/total frame;
     // `HeadDone` advances the bar/percent; 100% fills the bar; a zero-total
     // heading renders nothing (mirrors the executor zero-total policy).
