@@ -4374,6 +4374,71 @@ mod tests {
         }
     }
 
+    /// W302 mini store: first MANIFEST_KEY head answers NotFound (warm load
+    /// falls cold), later heads see the real valid body (B1 ADOPTS). Its
+    /// `list` returns a STALE cold view - only `a.md` - because `c.md` is
+    /// manifest-only (never surfaces in list+head).
+    struct AdoptRefreshStore {
+        inner: MemoryStore,
+        manifest_heads: std::sync::atomic::AtomicUsize,
+    }
+    impl AdoptRefreshStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                manifest_heads: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+    impl ObjectStore for AdoptRefreshStore {
+        fn list(&self, _p: &str) -> Result<crate::store::Listing, crate::error::Error> {
+            // Stale cold list: a.md only; c.md exists solely in the manifest.
+            Ok(crate::store::Listing {
+                entities: vec![crate::entity::file("a.md", 1, Some(1000))],
+                warnings: Vec::new(),
+            })
+        }
+        fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
+            if key == crate::local::MANIFEST_KEY
+                && self
+                    .manifest_heads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    == 0
+            {
+                return Err(crate::error::Error::NotFound(key.to_string()));
+            }
+            self.inner.head(key)
+        }
+        fn get_to(
+            &self,
+            key: &str,
+            w: &mut dyn std::io::Write,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            s: u64,
+            m: Option<u64>,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.put_from(key, r, s, m)
+        }
+        fn put_from_with(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            s: u64,
+            o: crate::store::PutOpts,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.put_from_with(key, r, s, o)
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
+            self.inner.delete(key)
+        }
+    }
+
     #[test]
     fn push_prints_adopted_bootstrap_line() {
         // W296 / W268 CLI half (issue 48, A18): when B1 ADOPTS a
@@ -4414,6 +4479,51 @@ mod tests {
         let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
         assert_eq!(m.entry_count, 1);
         assert_eq!(m.entries[0].key, "b.md");
+    }
+
+    #[test]
+    fn push_adopted_refresh_keeps_concurrent_keys_on_commit() {
+        // W302 (PR50-r1 H1/N4, review 5476323432): end-to-end push where B1
+        // ADOPTS a concurrent-valid manifest. The final commit must preserve
+        // the winner's untouched keys. Cold list+head sees only a.md (stale -
+        // c.md is manifest-only), a.md uploads, and after the push the live
+        // manifest retains BOTH a.md (new content) and c.md.
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "newer-content").unwrap();
+        let store = AdoptRefreshStore::new();
+        // Winner-authored live manifest {a.md, c.md}; c.md lives ONLY here.
+        let their_body =
+            br#"{"schema":"vaultsync.manifest.v1","created_ms":0,"entry_count":2,"entries":[{"key":"a.md","size":1,"mtime_ms":1000},{"key":"c.md","size":2,"mtime_ms":2000}]}"#;
+        let mut c = std::io::Cursor::new(their_body.to_vec());
+        store
+            .inner
+            .put_from(
+                crate::local::MANIFEST_KEY,
+                &mut c,
+                their_body.len() as u64,
+                None,
+            )
+            .unwrap();
+        // Remote a.md object itself, older than local so it uploads.
+        let mut c = std::io::Cursor::new(b"a".to_vec());
+        store.inner.put_from("a.md", &mut c, 1, Some(1000)).unwrap();
+        let (code, _, err) = run_bi(
+            Command::push(dir.path().into(), false),
+            &store,
+            crate::config::InventoryMode::Auto,
+            crate::config::InventoryBootstrap::PushEnsure,
+        );
+        assert_eq!(code, 0, "err: {err}");
+        assert!(err.contains("manifest bootstrap adopted"), "err: {err}");
+        // Final manifest must contain BOTH a.md (new) and the winner's c.md.
+        let mut buf = Vec::new();
+        store
+            .inner
+            .get_to(crate::local::MANIFEST_KEY, &mut buf)
+            .unwrap();
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        let keys: Vec<&str> = m.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["a.md", "c.md"], "winner key c.md must survive");
     }
 
     #[test]
