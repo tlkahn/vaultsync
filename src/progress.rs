@@ -1172,6 +1172,50 @@ mod tests {
         }
     }
 
+    // I42-line (W328): `HeadsStart` arms heading mode with a 0/total frame;
+    // `HeadDone` advances the bar/percent; 100% fills the bar; a zero-total
+    // heading renders nothing (mirrors the executor zero-total policy).
+    #[test]
+    fn plan_line_heading_frames() {
+        let mut line = PlanProgressLine::new();
+        line.on_event(ProgressEvent::HeadsStart { total_keys: 100 });
+        assert_eq!(
+            line.render(),
+            "Heading     0/100  [--------]    0%",
+            "HeadsStart arms the 0/total frame"
+        );
+
+        line.on_event(ProgressEvent::HeadDone {
+            done: 40,
+            total_keys: 100,
+        });
+        assert_eq!(
+            line.render(),
+            "Heading     40/100  [===>----]   40%",
+            "40/100 renders the bar + percent"
+        );
+
+        line.on_event(ProgressEvent::HeadDone {
+            done: 100,
+            total_keys: 100,
+        });
+        assert_eq!(
+            line.render(),
+            "Heading     100/100  [========]  100%",
+            "100% fills the bar"
+        );
+
+        // zero-total heading renders empty (W328, executor zero-total policy)
+        let mut zero = PlanProgressLine::new();
+        zero.on_event(ProgressEvent::HeadsStart { total_keys: 0 });
+        assert_eq!(zero.render(), "");
+        zero.on_event(ProgressEvent::HeadDone {
+            done: 0,
+            total_keys: 0,
+        });
+        assert_eq!(zero.render(), "");
+    }
+
     // I42-line (W327): the plan-phase line machine renders cumulative
     // listing frames. Empty until the first `ListPage` (PlanStart alone stays
     // blank, W327 lock); each `ListPage` updates the frame in place; no byte
