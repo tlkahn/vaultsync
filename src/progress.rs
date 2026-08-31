@@ -90,6 +90,15 @@ pub enum ProgressEvent {
 /// internally.
 pub trait Progress: Send + Sync {
     fn event(&self, ev: ProgressEvent);
+
+    /// Issue 42 belt-and-braces (I42-finalize): finalize a partial plan bar
+    /// with a newline so later stderr lines (warnings, W236, errors) never
+    /// collide with a mid-line `\r` frame - even when the library could not
+    /// emit `PlanEnd` (mid-cold failure). The CLI calls this after every
+    /// cold plan attempt; the TTY renderer finalizes at `PlanEnd` already, so
+    /// this is a no-op there. Default: no-op (Quiet/NoProgress sinks write
+    /// nothing).
+    fn finish_plan(&self) {}
 }
 
 /// The default no-op sink: `execute_plan` (the wrapper) passes this so

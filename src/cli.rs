@@ -139,6 +139,18 @@ impl Command {
             force: false,
         }
     }
+    /// Repair with an explicit vault (issue 42 tests need the vault for the
+    /// cache paths); remaining flags at defaults.
+    pub fn repair_with_vault(vault: PathBuf) -> Command {
+        Command::Repair {
+            vault,
+            json: false,
+            config: None,
+            verbose: 0,
+            dry_run: false,
+            force: false,
+        }
+    }
 }
 
 /// clap top level. Global args are `global = true` so they parse before or
@@ -453,7 +465,17 @@ pub fn run_with_io(
             // M1/F1 (W251): repair refreshes the local mirror like push - the
             // rebuilt manifest's meta records the fresh remote etag.
             let cache = crate::inventory::CachePaths::new(&vault);
-            match crate::inventory::repair_manifest(store, &opts, Some(&cache)) {
+            // Issue 42 (W353/W359): repair resolves the progress mode like
+            // dispatch and renders the cold list+head plan phase over stderr
+            // (I42-repair).
+            let resolved = crate::progress::resolve_progress_mode(
+                ctx.progress_mode,
+                std::io::stderr().is_terminal(),
+            );
+            let result = with_plan_renderer(resolved, err, |prog| {
+                crate::inventory::repair_manifest_with_progress(store, &opts, Some(&cache), prog)
+            });
+            match result {
                 Ok(report) => {
                     for w in &report.warnings {
                         let _ = writeln!(err, "warning: {w}");
@@ -507,17 +529,28 @@ pub fn run_with_io(
             };
             let local = crate::local::LocalFs::with_follow(&vault, follow_symlinks)
                 .with_ignore(ctx.ignore.clone());
-            match crate::build_plan(
-                &local,
-                store,
-                Mode::Status,
-                &opts,
-                &ctx.ignore,
-                &crate::inventory::InventoryOpts {
-                    mode: ctx.inventory_mode,
-                    vault_root: Some(vault.clone()),
-                },
-            ) {
+            // Issue 42 (W351/W359): status resolves the progress mode like
+            // dispatch and renders the cold plan phase over stderr; warm runs
+            // emit zero plan-phase events so nothing renders (I42-warm).
+            let resolved = crate::progress::resolve_progress_mode(
+                ctx.progress_mode,
+                std::io::stderr().is_terminal(),
+            );
+            let report = with_plan_renderer(resolved, err, |prog| {
+                crate::build_plan_with_progress(
+                    &local,
+                    store,
+                    Mode::Status,
+                    &opts,
+                    &ctx.ignore,
+                    &crate::inventory::InventoryOpts {
+                        mode: ctx.inventory_mode,
+                        vault_root: Some(vault.clone()),
+                    },
+                    prog,
+                )
+            });
+            match report {
                 Ok(report) => {
                     // H1 (W99): build_plan + store-listing warnings surface
                     // here, at the CLI layer - library code never writes to
@@ -803,6 +836,24 @@ fn build_progress_renderer<'w>(
     }
 }
 
+/// Issue 42 (W359): run `f` with a progress renderer for `resolved` over
+/// `err`, finalizing the plan phase before returning (I42-finalize). A
+/// partial `\r` bar can never collide with later stderr lines (warnings,
+/// W236, errors) - whether the library emitted `PlanEnd` (success path
+/// finalizes inside the renderer) or not (mid-cold failure: `finish_plan`
+/// is the belt-and-braces). One helper shared by status / repair /
+/// dispatch_plan so the lifecycle cannot drift.
+fn with_plan_renderer<'w, T>(
+    resolved: ResolvedMode,
+    err: &'w mut (dyn Write + Send),
+    f: impl FnOnce(&dyn Progress) -> T,
+) -> T {
+    let renderer = build_progress_renderer(resolved, err);
+    let out = f(renderer.as_ref());
+    renderer.finish_plan();
+    out
+}
+
 /// Build a plan and dispatch push/pull execution.
 ///
 /// Exit codes (P1r-stub-exit, retired in Slice 6): `0` all selected actions
@@ -831,17 +882,27 @@ fn dispatch_plan(
     // the seam).
     let resolved =
         crate::progress::resolve_progress_mode(flags.progress, std::io::stderr().is_terminal());
-    match crate::build_plan(
-        &local,
-        store,
-        mode,
-        opts,
-        &flags.ignore,
-        &crate::inventory::InventoryOpts {
-            mode: flags.inventory_mode,
-            vault_root: Some(vault.clone()),
-        },
-    ) {
+    // Issue 42 (I42-finalize/W355): one renderer covers the plan phase;
+    // finalize (PlanEnd or finish_plan belt-and-braces) before any later
+    // stderr line (warnings, W236, errors). The executor phase builds its
+    // own renderer below so the direct `err` writes between the phases stay
+    // borrow-safe; output ordering is identical (plan finalize newline, then
+    // direct lines, then executor frames).
+    let report = with_plan_renderer(resolved, err, |prog| {
+        crate::build_plan_with_progress(
+            &local,
+            store,
+            mode,
+            opts,
+            &flags.ignore,
+            &crate::inventory::InventoryOpts {
+                mode: flags.inventory_mode,
+                vault_root: Some(vault.clone()),
+            },
+            prog,
+        )
+    });
+    match report {
         Ok(report) => {
             // H1 (W99): build_plan + store-listing warnings surface here, at
             // the CLI layer - library code never writes to stderr.
@@ -1742,6 +1803,17 @@ mod tests {
         store: &dyn ObjectStore,
         mode: ProgressMode,
     ) -> (i32, String, String) {
+        run_mode_inv(cmd, store, mode, crate::config::InventoryMode::ListHead)
+    }
+
+    /// I27/42 helper: like [`run_mode`] with an explicit inventory mode
+    /// (warm tests pass Auto/Manifest; cold tests keep ListHead).
+    fn run_mode_inv(
+        cmd: Command,
+        store: &dyn ObjectStore,
+        mode: ProgressMode,
+        inventory_mode: crate::config::InventoryMode,
+    ) -> (i32, String, String) {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = run_with_io(
@@ -1752,7 +1824,7 @@ mod tests {
                 concurrency: 1,
                 progress_mode: mode,
                 ignore: crate::IgnoreSet::empty(),
-                inventory_mode: crate::config::InventoryMode::ListHead,
+                inventory_mode,
                 inventory_bootstrap: crate::config::InventoryBootstrap::PushEnsure,
             },
             &mut out,
@@ -1763,6 +1835,27 @@ mod tests {
             String::from_utf8(out).unwrap(),
             String::from_utf8(err).unwrap(),
         )
+    }
+
+    /// Seed a valid remote manifest object (issue 45 warm path) with the
+    /// given entries (key, size, mtime).
+    fn put_manifest(store: &dyn ObjectStore, entries: &[(&str, u64, Option<u64>)]) {
+        let m = crate::manifest::file_entities_to_manifest(
+            &entries
+                .iter()
+                .map(|(k, s, m)| crate::entity::file(k, *s, *m))
+                .collect::<Vec<_>>(),
+            42,
+            None,
+            None,
+        )
+        .unwrap();
+        let body = crate::manifest::serialize_manifest(&m).unwrap();
+        let body_len = body.len() as u64;
+        let mut c = std::io::Cursor::new(body);
+        store
+            .put_from(crate::local::MANIFEST_KEY, &mut c, body_len, None)
+            .unwrap();
     }
 
     #[test]
@@ -1893,6 +1986,275 @@ mod tests {
             "status must not render: {err_st:?}"
         );
         assert_eq!(code_st, 2, "dirty status exits 2");
+    }
+
+    // --- issue 42: plan-phase progress on the CLI ---
+
+    /// Seed a paging store with a local dirty file + a remote-only file so a
+    /// cold status/push has both plan-phase pages and a dirty plan.
+    fn paging_store_with_local_and_remote(dir: &std::path::Path) -> crate::testutil::FakePagingStore {
+        std::fs::write(dir.join("a.md"), "hello").unwrap();
+        let store = crate::testutil::FakePagingStore::new(1);
+        let mut c = std::io::Cursor::new(b"remote".to_vec());
+        store
+            .inner
+            .put_from("r.md", &mut c, 6, Some(1_700_000_000_000))
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn status_cold_always_shows_plan_progress() {
+        // W351: cold status under ProgressMode::Always renders Listing/Heading
+        // frames on stderr (via the paging store's ListPage events); stdout
+        // keeps the plan table and no \r; exit codes unchanged; W236 cold line
+        // appears after a newline-finalized progress frame.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = paging_store_with_local_and_remote(dir.path());
+        let (code, out, err) = run_mode(
+            Command::status(dir.path().into()),
+            &store,
+            ProgressMode::Always,
+        );
+        assert_eq!(code, 2, "dirty status exits 2");
+        assert!(err.contains('\r'), "plan frames on stderr: {err:?}");
+        assert!(
+            err.contains("Listing") || err.contains("Heading"),
+            "plan verb on stderr: {err:?}"
+        );
+        assert!(out.contains("plan:"), "plan table on stdout: {out}");
+        assert!(!out.contains('\r'), "stdout stays progress-free: {out:?}");
+        let idx = err
+            .find("inventory: list+head (cold)")
+            .expect("W236 cold line");
+        assert!(
+            err[..idx].ends_with('\n'),
+            "W236 must follow a newline-finalized progress frame: {err:?}"
+        );
+    }
+
+    #[test]
+    fn status_warm_always_no_plan_bar() {
+        // W352: warm status under Always shows NO Listing/Heading and no \r
+        // from the plan phase; the W236 manifest line is still printed.
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "hello").unwrap();
+        let store = MemoryStore::new();
+        put_manifest(&store, &[("a.md", 5, Some(1_700_000_000_000))]);
+        let (code, _out, err) = run_mode_inv(
+            Command::status(dir.path().into()),
+            &store,
+            ProgressMode::Always,
+            crate::config::InventoryMode::Auto,
+        );
+        assert!(err.contains("inventory: manifest ("), "{err:?}");
+        assert!(
+            !err.contains("Listing") && !err.contains("Heading"),
+            "warm must not render plan frames: {err:?}"
+        );
+        assert!(!err.contains('\r'), "warm must not refresh lines: {err:?}");
+        let _ = code;
+    }
+
+    #[test]
+    fn repair_always_shows_plan_frames() {
+        // W353: repair under Always shows plan-phase frames on stderr; the
+        // stdout summary keeps its locked shape.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = paging_store_with_local_and_remote(dir.path());
+        let (code, out, err) = run_mode(
+            Command::repair_with_vault(dir.path().into()),
+            &store,
+            ProgressMode::Always,
+        );
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(err.contains('\r'), "plan frames on stderr: {err:?}");
+        assert!(
+            err.contains("Listing") || err.contains("Heading"),
+            "plan verb on stderr: {err:?}"
+        );
+        assert!(
+            out.contains("repair: listed 1 objects via list+head"),
+            "stdout summary shape: {out}"
+        );
+    }
+
+    #[test]
+    fn dry_run_push_cold_always_shows_plan_progress() {
+        // W354: dry-run push cold under Always shows plan progress but never
+        // Uploading (no executor); stdout plan present; W236 cold line once.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = paging_store_with_local_and_remote(dir.path());
+        let cmd = Command::Push {
+            vault: dir.path().into(),
+            delete: false,
+            dry_run: true,
+            force_local: false,
+            force_remote: false,
+            json: false,
+            config: None,
+            verbose: 0,
+            follow_symlinks: false,
+        };
+        let (code, out, err) = run_mode(cmd, &store, ProgressMode::Always);
+        assert_eq!(code, 2, "dry-run of a dirty push exits 2; stderr: {err}");
+        assert!(err.contains('\r'), "plan frames: {err:?}");
+        assert!(
+            err.contains("Listing") || err.contains("Heading"),
+            "plan verb: {err:?}"
+        );
+        assert!(!err.contains("Uploading"), "no executor: {err:?}");
+        assert!(out.contains("plan:"), "stdout plan: {out}");
+        assert_eq!(
+            err.matches("inventory: list+head (cold)").count(),
+            1,
+            "W236 cold line exactly once: {err:?}"
+        );
+    }
+
+    #[test]
+    fn push_cold_always_plan_then_upload_frames() {
+        // W355: cold push under Always renders plan-phase frames THEN
+        // Uploading frames - the plan frame is finalized (newline) before the
+        // upload pass starts. Exit codes unchanged vs Off; stdout identical.
+        let dir = TempDir::new("vaultsync-cli-test");
+        // Two FRESH stores: the Always leg mutates its store (uploads a.md,
+        // commits a manifest), so the Off leg must run against a clean twin
+        // (same pattern as push_off_progress_writes_nothing).
+        let store_on = paging_store_with_local_and_remote(dir.path());
+        let store_off = paging_store_with_local_and_remote(dir.path());
+        let cmd = Command::push(dir.path().into(), false);
+        let (code_on, out_on, err_on) = run_mode(cmd.clone(), &store_on, ProgressMode::Always);
+        let (code_off, out_off, err_off) = run_mode(cmd, &store_off, ProgressMode::Off);
+        assert_eq!(code_on, code_off, "exit codes unchanged");
+        assert_eq!(out_on, out_off, "stdout byte-identical");
+        let plan_idx = err_on
+            .find("Listing")
+            .unwrap_or_else(|| panic!("plan frames: {err_on:?}"));
+        let upload_idx = err_on
+            .find("Uploading")
+            .expect("upload frames after the plan phase");
+        assert!(plan_idx < upload_idx, "plan phase before upload: {err_on:?}");
+        assert!(
+            err_on[..upload_idx].contains('\n'),
+            "plan frame finalized with a newline before upload: {err_on:?}"
+        );
+        assert!(
+            err_off.contains("inventory: list+head (cold)"),
+            "W236 still printed under Off: {err_off:?}"
+        );
+    }
+
+    #[test]
+    fn progress_off_no_plan_frames() {
+        // W356: ProgressMode::Off keeps captured-stderr contracts free of
+        // \r / Listing / Heading for status, repair, and push - even over a
+        // paging store that WOULD emit ListPage under Always.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = paging_store_with_local_and_remote(dir.path());
+        let cmds: Vec<Command> = vec![
+            Command::status(dir.path().into()),
+            Command::repair_with_vault(dir.path().into()),
+            Command::push(dir.path().into(), false),
+        ];
+        for cmd in cmds {
+            let (_, _, err) = run_mode(cmd, &store, ProgressMode::Off);
+            assert!(
+                !err.contains('\r')
+                    && !err.contains("Listing")
+                    && !err.contains("Heading"),
+                "Off must not render plan frames: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn w236_after_plan_progress_finalize() {
+        // W357: under Always every \r-progress frame lies before the W236
+        // line, whose own line start follows the plan finalize newline.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = paging_store_with_local_and_remote(dir.path());
+        let (_, _, err) = run_mode(
+            Command::status(dir.path().into()),
+            &store,
+            ProgressMode::Always,
+        );
+        let idx = err
+            .find("inventory: list+head (cold)")
+            .expect("W236 cold line");
+        let last_nl = err[..idx]
+            .rfind('\n')
+            .expect("W236 must follow a finalized progress frame");
+        for (i, ch) in err.char_indices() {
+            if ch == '\r' {
+                assert!(
+                    i < last_nl,
+                    "\r frame after the plan finalize: {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn json_reject_precedes_plan_progress() {
+        // W358: --json is rejected before any progress renderer is built on
+        // status/push/pull/repair - err has no Listing/Heading/\r frames.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = paging_store_with_local_and_remote(dir.path());
+        let cmds: Vec<Command> = vec![
+            Command::Status {
+                vault: dir.path().into(),
+                json: true,
+                config: None,
+                verbose: 0,
+                follow_symlinks: false,
+                write_manifest: false,
+            },
+            Command::Push {
+                vault: dir.path().into(),
+                delete: false,
+                dry_run: false,
+                force_local: false,
+                force_remote: false,
+                json: true,
+                config: None,
+                verbose: 0,
+                follow_symlinks: false,
+            },
+            Command::Pull {
+                vault: dir.path().into(),
+                delete: false,
+                dry_run: false,
+                force_local: false,
+                force_remote: false,
+                json: true,
+                config: None,
+                verbose: 0,
+                follow_symlinks: false,
+            },
+            Command::Repair {
+                vault: dir.path().into(),
+                json: true,
+                config: None,
+                verbose: 0,
+                dry_run: false,
+                force: false,
+            },
+        ];
+        for cmd in cmds {
+            let (code, _, err) = run_mode(cmd, &store, ProgressMode::Always);
+            assert_eq!(code, 1, "reject_json exits 1");
+            assert!(
+                !err.contains("Listing")
+                    && !err.contains("Heading")
+                    && !err.contains('\r'),
+                "json reject must precede any plan progress: {err:?}"
+            );
+            assert!(
+                err.contains("--json is not implemented"),
+                "reject message: {err:?}"
+            );
+        }
     }
 
     #[test]

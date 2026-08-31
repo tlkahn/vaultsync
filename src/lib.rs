@@ -476,6 +476,18 @@ pub(crate) mod testutil {
         ) -> Result<crate::entity::Entity, crate::error::Error> {
             self.inner.put_from(key, r, size, mtime_ms)
         }
+        fn put_from_with(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            opts: crate::store::PutOpts,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            // Delegate the conditional put to the inner mock (repair/commit
+            // use If-Match / If-None-Match on MANIFEST_KEY; the trait default
+            // would reject it loudly).
+            self.inner.put_from_with(key, r, size, opts)
+        }
         fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
             self.inner.delete(key)
         }
