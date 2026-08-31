@@ -95,6 +95,21 @@ pub trait ObjectStore: Send + Sync {
     /// trailing `/` (e.g. `notes/`); passing `notes` will also match `notes.md`
     /// and any sibling whose key merely starts with `notes`.
     fn list(&self, prefix: &str) -> Result<Listing, Error>;
+    /// Issue 42 (I42-list-api): like [`list`] with a plan-phase progress
+    /// sink threaded through the page loop (S3 emits `ListPage` per
+    /// `ListObjectsV2` page and the head enrichment emits
+    /// `HeadsStart`/`HeadDone`). The DEFAULT body ignores the sink and
+    /// delegates to [`list`] - every existing impl keeps compiling and stays
+    /// byte-identical (same additive spirit as `put_from_with`, W339).
+    /// Backends without paging or without cold-list cost emit nothing.
+    fn list_with_progress(
+        &self,
+        prefix: &str,
+        progress: &dyn crate::progress::Progress,
+    ) -> Result<Listing, Error> {
+        let _ = progress;
+        self.list(prefix)
+    }
     /// Fetch metadata for a single object.
     fn head(&self, key: &str) -> Result<Entity, Error>;
     /// Stream object bytes into `w`, returning its metadata.
@@ -489,6 +504,58 @@ mod tests {
         // keeps mock race tests matching cleanly (never stuffed into Other).
         let err = Error::PreconditionFailed("\"abc\"".to_string());
         assert_eq!(format!("{err}"), "precondition failed: \"abc\"");
+    }
+
+    // I42-pages (W340): FakePagingStore is the offline stand-in for the S3
+    // page loop - list_with_progress chunks the listed rows into pages of P
+    // and emits one cumulative ListPage per chunk (ceil(N/P) pages), then
+    // returns the full listing.
+    #[test]
+    fn fake_paging_store_emits_list_pages() {
+        use crate::progress::ProgressEvent;
+        let store = crate::testutil::FakePagingStore::new(3);
+        for i in 0..7 {
+            let mut c = std::io::Cursor::new(b"x".to_vec());
+            store
+                .inner
+                .put_from(&format!("k{i}.md"), &mut c, 1, Some(1000 + i))
+                .unwrap();
+        }
+        let prog = crate::testutil::RecordingProgress::new();
+        let listing = store.list_with_progress("", &prog).unwrap();
+        let events = prog.events();
+        let pages: Vec<(u32, u64)> = events
+            .iter()
+            .map(|e| match e {
+                ProgressEvent::ListPage {
+                    page,
+                    keys_so_far,
+                } => (*page, *keys_so_far),
+                other => panic!("expected ListPage, got {other:?}"),
+            })
+            .collect();
+        // 7 rows, page_size 3 -> 3 pages (3, 3, 1) with cumulative counts.
+        assert_eq!(pages, vec![(1, 3), (2, 6), (3, 7)]);
+        assert_eq!(listing.entities.len(), 7, "full listing returned");
+    }
+
+    // I42-list-api (W339): the trait DEFAULT `list_with_progress` ignores
+    // the sink and equals `list()`; the recording stays empty (same additive
+    // spirit as `put_from_with` - every existing impl keeps compiling).
+    #[test]
+    fn list_with_progress_default_ignores_sink() {
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"a".to_vec());
+        store.put_from("a.md", &mut c, 1, Some(100)).unwrap();
+        let prog = crate::testutil::RecordingProgress::new();
+        let plain = store.list("").unwrap();
+        let with = store.list_with_progress("", &prog).unwrap();
+        assert_eq!(with, plain, "default must delegate to list()");
+        assert!(
+            prog.events().is_empty(),
+            "default must emit zero events: {:?}",
+            prog.events()
+        );
     }
 
     // I42-heads (W335): enrich_with_head_mtimes emits HeadsStart then one

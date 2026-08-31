@@ -392,6 +392,74 @@ pub(crate) mod testutil {
     use std::sync::{Condvar, Mutex};
     use std::time::{Duration, Instant};
 
+    /// Offline stand-in for the S3 page loop (I42-pages, W340): wraps a
+    /// [`crate::store::mock::MemoryStore`] and `list_with_progress` chunks the
+    /// listed rows into pages of `page_size`, emitting one cumulative
+    /// `ListPage` per chunk (`keys_so_far` counts raw page rows, W342 lock),
+    /// then returns the full listing unchanged (like MemoryStore: no head
+    /// enrichment). Used by the store/inventory/CLI tests that need
+    /// `ListPage` emissions without network. The bare `list` path delegates
+    /// to the mock (no events), so warm/quiet pins stay clean.
+    pub(crate) struct FakePagingStore {
+        pub(crate) inner: crate::store::mock::MemoryStore,
+        page_size: usize,
+    }
+
+    impl FakePagingStore {
+        pub(crate) fn new(page_size: usize) -> Self {
+            FakePagingStore {
+                inner: crate::store::mock::MemoryStore::new(),
+                page_size: page_size.max(1),
+            }
+        }
+    }
+
+    impl crate::store::ObjectStore for FakePagingStore {
+        fn list(&self, prefix: &str) -> Result<crate::store::Listing, crate::error::Error> {
+            self.inner.list(prefix)
+        }
+        fn list_with_progress(
+            &self,
+            prefix: &str,
+            progress: &dyn crate::progress::Progress,
+        ) -> Result<crate::store::Listing, crate::error::Error> {
+            let listing = self.inner.list(prefix)?;
+            let mut keys_so_far: u64 = 0;
+            let mut page: u32 = 0;
+            for chunk in listing.entities.chunks(self.page_size) {
+                page += 1;
+                keys_so_far += chunk.len() as u64;
+                progress.event(crate::progress::ProgressEvent::ListPage {
+                    page,
+                    keys_so_far,
+                });
+            }
+            Ok(listing)
+        }
+        fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.head(key)
+        }
+        fn get_to(
+            &self,
+            key: &str,
+            w: &mut dyn std::io::Write,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime_ms: Option<u64>,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.put_from(key, r, size, mtime_ms)
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
+            self.inner.delete(key)
+        }
+    }
+
     /// I27/42 test double (W334 shared helper): records every event into a
     /// `Mutex<Vec<ProgressEvent>>` (thread-safe for pool-driven emission,
     /// I27-thread). Shared so exec, progress, inventory, and store tests use
