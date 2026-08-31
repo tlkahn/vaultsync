@@ -64,14 +64,26 @@ pub fn load_remote_inventory(
     match mode {
         InventoryMode::ListHead => live_list_head(store),
         InventoryMode::Auto => match try_load_manifest(store, cache) {
-            Ok(Some(inv)) => Ok(inv),
-            Ok(None) => {
-                // Missing manifest: auto falls back cold with a normative
+            Ok(ManifestWarm::Loaded(inv)) => Ok(inv),
+            Ok(ManifestWarm::Missing) => {
+                // No manifest object: auto falls back cold with a normative
                 // warning (Q3: the read path stays side-effect free).
                 let mut inv = live_list_head(store)?;
                 inv.warnings.push(
-                    "inventory manifest missing or corrupt; falling back to list+head (run vaultsync repair to write one)".to_string(),
+                    "inventory manifest missing; falling back to list+head (next push will create one)"
+                        .to_string(),
                 );
+                Ok(inv)
+            }
+            Ok(ManifestWarm::Invalid(detail)) => {
+                // Present but unusable (corrupt body / unknown schema / over
+                // soft cap): same fallback, but the detail tells the
+                // operator WHY and that push may heal it via the H1
+                // head-then-If-Match commit (or run repair).
+                let mut inv = live_list_head(store)?;
+                inv.warnings.push(format!(
+                    "inventory manifest invalid: {detail}; falling back to list+head (push will try to replace a present corrupt object, or run vaultsync repair)"
+                ));
                 Ok(inv)
             }
             Err(e) => Err(e),
@@ -80,26 +92,41 @@ pub fn load_remote_inventory(
             // Strict mode (W234): a missing OR corrupt manifest is a hard
             // error suggesting repair - never a silent empty plan, never a
             // cold fallback (fail closed). A non-NotFound fetch error
-            // propagates via `?` (fail closed on store trouble too).
+            // propagates via `?` (fail closed on store trouble too). The
+            // corrupt case carries the parse detail (F4/L6, review
+            // 5472033449).
             match try_load_manifest(store, cache)? {
-                Some(inv) => Ok(inv),
-                None => Err(Error::Other(
-                    "inventory.mode=manifest requires a valid remote manifest; run vaultsync repair to create one".to_string(),
+                ManifestWarm::Loaded(inv) => Ok(inv),
+                ManifestWarm::Missing => Err(Error::Other(
+                    "inventory.mode=manifest requires a valid remote manifest (none present); run vaultsync repair to create one".to_string(),
                 )),
+                ManifestWarm::Invalid(detail) => Err(Error::Other(format!(
+                    "inventory.mode=manifest requires a valid remote manifest, but the object is invalid: {detail}; run vaultsync repair to rebuild it"
+                ))),
             }
         }
     }
 }
 
+/// Outcome of a warm manifest attempt (F4/L6, reviews 5472028291 +
+/// 5472033449): `Loaded` = valid manifest; `Missing` = absent object;
+/// `Invalid` = present but unusable (corrupt body, unknown schema, or above
+/// the soft cap), carrying the parse/remedy detail so operators can tell
+/// "absent (next push creates)" from "present but corrupt (push may heal via
+/// H1, or run repair)".
+enum ManifestWarm {
+    Loaded(RemoteInventory),
+    Missing,
+    Invalid(String),
+}
+
 /// Warm attempt: fetch + parse the remote manifest (issue 45, 6.1 steps 2-3
-/// for the success path). `Ok(None)` means "no valid manifest to use"
-/// (absent object OR corrupt body - the caller decides auto-fallback vs
-/// strict error); a non-NotFound fetch error (e.g. Unavailable) fails closed
-/// (never silently plan empty).
+/// for the success path). A non-NotFound fetch error (e.g. Unavailable)
+/// fails closed (never silently plan empty).
 fn try_load_manifest(
     store: &dyn ObjectStore,
     cache: Option<&CachePaths>,
-) -> Result<Option<RemoteInventory>, Error> {
+) -> Result<ManifestWarm, Error> {
     match cache {
         Some(cache) => try_load_manifest_cached(store, cache),
         None => try_load_manifest_fresh(store),
@@ -133,21 +160,19 @@ fn manifest_inventory(
 /// Unconditional warm fetch (no cache): GET the manifest, parse, and serve.
 /// M2 (review 5472028291): the fetch heads first and streams through a
 /// capped writer, so a pathological/hostile object at MANIFEST_KEY cannot
-/// force a full download + peak RSS before refusal. An over-cap object is
-/// treated like a corrupt body (`Ok(None)` - the caller decides auto
-/// fallback vs strict error).
-fn try_load_manifest_fresh(store: &dyn ObjectStore) -> Result<Option<RemoteInventory>, Error> {
+/// force a full download + peak RSS before refusal. Absent => `Missing`;
+/// over-cap or unparseable => `Invalid(detail)` (F4/L6: the caller decides
+/// auto fallback vs strict error).
+fn try_load_manifest_fresh(store: &dyn ObjectStore) -> Result<ManifestWarm, Error> {
     let (entity, buf) = match head_then_get_manifest(store, crate::manifest::MANIFEST_MAX_BYTES)? {
         WarmFetch::Body(entity, buf) => (entity, buf),
-        // Absent OR over-cap: same "no valid manifest" signal the caller
-        // already handles for corrupt bodies.
-        WarmFetch::Absent | WarmFetch::OverCap(_) => return Ok(None),
+        WarmFetch::Absent => return Ok(ManifestWarm::Missing),
+        WarmFetch::OverCap(msg) => return Ok(ManifestWarm::Invalid(msg)),
     };
-    let manifest = match crate::manifest::parse_manifest_bytes(&buf) {
-        Ok(m) => m,
-        Err(_) => return Ok(None), // corrupt: caller falls back / errors per mode
-    };
-    manifest_inventory(&manifest, entity.etag).map(Some)
+    match crate::manifest::parse_manifest_bytes(&buf) {
+        Ok(m) => manifest_inventory(&m, entity.etag).map(ManifestWarm::Loaded),
+        Err(e) => Ok(ManifestWarm::Invalid(format!("{e}"))),
+    }
 }
 
 /// Result of a warm manifest fetch attempt (M2, review 5472028291).
@@ -157,10 +182,6 @@ fn try_load_manifest_fresh(store: &dyn ObjectStore) -> Result<Option<RemoteInven
 #[derive(Debug)]
 enum WarmFetch {
     Absent,
-    // Message carried for diagnostics (unit tests read it today; W255
-    // surfaces it in the auto/strict strings). Unread in the lib build until
-    // then.
-    #[allow(dead_code)]
     OverCap(String),
     Body(crate::entity::Entity, Vec<u8>),
 }
@@ -240,7 +261,7 @@ impl std::io::Write for CappedWriter {
 fn try_load_manifest_cached(
     store: &dyn ObjectStore,
     cache: &CachePaths,
-) -> Result<Option<RemoteInventory>, Error> {
+) -> Result<ManifestWarm, Error> {
     // Conditional attempt when we hold a remote etag.
     if let Some(etag) = read_cache_meta(cache).and_then(|m| m.remote_etag) {
         // M2 (review 5472028291): the conditional Body streams through a
@@ -258,7 +279,7 @@ fn try_load_manifest_cached(
                 if let Some(cached) = read_cache_body(cache) {
                     // Cache valid: plan from it without re-download.
                     let manifest = crate::manifest::parse_manifest_bytes(&cached)?;
-                    return manifest_inventory(&manifest, Some(etag)).map(Some);
+                    return manifest_inventory(&manifest, Some(etag)).map(ManifestWarm::Loaded);
                 }
                 // Corrupt/missing cache body was invalidated above: fall
                 // through to a fresh fetch below.
@@ -266,29 +287,36 @@ fn try_load_manifest_cached(
             Ok(crate::store::GetOutcome::Body(entity)) => {
                 if writer.tripped {
                     invalidate_cache(cache);
-                    return Ok(None);
+                    return Ok(ManifestWarm::Invalid(format!(
+                        "manifest body exceeded the {} byte soft cap while streaming",
+                        crate::manifest::MANIFEST_MAX_BYTES
+                    )));
                 }
-                let manifest = match crate::manifest::parse_manifest_bytes(&writer.buf) {
-                    Ok(m) => m,
-                    Err(_) => {
-                        invalidate_cache(cache);
-                        return Ok(None);
+                match crate::manifest::parse_manifest_bytes(&writer.buf) {
+                    Ok(m) => {
+                        let inv = manifest_inventory(&m, entity.etag.clone())?;
+                        fill_cache(cache, &writer.buf, entity.etag);
+                        return Ok(ManifestWarm::Loaded(inv));
                     }
-                };
-                let inv = manifest_inventory(&manifest, entity.etag.clone())?;
-                fill_cache(cache, &writer.buf, entity.etag);
-                return Ok(Some(inv));
+                    Err(e) => {
+                        invalidate_cache(cache);
+                        return Ok(ManifestWarm::Invalid(format!("{e}")));
+                    }
+                }
             }
             Err(Error::NotFound(_)) => {
                 invalidate_cache(cache);
-                return Ok(None);
+                return Ok(ManifestWarm::Missing);
             }
             // W245: any non-NotFound failure fails closed - never plan from
             // the stale cache alone. The capped writer's own trip is
             // over-cap (corrupt-like), not a store failure.
             Err(_) if writer.tripped => {
                 invalidate_cache(cache);
-                return Ok(None);
+                return Ok(ManifestWarm::Invalid(format!(
+                    "manifest body exceeded the {} byte soft cap while streaming",
+                    crate::manifest::MANIFEST_MAX_BYTES
+                )));
             }
             Err(e) => return Err(e),
         }
@@ -298,21 +326,26 @@ fn try_load_manifest_cached(
     // body + etag.
     let (entity, buf) = match head_then_get_manifest(store, crate::manifest::MANIFEST_MAX_BYTES)? {
         WarmFetch::Body(entity, buf) => (entity, buf),
-        WarmFetch::Absent | WarmFetch::OverCap(_) => {
+        WarmFetch::Absent => {
             invalidate_cache(cache);
-            return Ok(None);
+            return Ok(ManifestWarm::Missing);
+        }
+        WarmFetch::OverCap(msg) => {
+            invalidate_cache(cache);
+            return Ok(ManifestWarm::Invalid(msg));
         }
     };
-    let manifest = match crate::manifest::parse_manifest_bytes(&buf) {
-        Ok(m) => m,
-        Err(_) => {
-            invalidate_cache(cache);
-            return Ok(None);
+    match crate::manifest::parse_manifest_bytes(&buf) {
+        Ok(m) => {
+            let inv = manifest_inventory(&m, entity.etag.clone())?;
+            fill_cache(cache, &buf, entity.etag);
+            Ok(ManifestWarm::Loaded(inv))
         }
-    };
-    let inv = manifest_inventory(&manifest, entity.etag.clone())?;
-    fill_cache(cache, &buf, entity.etag);
-    Ok(Some(inv))
+        Err(e) => {
+            invalidate_cache(cache);
+            Ok(ManifestWarm::Invalid(format!("{e}")))
+        }
+    }
 }
 
 /// Best-effort cache fill after a valid remote fetch (W244, Q3): write the
@@ -917,6 +950,80 @@ mod tests {
     }
 
     #[test]
+    fn auto_missing_manifest_warning_names_absent() {
+        // W255 (F4/L6, reviews 5472028291 + 5472033449): the auto fallback
+        // warning must let an operator tell ABSENT from CORRUPT - the
+        // missing case names absence (and that the next push will create),
+        // and must NOT claim "corrupt". RED today: the single shared
+        // "missing or corrupt" string.
+        let store = MemoryStore::new();
+        let inv = load_remote_inventory(&store, InventoryMode::Auto, None).unwrap();
+        assert_eq!(inv.base.source, InventorySource::LiveListHead);
+        let warn = inv.warnings.join(" ");
+        assert!(warn.contains("missing"), "warnings: {warn}");
+        assert!(
+            !warn.contains("corrupt"),
+            "missing must not be called corrupt: {warn}"
+        );
+        assert!(
+            !warn.contains("invalid"),
+            "missing must not be called invalid: {warn}"
+        );
+        assert!(warn.contains("push"), "warnings: {warn}");
+    }
+
+    #[test]
+    fn auto_corrupt_manifest_warning_includes_parse_detail() {
+        // W255 (F4/L6): a corrupt body's auto warning carries a stable
+        // fragment of the parse error so the operator sees WHY (here the
+        // locked "JSON parse failed" wrapper), plus the push-may-heal
+        // guidance. RED today: the shared generic string has no detail.
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"not json at all".to_vec());
+        store
+            .put_from(
+                crate::local::MANIFEST_KEY,
+                &mut c,
+                "not json at all".len() as u64,
+                None,
+            )
+            .unwrap();
+        let inv = load_remote_inventory(&store, InventoryMode::Auto, None).unwrap();
+        assert_eq!(inv.base.source, InventorySource::LiveListHead);
+        let warn = inv.warnings.join(" ");
+        assert!(
+            warn.contains("JSON parse failed"),
+            "parse detail must surface: {warn}"
+        );
+        assert!(warn.contains("falling back"), "warnings: {warn}");
+        assert!(warn.contains("push"), "warnings: {warn}");
+    }
+
+    #[test]
+    fn strict_manifest_mode_surfaces_parse_detail() {
+        // W255 (F4/L6): strict Manifest mode errors on a corrupt body with
+        // the parse detail + a repair hint (never the generic missing
+        // message). RED today: the strict error carries no parse text.
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"not json".to_vec());
+        store
+            .put_from(
+                crate::local::MANIFEST_KEY,
+                &mut c,
+                "not json".len() as u64,
+                None,
+            )
+            .unwrap();
+        let err = load_remote_inventory(&store, InventoryMode::Manifest, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("JSON parse failed"),
+            "parse detail must surface in strict error: {msg}"
+        );
+        assert!(msg.contains("repair"), "error must suggest repair: {msg}");
+    }
+
+    #[test]
     fn strict_mode_requires_valid_manifest() {
         // W234 (issue 45): mode `manifest` fails CLOSED when the manifest is
         // missing or corrupt - never a silent empty plan, never a cold
@@ -1356,20 +1463,17 @@ mod tests {
     #[test]
     fn warm_auto_falls_back_when_head_over_cap() {
         // W253 (M2, mode mapping): under Auto an over-cap manifest object is
-        // None-as-corrupt - the load falls back cold with the normative
-        // warning instead of failing the plan.
+        // Invalid (present but unusable) - the load falls back cold with a
+        // warning naming the soft cap instead of failing the plan (W255:
+        // the warning is "invalid", not "missing").
         let store = NoGetOverCapStore {
             inner: MemoryStore::new(),
         };
         let inv = load_remote_inventory(&store, InventoryMode::Auto, None).unwrap();
         assert_eq!(inv.base.source, InventorySource::LiveListHead);
-        assert!(
-            inv.warnings
-                .iter()
-                .any(|w| w.contains("missing or corrupt")),
-            "warnings: {:?}",
-            inv.warnings
-        );
+        let warn = inv.warnings.join(" ");
+        assert!(warn.contains("invalid"), "warnings: {warn}");
+        assert!(warn.contains("soft cap"), "warnings: {warn}");
     }
 
     #[test]
