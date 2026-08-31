@@ -65,6 +65,8 @@ pub enum Command {
         json: bool,
     },
     Repair {
+        vault: PathBuf,
+        json: bool,
         config: Option<PathBuf>,
         verbose: u8,
         dry_run: bool,
@@ -121,9 +123,13 @@ impl Command {
             json: false,
         }
     }
-    /// Repair with defaults (dry-run off, force off).
+    /// Repair with defaults (dry-run off, force off). The vault defaults to
+    /// the same sentinel as clap (`VAULT_UNSET`), matching how a no-flag
+    /// invocation resolves through `resolve_vault_from_config`.
     pub fn repair() -> Command {
         Command::Repair {
+            vault: PathBuf::from(VAULT_UNSET),
+            json: false,
             config: None,
             verbose: 0,
             dry_run: false,
@@ -260,6 +266,8 @@ impl Cli {
                 json: self.json,
             },
             Some(Commands::Repair(a)) => Command::Repair {
+                vault: self.vault,
+                json: self.json,
                 config,
                 verbose,
                 dry_run: a.dry_run,
@@ -408,6 +416,8 @@ pub fn run_with_io(
             }
         }
         Command::Repair {
+            vault,
+            json: _json,
             config: _c,
             verbose: _v,
             dry_run,
@@ -416,13 +426,17 @@ pub fn run_with_io(
             // W242 (issue 45, D-repair): rebuild the manifest from a live
             // list+head. No plan table; short summary lines on stdout. Exit
             // 0 on success (including dry-run), 1 on store errors. `--json`
-            // is not a Repair flag (schema stability is Phase 3).
+            // is not a Repair flag (schema stability is Phase 3; W252 adds
+            // the reject).
             let opts = crate::inventory::RepairOpts {
                 force,
                 dry_run,
                 concurrency: ctx.concurrency,
             };
-            match crate::inventory::repair_manifest(store, &opts, None) {
+            // M1/F1 (W251): repair refreshes the local mirror like push - the
+            // rebuilt manifest's meta records the fresh remote etag.
+            let cache = crate::inventory::CachePaths::new(&vault);
+            match crate::inventory::repair_manifest(store, &opts, Some(&cache)) {
                 Ok(report) => {
                     for w in &report.warnings {
                         let _ = writeln!(err, "warning: {w}");
@@ -753,11 +767,16 @@ fn dispatch_plan(
                 // status never commit; a dry run mutated nothing so it never
                 // commits; zero mutations skip the write (SkippedNoMutations).
                 if mode == Mode::Push && !exec_report.mutations.is_empty() {
+                    // M1/F1 (W251, reviews 5472028291 + 5472033449): the
+                    // production push commit refreshes the S7 local mirror
+                    // (W246 contract live; `commit_manifest` fills the cache
+                    // on Written).
+                    let cache = crate::inventory::CachePaths::new(vault);
                     match crate::inventory::commit_manifest(
                         store,
                         &inventory_base,
                         &exec_report.mutations,
-                        None,
+                        Some(&cache),
                     ) {
                         Ok(crate::inventory::CommitOutcome::Written { .. })
                         | Ok(crate::inventory::CommitOutcome::SkippedNoMutations) => {}
@@ -880,6 +899,21 @@ fn resolve_vault_from_config(cmd: Command, settings: &crate::config::Settings) -
             config,
             verbose,
             follow_symlinks,
+        },
+        Command::Repair {
+            vault,
+            json,
+            config,
+            verbose,
+            dry_run,
+            force,
+        } if vault == Path::new(VAULT_UNSET) => Command::Repair {
+            vault: want,
+            json,
+            config,
+            verbose,
+            dry_run,
+            force,
         },
         other => other,
     }
@@ -2001,6 +2035,50 @@ mod tests {
     }
 
     #[test]
+    fn push_refreshes_local_manifest_cache() {
+        // W251 (M1/F1, reviews 5472028291 + 5472033449): production push
+        // wires the S7 local cache so the mirror (W246 contract) is live -
+        // the committed manifest's meta file records the remote etag and the
+        // body file holds the committed body. RED today: the push arm passes
+        // cache: None, so no cache files appear.
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "hi").unwrap();
+        let store = MemoryStore::new();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::push(dir.path().into(), false),
+            &store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::Auto,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0, "err: {}", String::from_utf8_lossy(&err));
+        let cache = crate::inventory::CachePaths::new(dir.path());
+        let meta: crate::inventory::CacheMeta = serde_json::from_slice(
+            &std::fs::read(&cache.meta)
+                .unwrap_or_else(|_| panic!("cache meta missing at {}", cache.meta.display())),
+        )
+        .unwrap();
+        let remote = store.head(crate::local::MANIFEST_KEY).unwrap();
+        assert_eq!(
+            meta.remote_etag, remote.etag,
+            "cache meta etag must equal the committed remote etag"
+        );
+        let body = std::fs::read(&cache.body)
+            .unwrap_or_else(|_| panic!("cache body missing at {}", cache.body.display()));
+        let m = crate::manifest::parse_manifest_bytes(&body).unwrap();
+        assert_eq!(m.entry_count, 1);
+        assert_eq!(m.entries[0].key, "a.md");
+    }
+
+    #[test]
     fn pull_does_not_write_manifest() {
         // W240 / Q6 (issue 45): pull never commits the manifest - the body
         // arrives but the manifest etag/body stay untouched.
@@ -2163,6 +2241,8 @@ mod tests {
         let mut err = Vec::new();
         let code = run_with_io(
             Command::Repair {
+                vault: PathBuf::from(VAULT_UNSET),
+                json: false,
                 config: None,
                 verbose: 0,
                 dry_run: true,
@@ -2190,6 +2270,58 @@ mod tests {
             store.head(crate::local::MANIFEST_KEY).unwrap_err(),
             crate::error::Error::NotFound(_)
         ));
+    }
+
+    #[test]
+    fn repair_refreshes_local_manifest_cache() {
+        // W251 (M1/F1, reviews 5472028291 + 5472033449): repair (like push)
+        // wires the S7 local cache - the rebuilt manifest's meta records the
+        // fresh remote etag and the body file holds the rebuilt body. RED
+        // today: the repair arm passes cache: None.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"hi".to_vec());
+        store
+            .put_from("a.md", &mut c, 2, Some(1_600_000_000_000))
+            .unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::Repair {
+                vault: dir.path().into(),
+                json: false,
+                config: None,
+                verbose: 0,
+                dry_run: false,
+                force: false,
+            },
+            &store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::ListHead,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0, "err: {}", String::from_utf8_lossy(&err));
+        let cache = crate::inventory::CachePaths::new(dir.path());
+        let meta: crate::inventory::CacheMeta = serde_json::from_slice(
+            &std::fs::read(&cache.meta)
+                .unwrap_or_else(|_| panic!("cache meta missing at {}", cache.meta.display())),
+        )
+        .unwrap();
+        let remote = store.head(crate::local::MANIFEST_KEY).unwrap();
+        assert_eq!(
+            meta.remote_etag, remote.etag,
+            "cache meta etag must equal the rebuilt remote etag"
+        );
+        let body = std::fs::read(&cache.body)
+            .unwrap_or_else(|_| panic!("cache body missing at {}", cache.body.display()));
+        let m = crate::manifest::parse_manifest_bytes(&body).unwrap();
+        assert_eq!(m.entry_count, 1);
     }
 
     #[test]
