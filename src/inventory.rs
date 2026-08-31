@@ -61,14 +61,29 @@ pub fn load_remote_inventory(
     mode: InventoryMode,
     cache: Option<&CachePaths>,
 ) -> Result<RemoteInventory, Error> {
+    load_remote_inventory_with_progress(store, mode, cache, &crate::progress::NoProgress)
+}
+
+/// Like [`load_remote_inventory`] with a plan-phase progress sink threaded
+/// into the COLD path only (issue 42, I42-callers-no-sink): warm manifest
+/// loads emit zero plan-phase events (I42-warm-events); a cold `ListHead`
+/// (or an Auto fallback) brackets with `PlanStart`/`PlanEnd` and lets the
+/// store's `list_with_progress` emit `ListPage`/head events through the same
+/// sink. No-sink callers keep the old signature via the wrapper above.
+pub fn load_remote_inventory_with_progress(
+    store: &dyn ObjectStore,
+    mode: InventoryMode,
+    cache: Option<&CachePaths>,
+    progress: &dyn crate::progress::Progress,
+) -> Result<RemoteInventory, Error> {
     match mode {
-        InventoryMode::ListHead => live_list_head(store),
+        InventoryMode::ListHead => live_list_head(store, progress),
         InventoryMode::Auto => match try_load_manifest(store, cache) {
             Ok(ManifestWarm::Loaded(inv)) => Ok(inv),
             Ok(ManifestWarm::Missing) => {
                 // No manifest object: auto falls back cold with a normative
                 // warning (Q3: the read path stays side-effect free).
-                let mut inv = live_list_head(store)?;
+                let mut inv = live_list_head(store, progress)?;
                 inv.warnings.push(
                     "inventory manifest missing; falling back to list+head (next push may ensure a manifest via bootstrap or commit, or run vaultsync repair)"
                         .to_string(),
@@ -80,7 +95,7 @@ pub fn load_remote_inventory(
                 // soft cap): same fallback, but the detail tells the
                 // operator WHY and that push may heal it via the H1
                 // head-then-If-Match commit (or run repair).
-                let mut inv = live_list_head(store)?;
+                let mut inv = live_list_head(store, progress)?;
                 inv.warnings.push(format!(
                     "inventory manifest invalid: {detail}; falling back to list+head (push will try to replace a present corrupt object, or run vaultsync repair)"
                 ));
@@ -381,38 +396,55 @@ fn fill_cache(cache: &CachePaths, body: &[u8], remote_etag: Option<String>) {
 /// issue 45 control-plane). Folder views stay in `entities`; `file_entities`
 /// carries files only (the commit base). I15-errors: a non-NotFound head
 /// error still fails the whole listing (fail closed).
-fn live_list_head(store: &dyn ObjectStore) -> Result<RemoteInventory, Error> {
-    let listing = store.list("")?;
-    let mut warnings = listing.warnings;
-    // R4-M2: drop a remote empty key (the exact-prefix folder marker) before
-    // validation. Every *other* invalid key stays fail-closed (R5-L1) at the
-    // build_plan boundary.
-    let entities: Vec<Entity> = listing
-        .entities
-        .into_iter()
-        .filter(|e| !e.key.is_empty())
-        .collect();
-    // W79/r9 L1 + W219 (issue 45): reserved partition (control-plane +
-    // final-segment probe/tmp). S3 already pre-partitions (W118) so this is
-    // a second-line guard for other backends - the warning fires once.
-    let (entities, reserved_dropped) = crate::partition_reserved_remote_keys(entities);
-    if !reserved_dropped.is_empty() {
-        warnings.push(crate::reserved_drops_warning(&reserved_dropped));
+///
+/// Issue 42 (I42 emission rules): the cold path emits `PlanStart` before the
+/// list and `PlanEnd` after the success path (warm paths never call this, so
+/// they stay event-free, I42-warm-events). The store's `list_with_progress`
+/// carries `ListPage`/head events through the same sink (W343/W346).
+/// Mid-cold failure returns WITHOUT `PlanEnd` - the CLI finalizes the bar
+/// defensively via the renderer's `finish_plan` (I42-finalize).
+fn live_list_head(
+    store: &dyn ObjectStore,
+    progress: &dyn crate::progress::Progress,
+) -> Result<RemoteInventory, Error> {
+    progress.event(crate::progress::ProgressEvent::PlanStart);
+    let result = (|| -> Result<RemoteInventory, Error> {
+        let listing = store.list_with_progress("", progress)?;
+        let mut warnings = listing.warnings;
+        // R4-M2: drop a remote empty key (the exact-prefix folder marker) before
+        // validation. Every *other* invalid key stays fail-closed (R5-L1) at the
+        // build_plan boundary.
+        let entities: Vec<Entity> = listing
+            .entities
+            .into_iter()
+            .filter(|e| !e.key.is_empty())
+            .collect();
+        // W79/r9 L1 + W219 (issue 45): reserved partition (control-plane +
+        // final-segment probe/tmp). S3 already pre-partitions (W118) so this is
+        // a second-line guard for other backends - the warning fires once.
+        let (entities, reserved_dropped) = crate::partition_reserved_remote_keys(entities);
+        if !reserved_dropped.is_empty() {
+            warnings.push(crate::reserved_drops_warning(&reserved_dropped));
+        }
+        let file_entities: Vec<Entity> = entities
+            .iter()
+            .filter(|e| !e.is_folder())
+            .cloned()
+            .collect();
+        Ok(RemoteInventory {
+            entities,
+            base: InventoryBase {
+                source: InventorySource::LiveListHead,
+                file_entities,
+                manifest_etag: None,
+            },
+            warnings,
+        })
+    })();
+    if result.is_ok() {
+        progress.event(crate::progress::ProgressEvent::PlanEnd);
     }
-    let file_entities: Vec<Entity> = entities
-        .iter()
-        .filter(|e| !e.is_folder())
-        .cloned()
-        .collect();
-    Ok(RemoteInventory {
-        entities,
-        base: InventoryBase {
-            source: InventorySource::LiveListHead,
-            file_entities,
-            manifest_etag: None,
-        },
-        warnings,
-    })
+    result
 }
 
 /// Local cache paths (S7). Declared here so the facade signature is stable
@@ -750,7 +782,7 @@ pub fn repair_manifest(
     opts: &RepairOpts,
     cache: Option<&CachePaths>,
 ) -> Result<RepairReport, Error> {
-    let inv = live_list_head(store)?;
+    let inv = live_list_head(store, &crate::progress::NoProgress)?;
     let files = &inv.base.file_entities;
     let created_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1267,6 +1299,214 @@ mod tests {
         )
         .unwrap();
         crate::manifest::serialize_manifest(&m).unwrap()
+    }
+
+    // I42 (W346): live_list_head routes through `list_with_progress`, not
+    // bare `list` - a counter store shows list_with_progress hit once and
+    // list hit zero on the cold path (the S3 page emission can only fire
+    // when the facade calls the progress-carrying method).
+    #[test]
+    fn cold_path_uses_list_with_progress() {
+        struct CountingListStore {
+            inner: MemoryStore,
+            list: std::sync::atomic::AtomicUsize,
+            list_with: std::sync::atomic::AtomicUsize,
+        }
+        impl ObjectStore for CountingListStore {
+            fn list(&self, prefix: &str) -> Result<crate::store::Listing, Error> {
+                self.list.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.inner.list(prefix)
+            }
+            fn list_with_progress(
+                &self,
+                prefix: &str,
+                progress: &dyn crate::progress::Progress,
+            ) -> Result<crate::store::Listing, Error> {
+                self.list_with
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.inner.list_with_progress(prefix, progress)
+            }
+            fn head(&self, key: &str) -> Result<Entity, Error> {
+                self.inner.head(key)
+            }
+            fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+                self.inner.get_to(key, w)
+            }
+            fn put_from(
+                &self,
+                key: &str,
+                r: &mut dyn std::io::Read,
+                size: u64,
+                mtime_ms: Option<u64>,
+            ) -> Result<Entity, Error> {
+                self.inner.put_from(key, r, size, mtime_ms)
+            }
+            fn delete(&self, key: &str) -> Result<(), Error> {
+                self.inner.delete(key)
+            }
+        }
+        let store = CountingListStore {
+            inner: MemoryStore::new(),
+            list: std::sync::atomic::AtomicUsize::new(0),
+            list_with: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let prog = crate::testutil::RecordingProgress::new();
+        let _inv =
+            load_remote_inventory_with_progress(&store, InventoryMode::ListHead, None, &prog)
+                .unwrap();
+        assert_eq!(
+            store.list_with.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "cold path must call list_with_progress exactly once"
+        );
+        assert_eq!(
+            store.list.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "cold path must never call bare list"
+        );
+    }
+
+    // I42 facade (W345): Auto fallback (missing / corrupt manifest) is COLD -
+    // emits PlanStart..PlanEnd and keeps the existing warning text verbatim;
+    // progress must not alter warning strings.
+    #[test]
+    fn auto_cold_fallback_emits_plan_progress_and_keeps_warnings() {
+        use crate::progress::ProgressEvent;
+        // missing manifest
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"aaa".to_vec());
+        store
+            .put_from("a.md", &mut c, 3, Some(1_600_000_000_000))
+            .unwrap();
+        let prog = crate::testutil::RecordingProgress::new();
+        let inv =
+            load_remote_inventory_with_progress(&store, InventoryMode::Auto, None, &prog)
+                .unwrap();
+        assert_eq!(inv.base.source, InventorySource::LiveListHead);
+        let events = prog.events();
+        assert!(matches!(events.first(), Some(ProgressEvent::PlanStart)));
+        assert!(matches!(events.last(), Some(ProgressEvent::PlanEnd)));
+        let warn = inv.warnings.join(" ");
+        assert!(warn.contains("falling back"), "warnings: {warn}");
+        assert!(warn.contains("list+head"), "warnings: {warn}");
+
+        // corrupt manifest body
+        let store2 = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"not json at all".to_vec());
+        store2
+            .put_from(
+                crate::local::MANIFEST_KEY,
+                &mut c,
+                "not json at all".len() as u64,
+                None,
+            )
+            .unwrap();
+        let mut c = std::io::Cursor::new(b"aaa".to_vec());
+        store2
+            .put_from("a.md", &mut c, 3, Some(1_600_000_000_000))
+            .unwrap();
+        let prog2 = crate::testutil::RecordingProgress::new();
+        let inv2 =
+            load_remote_inventory_with_progress(&store2, InventoryMode::Auto, None, &prog2)
+                .unwrap();
+        assert_eq!(inv2.base.source, InventorySource::LiveListHead);
+        let events2 = prog2.events();
+        assert!(matches!(events2.first(), Some(ProgressEvent::PlanStart)));
+        assert!(matches!(events2.last(), Some(ProgressEvent::PlanEnd)));
+        let warn2 = inv2.warnings.join(" ");
+        assert!(warn2.contains("falling back"), "warnings: {warn2}");
+        assert!(warn2.contains("invalid"), "warnings: {warn2}");
+    }
+
+    // I42-warm (W344): warm Auto/Manifest loads emit ZERO plan-phase events
+    // (I42-warm-events) - no PlanStart/PlanEnd, no ListPage, no heads; the
+    // source stays Manifest and entities match.
+    #[test]
+    fn warm_load_emits_no_plan_progress() {
+        let store = MemoryStore::new();
+        let body = manifest_body(&[("notes/a.md", 3, Some(100)), ("b.md", 1, None)]);
+        let body_len = body.len() as u64;
+        let mut c = std::io::Cursor::new(body);
+        store
+            .put_from(crate::local::MANIFEST_KEY, &mut c, body_len, None)
+            .unwrap();
+        for mode in [InventoryMode::Auto, InventoryMode::Manifest] {
+            let prog = crate::testutil::RecordingProgress::new();
+            let inv =
+                load_remote_inventory_with_progress(&store, mode, None, &prog).unwrap();
+            assert!(
+                prog.events().is_empty(),
+                "warm load must be event-free: {:?}",
+                prog.events()
+            );
+            assert!(matches!(inv.base.source, InventorySource::Manifest { .. }));
+            assert_eq!(inv.base.file_entities.len(), 2);
+        }
+    }
+
+    // I42 facade (W343): load_remote_inventory_with_progress brackets the
+    // cold ListHead path with PlanStart..PlanEnd; FakePagingStore adds
+    // ListPage between the brackets; the no-sink wrapper returns the same
+    // entities/source/warnings as the with-progress call under NoProgress.
+    #[test]
+    fn load_remote_inventory_with_progress_cold_brackets() {
+        use crate::progress::ProgressEvent;
+        // MemoryStore: PlanStart/PlanEnd only (no page loop, no enrich).
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"aaa".to_vec());
+        store
+            .put_from("a.md", &mut c, 3, Some(1_600_000_000_000))
+            .unwrap();
+        let prog = crate::testutil::RecordingProgress::new();
+        let inv =
+            load_remote_inventory_with_progress(&store, InventoryMode::ListHead, None, &prog)
+                .unwrap();
+        let events = prog.events();
+        assert!(
+            matches!(events.first(), Some(ProgressEvent::PlanStart)),
+            "first event must be PlanStart: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(ProgressEvent::PlanEnd)),
+            "last event must be PlanEnd: {events:?}"
+        );
+        assert_eq!(
+            events.len(),
+            2,
+            "MemoryStore cold emits only the brackets: {events:?}"
+        );
+        assert_eq!(inv.base.source, InventorySource::LiveListHead);
+        let keys: Vec<&str> = inv.entities.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["a.md"]);
+
+        // FakePagingStore: ListPage events between the brackets.
+        let paged = crate::testutil::FakePagingStore::new(1);
+        let mut c = std::io::Cursor::new(b"x".to_vec());
+        paged.inner.put_from("a.md", &mut c, 1, Some(1)).unwrap();
+        let mut c = std::io::Cursor::new(b"y".to_vec());
+        paged.inner.put_from("b.md", &mut c, 1, Some(2)).unwrap();
+        let prog2 = crate::testutil::RecordingProgress::new();
+        let inv2 =
+            load_remote_inventory_with_progress(&paged, InventoryMode::ListHead, None, &prog2)
+                .unwrap();
+        let events2 = prog2.events();
+        assert!(matches!(events2.first(), Some(ProgressEvent::PlanStart)));
+        assert!(matches!(events2.last(), Some(ProgressEvent::PlanEnd)));
+        assert!(
+            events2
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::ListPage { .. })),
+            "FakePagingStore must emit ListPage between the brackets: {events2:?}"
+        );
+        assert_eq!(inv2.base.file_entities.len(), 2);
+
+        // No-sink wrapper: identical result to NoProgress threading.
+        let plain = load_remote_inventory(&store, InventoryMode::ListHead, None).unwrap();
+        assert_eq!(inv.base.source, plain.base.source);
+        assert_eq!(inv.base.file_entities, plain.base.file_entities);
+        assert_eq!(inv.base.manifest_etag, plain.base.manifest_etag);
+        assert_eq!(inv.entities, plain.entities);
+        assert_eq!(inv.warnings, plain.warnings);
     }
 
     #[test]
