@@ -379,12 +379,30 @@ fn format_eta(secs: f64) -> String {
     }
 }
 
+/// True for issue-42 plan-phase events, routed to [`PlanProgressLine`] by the
+/// renderers (W331). Executor events route to [`ProgressLine`].
+fn is_plan_phase(ev: &ProgressEvent) -> bool {
+    matches!(
+        ev,
+        ProgressEvent::PlanStart
+            | ProgressEvent::ListPage { .. }
+            | ProgressEvent::HeadsStart { .. }
+            | ProgressEvent::HeadDone { .. }
+            | ProgressEvent::PlanEnd
+    )
+}
+
 /// TTY renderer (I27-home/I27-render): wraps a writer + a [`ProgressLine`]
 /// and refreshes one line in place - `\r{line}\x1b[K` on `PassStart`/
 /// `KeyDone`, `\r{line}\x1b[K\n` to finalize a `PassEnd`. `RunEnd` and
 /// zero-total passes render nothing. `event()` serializes through an internal
 /// `Mutex`, so worker-thread emission (I27-thread) is safe and the writer is
 /// flushed after every frame (a buffered cursor cannot freeze the bar).
+///
+/// Issue 42 (W331+): plan-phase events route to a [`PlanProgressLine`]
+/// beside the executor line. `PlanEnd` finalizes the plan frame with a
+/// newline; `finish_plan()` is the belt-and-braces finalize for error paths
+/// where the library could not emit `PlanEnd` (I42-finalize).
 ///
 /// The writer is `&mut (dyn Write + Send)` (not bare `dyn Write`) so the
 /// `Mutex` keeps `TermProgress: Send + Sync` and thus usable behind `dyn
@@ -396,6 +414,10 @@ pub struct TermProgress<'w> {
 
 struct TermInner<'w> {
     line: ProgressLine,
+    plan_line: PlanProgressLine,
+    /// Set once the plan frame was finalized with a newline (`PlanEnd` or
+    /// `finish_plan`) so the belt-and-braces finalize is idempotent.
+    plan_finalized: bool,
     writer: &'w mut (dyn std::io::Write + Send),
 }
 
@@ -404,10 +426,31 @@ impl<'w> TermProgress<'w> {
         TermProgress {
             inner: Mutex::new(TermInner {
                 line: ProgressLine::new(),
+                plan_line: PlanProgressLine::new(),
+                plan_finalized: false,
                 writer,
             }),
             start: std::time::Instant::now(),
         }
+    }
+
+    /// Issue 42 belt-and-braces (I42-finalize): finalize a partial plan bar
+    /// with a newline so later stderr lines (warnings, W236, errors) never
+    /// collide with a mid-line `\r` frame. No-op when the plan line was
+    /// already finalized via `PlanEnd` or there is nothing to render.
+    pub fn finish_plan(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.plan_finalized {
+            return;
+        }
+        let rendered = inner.plan_line.render();
+        if rendered.is_empty() {
+            return;
+        }
+        inner.plan_finalized = true;
+        let frame = format!("\r{rendered}\x1b[K\n");
+        let _ = inner.writer.write_all(frame.as_bytes());
+        let _ = inner.writer.flush();
     }
 }
 
@@ -416,6 +459,29 @@ impl Progress for TermProgress<'_> {
         if matches!(ev, ProgressEvent::RunEnd { .. }) {
             // The pass line was finalized with a newline at PassEnd; a RunEnd
             // frame would overwrite it without one.
+            return;
+        }
+        // Issue 42 (W331): plan-phase events drive the plan line machine and
+        // finalize at `PlanEnd` (newline). The executor line machine never
+        // sees them, and the plan line never sees executor events (W329/W330).
+        if is_plan_phase(&ev) {
+            let finalize = matches!(ev, ProgressEvent::PlanEnd);
+            let mut inner = self.inner.lock().unwrap();
+            inner.plan_line.on_event(ev);
+            let rendered = inner.plan_line.render();
+            if rendered.is_empty() {
+                return;
+            }
+            if finalize {
+                inner.plan_finalized = true;
+            }
+            let frame = if finalize {
+                format!("\r{rendered}\x1b[K\n")
+            } else {
+                format!("\r{rendered}\x1b[K")
+            };
+            let _ = inner.writer.write_all(frame.as_bytes());
+            let _ = inner.writer.flush();
             return;
         }
         let finalize = matches!(ev, ProgressEvent::PassEnd { .. });
@@ -795,6 +861,116 @@ mod tests {
             );
         }
         assert_eq!(bar_cells(&l.render()), "=====>--");
+    }
+
+    // I42-render (W333): the non-TTY renderer swallows the full plan-phase
+    // sequence - the writer stays empty (same contract as the executor path).
+    #[test]
+    fn quiet_renderer_swallows_plan_phase() {
+        let mut buf = Vec::new();
+        {
+            let p = QuietProgress::new(&mut buf);
+            p.event(ProgressEvent::PlanStart);
+            p.event(ProgressEvent::ListPage {
+                page: 1,
+                keys_so_far: 1000,
+            });
+            p.event(ProgressEvent::HeadsStart { total_keys: 5 });
+            p.event(ProgressEvent::HeadDone {
+                done: 2,
+                total_keys: 5,
+            });
+            p.event(ProgressEvent::PlanEnd);
+        }
+        assert!(buf.is_empty(), "quiet renderer must write nothing");
+    }
+
+    // I42-render (W332): `PlanEnd` finalizes the plan frame with a newline
+    // (and clear); a subsequent executor pass starts a fresh line that never
+    // corrupts the finalized plan line (split contents on `\n` and assert).
+    #[test]
+    fn tty_renderer_plan_end_then_executor_pass() {
+        let mut buf = Vec::new();
+        {
+            let p = TermProgress::new(&mut buf);
+            p.event(ProgressEvent::PlanStart);
+            p.event(ProgressEvent::ListPage {
+                page: 1,
+                keys_so_far: 1000,
+            });
+            p.event(ProgressEvent::ListPage {
+                page: 2,
+                keys_so_far: 2000,
+            });
+            p.event(ProgressEvent::PlanEnd);
+            p.event(ProgressEvent::PassStart {
+                kind: PassKind::Upload,
+                total_keys: 2,
+                total_bytes: 20,
+            });
+            p.event(ProgressEvent::KeyDone {
+                kind: PassKind::Upload,
+                key: "a.md".to_string(),
+                bytes: 10,
+                ok: true,
+            });
+        }
+        let s = String::from_utf8(buf).unwrap();
+        let mut lines = s.split('\n');
+        let plan_part = lines.next().unwrap();
+        let exec_part = lines.next().unwrap();
+        assert!(
+            plan_part.contains("Listing"),
+            "plan frames on the first line: {plan_part:?}"
+        );
+        assert!(
+            plan_part.contains("2000 keys"),
+            "final plan frame state: {plan_part:?}"
+        );
+        assert!(
+            plan_part.ends_with("\x1b[K"),
+            "plan end clears the line: {plan_part:?}"
+        );
+        assert!(
+            exec_part.contains("Uploading"),
+            "executor frames on the next line: {exec_part:?}"
+        );
+        assert!(exec_part.contains("1/2"), "{exec_part:?}");
+        assert_eq!(lines.next(), None, "no stray extra lines: {s:?}");
+    }
+
+    // I42-render (W331): TermProgress routes plan-phase events to the plan
+    // line machine with in-place `\r` refresh per `ListPage`; no newline is
+    // written until `PlanEnd` (I42-finalize).
+    #[test]
+    fn tty_renderer_refreshes_plan_listing_frames() {
+        let mut buf = Vec::new();
+        {
+            let p = TermProgress::new(&mut buf);
+            p.event(ProgressEvent::PlanStart);
+            p.event(ProgressEvent::ListPage {
+                page: 1,
+                keys_so_far: 1000,
+            });
+            p.event(ProgressEvent::ListPage {
+                page: 2,
+                keys_so_far: 2000,
+            });
+        }
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(
+            s.matches('\r').count(),
+            2,
+            "one refresh per ListPage: {s:?}"
+        );
+        assert_eq!(
+            s.matches('\n').count(),
+            0,
+            "no newline before PlanEnd: {s:?}"
+        );
+        assert!(s.contains("Listing"), "{s:?}");
+        assert!(s.contains("2000 keys"), "latest key count: {s:?}");
+        assert!(s.contains("\x1b[K"), "clear-to-EOL: {s:?}");
     }
 
     // I27-render: a pass with total_keys == 0 renders nothing.
