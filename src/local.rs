@@ -1269,13 +1269,6 @@ fn walk(
             // `skipped_temp_files` (the reserved bucket), never as an ignore
             // drop, and never recursed into. Nested `notes/.vaultsync/` is a
             // normal user folder (first segment `notes`).
-            // W220 (issue 45): the control-plane directory `.vaultsync/`
-            // (first path segment exactly `.vaultsync`) is never walked or
-            // uploaded - the local cache lives there. Reserved-namespace
-            // stays FIRST and independent (D-filter-order): counted in
-            // `skipped_temp_files` (the reserved bucket), never as an ignore
-            // drop, and never recursed into. Nested `notes/.vaultsync/` is a
-            // normal user folder (first segment `notes`).
             if crate::local::is_vaultsync_control_plane_key(&key) {
                 report.skipped_temp_files += 1;
                 continue;
