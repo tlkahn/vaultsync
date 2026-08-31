@@ -72,6 +72,25 @@ pub fn build_plan(
     ignore: &IgnoreSet,
     inventory: &crate::inventory::InventoryOpts,
 ) -> Result<PlanReport, Error> {
+    // I42-callers-no-sink: the no-sink wrapper behaves byte-identically to
+    // today (NoProgress emits nothing on the cold path).
+    build_plan_with_progress(local, store, mode, opts, ignore, inventory, &crate::progress::NoProgress)
+}
+
+/// Like [`build_plan`] with a plan-phase progress sink threaded into the
+/// remote inventory load (issue 42, W347): cold ListHead planning emits
+/// `PlanStart`/`PlanEnd` (and `ListPage`/head events from the store's
+/// `list_with_progress`); warm planning emits nothing (I42-warm-events).
+/// The local walk emits no counters in v1 (I42-walk).
+pub fn build_plan_with_progress(
+    local: &LocalFs,
+    store: &dyn ObjectStore,
+    mode: Mode,
+    opts: &PlanOpts,
+    ignore: &IgnoreSet,
+    inventory: &crate::inventory::InventoryOpts,
+    progress: &dyn crate::progress::Progress,
+) -> Result<PlanReport, Error> {
     let (local_entities, walk_report) = local.list_report()?;
     // W235 (issue 45): the remote file set comes from the inventory facade
     // (warm manifest or live list+head), which also owns the reserved
@@ -79,8 +98,9 @@ pub fn build_plan(
     // aggregates the facade's warnings with its own into
     // `PlanReport.warnings` for the CLI to print - library code must not
     // write to process stderr. The base (source + files + etag) rides along
-    // for the commit path (D-plan-seam).
-    let remote = crate::inventory::load_remote_inventory(
+    // for the commit path (D-plan-seam). Issue 42: the progress sink is
+    // threaded into the facade (cold path only).
+    let remote = crate::inventory::load_remote_inventory_with_progress(
         store,
         inventory.mode,
         inventory
@@ -88,6 +108,7 @@ pub fn build_plan(
             .as_deref()
             .and_then(cache_paths)
             .as_ref(),
+        progress,
     )?;
     let mut warnings = remote.warnings;
     let remote_entities = remote.entities;
@@ -988,6 +1009,115 @@ mod tests {
     }
 
     #[test]
+    // I42-warm (W348): warm build_plan_with_progress stays silent - the
+    // recording is empty and the report source is Manifest (W236 remains a
+    // CLI concern only; the library never prints it).
+    #[test]
+    fn warm_build_plan_with_progress_silent() {
+        let dir = TempDir::new("vaultsync-lib-test");
+        std::fs::write(dir.join("a.md"), "aaa").unwrap();
+        let local = LocalFs::new(dir.path());
+        let (local_entities, _) = local.list_report().unwrap();
+        let files: Vec<Entity> = local_entities
+            .iter()
+            .filter(|e| !e.is_folder())
+            .cloned()
+            .collect();
+        let store = MemoryStore::new();
+        let m = crate::manifest::file_entities_to_manifest(&files, 0, None, None).unwrap();
+        let body = crate::manifest::serialize_manifest(&m).unwrap();
+        let body_len = body.len() as u64;
+        let mut c = std::io::Cursor::new(body);
+        store
+            .put_from(crate::local::MANIFEST_KEY, &mut c, body_len, None)
+            .unwrap();
+        let prog = crate::testutil::RecordingProgress::new();
+        let report = build_plan_with_progress(
+            &local,
+            &store,
+            Mode::Status,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::default(),
+            &prog,
+        )
+        .unwrap();
+        assert!(
+            prog.events().is_empty(),
+            "warm build_plan must be silent: {:?}",
+            prog.events()
+        );
+        assert!(
+            matches!(
+                report.inventory_base.source,
+                crate::inventory::InventorySource::Manifest { .. }
+            ),
+            "source must be Manifest"
+        );
+    }
+
+    // I42 (W347): build_plan_with_progress forwards the sink on the cold
+    // path (PlanStart..PlanEnd with ListPage from a paging store) and the
+    // no-sink wrapper equals it under NoProgress on plan/warnings/source.
+    #[test]
+    fn build_plan_with_progress_forwards_sink_and_wrapper_matches() {
+        use crate::progress::ProgressEvent;
+        let dir = TempDir::new("vaultsync-lib-test");
+        std::fs::write(dir.join("a.md"), "aaa").unwrap();
+        let local = LocalFs::new(dir.path());
+        let store = crate::testutil::FakePagingStore::new(2);
+        let mut c = std::io::Cursor::new(b"rrr".to_vec());
+        store
+            .inner
+            .put_from("r.md", &mut c, 3, Some(1_600_000_000_000))
+            .unwrap();
+        let prog = crate::testutil::RecordingProgress::new();
+        let report = build_plan_with_progress(
+            &local,
+            &store,
+            Mode::Status,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+            &prog,
+        )
+        .unwrap();
+        let events = prog.events();
+        assert!(matches!(events.first(), Some(ProgressEvent::PlanStart)));
+        assert!(matches!(events.last(), Some(ProgressEvent::PlanEnd)));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::ListPage { .. })),
+            "paging store emits ListPage through build_plan_with_progress: {events:?}"
+        );
+
+        // no-sink wrapper equals with-progress under NoProgress
+        let report2 = build_plan(
+            &local,
+            &store,
+            Mode::Status,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap();
+        assert_eq!(report.plan, report2.plan);
+        assert_eq!(report.warnings, report2.warnings);
+        assert_eq!(
+            report.inventory_base.source,
+            report2.inventory_base.source
+        );
+        assert_eq!(
+            report.inventory_base.file_entities,
+            report2.inventory_base.file_entities
+        );
+        assert_eq!(
+            report.inventory_base.manifest_etag,
+            report2.inventory_base.manifest_etag
+        );
+    }
+
     fn build_plan_empty_ignore_matches_today() {
         // W196: the new `ignore: &IgnoreSet` argument defaults to empty, and
         // an empty set must not break remote ingest - a normal remote-only
