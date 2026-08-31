@@ -315,7 +315,23 @@ No CLI flag required for v1 of the feature; config-only is enough (same spirit a
 
 ### 6.3 Progress (interaction with #42)
 
-Even with a warm manifest, emit a short stderr milestone on TTY, e.g. `inventory: manifest (12 403 entries)` vs `inventory: list+head (cold)`. Cold path **must** reuse the plan-phase progress work from #42 (page/head counters).
+Every plan build emits a short always-on stderr milestone: `inventory:
+manifest (N entries)` warm vs `inventory: list+head (cold)` (W236, locked
+strings). Issue 42 landed the plan-phase progress feed that the cold path
+reuses: `ProgressEvent` gains plan-phase variants (`PlanStart`, `ListPage`
+with cumulative `keys_so_far`, `HeadsStart`/`HeadDone` totals, `PlanEnd`),
+`ObjectStore` gains the additive `list_with_progress(prefix, &dyn Progress)`
+(default = ignore sink + `list`, so no-sink callers are byte-identical),
+and the facade threads a sink through `load_remote_inventory_with_progress`
+/ `repair_manifest_with_progress` / `build_plan_with_progress` on the COLD
+path only (warm loads emit zero plan-phase events). The pure
+`PlanProgressLine` renders `Listing     page N  K keys` /
+`Heading     D/T  [bar]  P%`; the CLI finalizes the bar (PlanEnd or its own
+`finish_plan` belt-and-braces on error) before printing W236 / warnings so
+`\r` frames never collide. S3 emits one `ListPage` per `ListObjectsV2` page
+(keys_so_far = cumulative raw contents count, `max_keys` stays 1000) and the
+head enrichment emits `HeadsStart`/`HeadDone` per object (folder views never
+headed).
 
 ---
 

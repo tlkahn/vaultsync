@@ -116,6 +116,17 @@ the only writer of the manifest (commit after a successful push, and
 and carries the `InventoryBase` (source + files + manifest etag) on
 `PlanReport` for the commit path. Full design: [inventory-manifest.md](./inventory-manifest.md).
 
+Issue 42 extended the progress story to the plan phase: the cold inventory
+path (live `ListObjectsV2` pages + per-object heads) emits plan-phase
+`ProgressEvent`s (`PlanStart`/`ListPage`/`HeadsStart`/`HeadDone`/`PlanEnd`)
+through the same `Progress` trait and TTY/quiet renderers that the executor
+uses - `build_plan_with_progress` / `load_remote_inventory_with_progress` /
+`repair_manifest_with_progress` thread an optional sink (no-sink wrappers
+stay byte-identical), `ObjectStore::list_with_progress` carries page/head
+events from the store, and warm manifest loads stay event-free. See
+[inventory-manifest.md section 6.3](./inventory-manifest.md) and
+[cli.md](./cli.md).
+
 ### 4. Planner
 
 Pure function:
