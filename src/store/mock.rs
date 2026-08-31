@@ -77,8 +77,9 @@ fn read_exact_n(r: &mut dyn Read, n: u64) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// FNV-1a 64-bit hash over a byte slice (std-only, no crates).
-fn fnv1a(bytes: &[u8]) -> u64 {
+/// FNV-1a 64-bit hash over a byte slice (std-only, no crates). Also used by
+/// the inventory cache body fingerprint (W259/N3).
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in bytes {
         h ^= *b as u64;

@@ -263,10 +263,13 @@ fn try_load_manifest_cached(
     cache: &CachePaths,
 ) -> Result<ManifestWarm, Error> {
     // Conditional attempt when we hold a remote etag.
-    if let Some(etag) = read_cache_meta(cache).and_then(|m| m.remote_etag) {
+    if let Some((meta, etag)) =
+        read_cache_meta(cache).and_then(|m| m.remote_etag.clone().map(|etag| (m, etag)))
+    {
         // M2 (review 5472028291): the conditional Body streams through a
-        // capped writer too - no extra head here (the conditional GET already
-        // round-tripped; a head would double every warm load's RTT).
+        // capped writer too - no extra head here (the conditional GET
+        // already round-tripped; a head would double every warm load's
+        // RTT).
         let mut writer = CappedWriter::new(crate::manifest::MANIFEST_MAX_BYTES);
         match store.get_to_with(
             crate::local::MANIFEST_KEY,
@@ -276,15 +279,20 @@ fn try_load_manifest_cached(
             },
         ) {
             Ok(crate::store::GetOutcome::NotModified(_)) => {
-                if let Some((_cached, manifest)) = read_cache_body(cache) {
-                    // Cache valid: plan from it without re-download. W257
-                    // (L3): the body was parsed exactly once inside
-                    // read_cache_body - no second parse here; a corrupt
-                    // cached body already invalidated + fell through.
-                    return manifest_inventory(&manifest, Some(etag)).map(ManifestWarm::Loaded);
+                if let Some((cached, manifest)) = read_cache_body(cache) {
+                    // W259 (N3, review 5472033449): the cached body must
+                    // belong with THIS meta - a mismatched fingerprint
+                    // (body/meta crash window, rot, tamper) is
+                    // invalidated and refetched, never planned from.
+                    // W257 (L3): the body was parsed exactly once inside
+                    // read_cache_body.
+                    if body_fingerprint(&cached) == meta.body_fnv {
+                        return manifest_inventory(&manifest, Some(etag)).map(ManifestWarm::Loaded);
+                    }
+                    invalidate_cache(cache);
                 }
-                // Corrupt/missing cache body was invalidated above: fall
-                // through to a fresh fetch below.
+                // Corrupt/missing/mismatched cache body invalidated
+                // above: fall through to a fresh fetch below.
             }
             Ok(crate::store::GetOutcome::Body(entity)) => {
                 if writer.tripped {
@@ -310,9 +318,9 @@ fn try_load_manifest_cached(
                 invalidate_cache(cache);
                 return Ok(ManifestWarm::Missing);
             }
-            // W245: any non-NotFound failure fails closed - never plan from
-            // the stale cache alone. The capped writer's own trip is
-            // over-cap (corrupt-like), not a store failure.
+            // W245: any non-NotFound failure fails closed - never plan
+            // from the stale cache alone. The capped writer's own trip
+            // is over-cap (corrupt-like), not a store failure.
             Err(_) if writer.tripped => {
                 invalidate_cache(cache);
                 return Ok(ManifestWarm::Invalid(format!(
@@ -361,6 +369,9 @@ fn fill_cache(cache: &CachePaths, body: &[u8], remote_etag: Option<String>) {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0),
         source_key: crate::local::MANIFEST_KEY.to_string(),
+        // W259 (N3): the fingerprint proves this body belongs with this meta
+        // on the 304 path.
+        body_fnv: body_fingerprint(body),
     };
     let _ = write_cache_files(body, &meta, cache);
 }
@@ -425,19 +436,34 @@ impl CachePaths {
 }
 
 /// Cache metadata (issue 45, 4.3): the remote etag the cached body was
-/// fetched under (used for the conditional GET), when it was fetched, and
-/// the source key. Stored at `manifest-v1.meta.json`.
+/// fetched under (used for the conditional GET), when it was fetched, the
+/// source key, and the body's fingerprint (W259/N3, review 5472033449) so
+/// the 304 path can prove a cached body belongs with its meta. Stored at
+/// `manifest-v1.meta.json`. The fingerprint field is REQUIRED: a meta
+/// written before W259 fails to deserialize and is treated as absent
+/// (one-time refetch).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CacheMeta {
     pub remote_etag: Option<String>,
     pub fetched_at_ms: u64,
     pub source_key: String,
+    /// FNV-1a 64-bit of the cached body bytes, hex (16 chars).
+    pub body_fnv: String,
+}
+
+/// FNV-1a 64-bit hex fingerprint of a cache body (std-only; the same
+/// primitive the mock uses for etags, reused per W259).
+fn body_fingerprint(body: &[u8]) -> String {
+    format!("{:016x}", crate::store::mock::fnv1a(body))
 }
 
 /// Write the cache body + meta atomically (temp+rename, owner-only 0o600 on
 /// Unix; W243). A crash between the two renames leaves a body/meta pair that
-/// may disagree - the reader treats a meta that does not validate as absent
-/// (and a body that fails to parse is invalidated, W245).
+/// may disagree - the reader validates the PAIR: a meta that does not
+/// deserialize is treated as absent, a body that fails to parse is
+/// invalidated (W245), and a body whose fingerprint does not match its meta
+/// is invalidated and refetched (W259/N3). No single crash window can serve
+/// a wrong body.
 fn write_cache_files(body: &[u8], meta: &CacheMeta, cache: &CachePaths) -> Result<(), Error> {
     if let Some(parent) = cache.body.parent() {
         std::fs::create_dir_all(parent).map_err(Error::Io)?;
@@ -1705,13 +1731,14 @@ mod tests {
         // the same values. On Unix the files are owner-only (0o600).
         let dir = crate::testutil::TempDir::new("vaultsync-cache-test");
         let cache = CachePaths::new(dir.path());
+        let body =
+            br#"{"schema":"vaultsync.manifest.v1","created_ms":0,"entry_count":0,"entries":[]}"#;
         let meta = CacheMeta {
             remote_etag: Some("\"abc\"".to_string()),
             fetched_at_ms: 1234,
             source_key: crate::local::MANIFEST_KEY.to_string(),
+            body_fnv: body_fingerprint(body),
         };
-        let body =
-            br#"{"schema":"vaultsync.manifest.v1","created_ms":0,"entry_count":0,"entries":[]}"#;
         write_cache_files(body, &meta, &cache).unwrap();
         // No temp leftovers.
         assert!(
@@ -1896,6 +1923,7 @@ mod tests {
             remote_etag: Some(etag.clone()),
             fetched_at_ms: 1,
             source_key: crate::local::MANIFEST_KEY.to_string(),
+            body_fnv: body_fingerprint(b"garbage body"),
         };
         write_cache_files(b"garbage body", &meta, &cache).unwrap();
         let inv = load_remote_inventory(&store, InventoryMode::Auto, Some(&cache)).unwrap();
@@ -1911,6 +1939,65 @@ mod tests {
         let m = crate::manifest::parse_manifest_bytes(&cached_body).unwrap();
         assert_eq!(m.entry_count, 1);
         assert_eq!(m.entries[0].key, "a.md");
+    }
+
+    #[test]
+    fn cache_body_mismatched_fingerprint_is_invalidated_not_served() {
+        // W259 (N3, review 5472033449): the 304 path must prove a cached
+        // body belongs with its meta - a body whose fingerprint does not
+        // match (body/meta crash window, rot, tamper) is never planned from;
+        // the load invalidates and fresh-fetches, then heals the pair. RED
+        // today: no fingerprint field, the stale body is served as if it were
+        // the current manifest.
+        let dir = crate::testutil::TempDir::new("vaultsync-cache-test");
+        let cache = CachePaths::new(dir.path());
+        let store = CountingGetStore::new();
+        let current = manifest_body(&[("a.md", 3, Some(100))]);
+        let body_len = current.len() as u64;
+        let mut c = std::io::Cursor::new(current.clone());
+        let put = store
+            .inner
+            .put_from(crate::local::MANIFEST_KEY, &mut c, body_len, None)
+            .unwrap();
+        let etag = put.etag.clone().unwrap();
+        // Manual mismatch: the meta claims the CURRENT etag + the CURRENT
+        // body's fingerprint, but the body FILE holds a STALE (different,
+        // valid) manifest - a pair that only a partial write could produce.
+        let stale = manifest_body(&[("stale.md", 1, None)]);
+        let meta = CacheMeta {
+            remote_etag: Some(etag.clone()),
+            fetched_at_ms: 1,
+            source_key: crate::local::MANIFEST_KEY.to_string(),
+            body_fnv: body_fingerprint(&current),
+        };
+        std::fs::create_dir_all(cache.body.parent().unwrap()).unwrap();
+        std::fs::write(&cache.body, &stale).unwrap();
+        std::fs::write(&cache.meta, serde_json::to_vec(&meta).unwrap()).unwrap();
+        let inv = load_remote_inventory(&store, InventoryMode::Auto, Some(&cache)).unwrap();
+        assert_eq!(
+            inv.base.source,
+            InventorySource::Manifest {
+                remote_etag: Some(etag.clone())
+            }
+        );
+        // Planned from the CURRENT body (a.md), never the stale one.
+        let keys: Vec<&str> = inv
+            .base
+            .file_entities
+            .iter()
+            .map(|e| e.key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["a.md"], "stale body must not be served");
+        // Cache healed: body + meta now agree (fingerprint of the current
+        // body), so the NEXT load is a plain 304 no-re-download.
+        let (cached, _m) = read_cache_body(&cache).expect("cache healed");
+        let m = crate::manifest::parse_manifest_bytes(&cached).unwrap();
+        assert_eq!(m.entries[0].key, "a.md");
+        assert_eq!(
+            body_fingerprint(&cached),
+            read_cache_meta(&cache).unwrap().body_fnv,
+            "cache pair must be consistent after healing"
+        );
     }
 
     #[test]
@@ -1934,6 +2021,7 @@ mod tests {
             remote_etag: Some("\"abc\"".to_string()),
             fetched_at_ms: 1,
             source_key: crate::local::MANIFEST_KEY.to_string(),
+            body_fnv: body_fingerprint(&body),
         };
         write_cache_files(&body, &meta, &cache).unwrap();
 
