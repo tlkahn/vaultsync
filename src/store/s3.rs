@@ -152,43 +152,68 @@ impl S3Store {
         &self,
         caller_prefix: &str,
     ) -> Result<Vec<(String, u64, Option<u64>)>, Error> {
+        // I42-pages (W341): the no-sink wrapper keeps `list_object_keys` and
+        // any other bare-page caller byte-identical (NoProgress emits
+        // nothing); the progress-carrying loop lives in
+        // `list_prefix_objects_with_progress`.
+        self.list_prefix_objects_with_progress(caller_prefix, &crate::progress::NoProgress)
+    }
+
+    /// The paged ListObjectsV2 loop with a plan-phase sink (I42-pages,
+    /// W341): emits one cumulative `ListPage` per page via
+    /// [`fold_list_page`] (keys_so_far = raw contents count, W342 lock).
+    /// `page` is 1-based. The async fetch is wrapped per page so the pure
+    /// fold stays unit-testable offline; `max_keys(1000)` unchanged
+    /// (I42-max-keys).
+    fn list_prefix_objects_with_progress(
+        &self,
+        caller_prefix: &str,
+        progress: &dyn crate::progress::Progress,
+    ) -> Result<Vec<(String, u64, Option<u64>)>, Error> {
         let s3_prefix = format!("{}{}", self.prefix, caller_prefix);
-        self.rt.block_on(async {
-            let mut out = Vec::new();
-            let mut continuation: Option<String> = None;
-            loop {
+        let mut out = Vec::new();
+        let mut continuation: Option<String> = None;
+        let mut page: u32 = 0;
+        let mut keys_so_far: u64 = 0;
+        loop {
+            let tok = continuation.clone();
+            let resp = self.rt.block_on(async {
                 let mut req = self
                     .client
                     .list_objects_v2()
                     .bucket(&self.bucket)
                     .prefix(&s3_prefix)
                     .max_keys(1000);
-                if let Some(tok) = &continuation {
-                    req = req.continuation_token(tok.clone());
+                if let Some(t) = &tok {
+                    req = req.continuation_token(t.clone());
                 }
-                let resp = req.send().await.map_err(|e| map_sdk_err(&e, "list"))?;
-                for obj in resp.contents().iter() {
-                    let Some(full) = obj.key() else { continue };
-                    let Some(rel) = strip_prefix(&self.prefix, full) else {
-                        continue;
-                    };
+                req.send().await.map_err(|e| map_sdk_err(&e, "list"))
+            })?;
+            let rows: Vec<(String, u64, Option<u64>)> = resp
+                .contents()
+                .iter()
+                .filter_map(|obj| {
+                    let full = obj.key()?;
+                    let rel = strip_prefix(&self.prefix, full)?;
                     // LastModified is the only mtime source in a raw listing;
                     // `enrich_with_head_mtimes` overwrites mtime/etag/size for
                     // object entities before `list` returns (W113/I15).
                     let last = obj.last_modified().and_then(dt_millis);
-                    out.push((
+                    Some((
                         rel.to_string(),
                         obj.size().map(nonneg_size).unwrap_or(0),
                         last,
-                    ));
-                }
-                match next_continuation(resp.is_truncated(), resp.next_continuation_token())? {
-                    Some(t) => continuation = Some(t),
-                    None => break,
-                }
+                    ))
+                })
+                .collect();
+            page += 1;
+            fold_list_page(progress, page, &mut keys_so_far, &mut out, rows);
+            match next_continuation(resp.is_truncated(), resp.next_continuation_token())? {
+                Some(t) => continuation = Some(t),
+                None => break,
             }
-            Ok(out)
-        })
+        }
+        Ok(out)
     }
 
     /// List the object keys under `prefix` WITHOUT head enrichment, folder
@@ -204,6 +229,28 @@ impl S3Store {
     pub fn list_object_keys(&self, prefix: &str) -> Result<Vec<String>, Error> {
         Ok(object_keys_from_raw(self.list_prefix_objects(prefix)?))
     }
+}
+
+/// Fold one ListObjectsV2 page into the running output (I42-pages, W341/
+/// W342): emits a cumulative `ListPage` event then appends the raw rows.
+/// `keys_so_far` counts the raw page `contents` rows INCLUDING folder-marker
+/// rows (W342 lock: simple, matches the wall-time work of the page request;
+/// pre-folder-synth is fine). `page` is 1-based. Pure; the S3 async page
+/// fetch is the only non-testable part - this helper is unit-tested offline
+/// with canned page vectors.
+pub(crate) fn fold_list_page(
+    progress: &dyn crate::progress::Progress,
+    page: u32,
+    keys_so_far: &mut u64,
+    out: &mut Vec<(String, u64, Option<u64>)>,
+    rows: Vec<(String, u64, Option<u64>)>,
+) {
+    *keys_so_far += rows.len() as u64;
+    progress.event(crate::progress::ProgressEvent::ListPage {
+        page,
+        keys_so_far: *keys_so_far,
+    });
+    out.extend(rows);
 }
 
 /// Pure conversion of a raw listing into object keys only (I17-cleanup-api):
@@ -594,7 +641,20 @@ fn create_temp_upload_file() -> Result<(PathBuf, std::fs::File), Error> {
 
 impl ObjectStore for S3Store {
     fn list(&self, prefix: &str) -> Result<Listing, Error> {
-        let raw = self.list_prefix_objects(prefix)?;
+        // I42-callers-no-sink: the bare `list` is the no-sink wrapper -
+        // byte-identical to today (NoProgress emits nothing).
+        self.list_with_progress(prefix, &crate::progress::NoProgress)
+    }
+
+    fn list_with_progress(
+        &self,
+        prefix: &str,
+        progress: &dyn crate::progress::Progress,
+    ) -> Result<Listing, Error> {
+        // I42-pages (W341): the page loop emits one cumulative `ListPage`
+        // per page; the head enrichment below emits `HeadsStart`/`HeadDone`
+        // through the SAME sink (W335).
+        let raw = self.list_prefix_objects_with_progress(prefix, progress)?;
         let (entities, dropped_nonempty) = convert_listed(raw);
         // W70/A-N2 + H1 (W99): a non-empty `*/` key would otherwise be
         // invisible - never planned, never warned. The warning now travels in
@@ -622,8 +682,14 @@ impl ObjectStore for S3Store {
         // by the SDK `RetryConfig` (I8, supersedes the retired W117 stopgap);
         // any other head error fails the listing (I15-errors). I20-heads:
         // the enrichment heads fan out under `self.concurrency` (same
-        // `[transfer].concurrency` cap as the transfer passes).
-        enrich_with_head_mtimes(self, Listing { entities, warnings }, self.concurrency, &crate::progress::NoProgress)
+        // `[transfer].concurrency` cap as the transfer passes). I42-heads:
+        // the enrichment emits through the caller's sink (W335).
+        enrich_with_head_mtimes(
+            self,
+            Listing { entities, warnings },
+            self.concurrency,
+            progress,
+        )
     }
 
     fn head(&self, key: &str) -> Result<Entity, Error> {
@@ -1158,6 +1224,44 @@ mod tests {
             keys,
             vec!["a.md".to_string(), "notes/c.md".to_string()],
             "folder-marker rows must be dropped, file keys keep stable order"
+        );
+    }
+
+    // I42-pages (W341/W342): the pure S3 page-loop fold emits one cumulative
+    // ListPage per page; keys_so_far counts raw page `contents` rows
+    // (folder-marker rows included - W342 lock: matches wall-time work).
+    #[test]
+    fn fold_list_page_emits_cumulative_pages() {
+        use crate::progress::ProgressEvent;
+        let prog = crate::testutil::RecordingProgress::new();
+        let mut keys_so_far: u64 = 0;
+        let mut out: Vec<(String, u64, Option<u64>)> = Vec::new();
+        let page1 = vec![
+            ("a.md".to_string(), 1, Some(100)),
+            ("notes/".to_string(), 0, None), // folder-marker row counts
+            ("b.md".to_string(), 2, Some(200)),
+        ];
+        fold_list_page(&prog, 1, &mut keys_so_far, &mut out, page1);
+        assert_eq!(
+            keys_so_far, 3,
+            "keys_so_far counts raw contents, folder marker included"
+        );
+        assert_eq!(out.len(), 3, "rows appended verbatim");
+        let page2 = vec![("c.md".to_string(), 3, Some(300))];
+        fold_list_page(&prog, 2, &mut keys_so_far, &mut out, page2);
+        assert_eq!(keys_so_far, 4, "cumulative across pages");
+        assert_eq!(
+            prog.events(),
+            vec![
+                ProgressEvent::ListPage {
+                    page: 1,
+                    keys_so_far: 3,
+                },
+                ProgressEvent::ListPage {
+                    page: 2,
+                    keys_so_far: 4,
+                },
+            ]
         );
     }
 
