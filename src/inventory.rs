@@ -670,7 +670,10 @@ pub(crate) fn write_manifest_body(
     cache: Option<&CachePaths>,
 ) -> Result<WriteBodyOutcome, Error> {
     let body_len = body.len() as u64;
-    let mut cursor = std::io::Cursor::new(body.to_vec());
+    // W304 (PR50-r1 F2, review 5476323432): `Cursor::new(&[u8])` reads in
+    // place - no forced `body.to_vec()` clone. All in-tree stores consume the
+    // reader synchronously within this call.
+    let mut cursor = std::io::Cursor::new(body);
     let opts = match cond {
         WriteCond::IfMatch(etag) => crate::store::PutOpts {
             if_match_etag: Some(etag),
@@ -778,8 +781,14 @@ pub fn repair_manifest(
         // put result carries the etag (no trailing head).
         match write_manifest_body(store, &body, WriteCond::Force, cache)? {
             WriteBodyOutcome::Written { etag } => etag,
+            // N2 (PR50-r1, review 5476323432): a store that answers
+            // PreconditionFailed on an unconditional put is surfaced as Err -
+            // never `unreachable!`.
             WriteBodyOutcome::PreconditionFailed => {
-                unreachable!("force put has no precondition")
+                return Err(Error::PreconditionFailed(format!(
+                    "unexpected precondition failure on force put of {}",
+                    crate::local::MANIFEST_KEY
+                )));
             }
         }
     } else {
@@ -2110,6 +2119,69 @@ mod tests {
         assert!(
             rep.etag.is_some(),
             "etag must come from the put result, not a trailing head"
+        );
+    }
+
+    #[test]
+    fn repair_force_put_precondition_failed_returns_err_no_panic() {
+        // W305/N2 (PR50-r1, review 5476323432): a force repair against a
+        // store that answers PreconditionFailed on the unconditional put must
+        // return `Err(Error::PreconditionFailed(_))`, never panic on the old
+        // `unreachable!`.
+        struct AlwaysFailStore {
+            inner: MemoryStore,
+        }
+        impl ObjectStore for AlwaysFailStore {
+            fn list(&self, prefix: &str) -> Result<crate::store::Listing, Error> {
+                self.inner.list(prefix)
+            }
+            fn head(&self, key: &str) -> Result<Entity, Error> {
+                self.inner.head(key)
+            }
+            fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+                self.inner.get_to(key, w)
+            }
+            fn put_from(
+                &self,
+                key: &str,
+                r: &mut dyn std::io::Read,
+                size: u64,
+                mtime_ms: Option<u64>,
+            ) -> Result<Entity, Error> {
+                self.inner.put_from(key, r, size, mtime_ms)
+            }
+            fn put_from_with(
+                &self,
+                _key: &str,
+                _r: &mut dyn std::io::Read,
+                _size: u64,
+                _opts: crate::store::PutOpts,
+            ) -> Result<Entity, Error> {
+                Err(Error::PreconditionFailed(
+                    "simulated unconditional-put precondition failure".to_string(),
+                ))
+            }
+            fn delete(&self, key: &str) -> Result<(), Error> {
+                self.inner.delete(key)
+            }
+        }
+        let store = AlwaysFailStore {
+            inner: MemoryStore::new(),
+        };
+        let mut c = std::io::Cursor::new(b"hi".to_vec());
+        store.put_from("a.md", &mut c, 2, Some(1)).unwrap();
+        let err = repair_manifest(
+            &store,
+            &RepairOpts {
+                force: true,
+                dry_run: false,
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::PreconditionFailed(_)),
+            "got {err:?} - must be Err, not panic"
         );
     }
 
