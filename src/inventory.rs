@@ -917,14 +917,33 @@ pub(crate) fn resolve_cold_put_plan(
             // writer the warm fetch uses, then parse with load rules.
             let mut writer = CappedWriter::new(crate::manifest::MANIFEST_MAX_BYTES);
             match store.get_to(crate::local::MANIFEST_KEY, &mut writer) {
-                Ok(_entity) => {
+                Ok(ent) => {
                     if writer.tripped {
                         // Present but above the soft cap: unusable -> heal.
+                        // Body is unusable, so If-Match the HEAD etag (the
+                        // live token for replacing the junk).
                         return Ok(ColdPlan::Overwrite {
                             files: apply_base(base_files),
                             etag: live_etag,
                         });
                     }
+                    // M2 (PR50-r2, review 5476798257): prefer the GET
+                    // entity etag - the generation we actually validated -
+                    // when it is present (matches the warm load which trusts
+                    // the GET etag). A HEAD etag that DIFFERS from the GET
+                    // etag means the object changed between HEAD and GET
+                    // (another writer): fail closed, never Adopt/If-Match a
+                    // mixed pair (caller F2 policy). A GET etag-less backend
+                    // (N5 residual) falls back to the HEAD etag.
+                    let cond_etag = match (ent.etag.as_deref(), live_etag.as_str()) {
+                        (Some(g), h) if g != h => {
+                            return Err(Error::Other(format!(
+                                "manifest HEAD/GET etag mismatch during conditional resolve ({h} vs {g}); please retry"
+                            )));
+                        }
+                        (Some(g), _) => g.to_string(),
+                        (None, h) => h.to_string(),
+                    };
                     match crate::manifest::parse_manifest_bytes(&writer.buf) {
                         Ok(their) => match successes_opt {
                             // B1: a concurrent-valid manifest is adopted.
@@ -933,7 +952,7 @@ pub(crate) fn resolve_cold_put_plan(
                                     crate::manifest::manifest_to_file_entities(&their)
                                         .expect("parsed manifest maps cleanly");
                                 Ok(ColdPlan::Adopt {
-                                    etag: live_etag,
+                                    etag: cond_etag,
                                     files,
                                     entry_count: their.entries.len(),
                                 })
@@ -947,14 +966,15 @@ pub(crate) fn resolve_cold_put_plan(
                                 let files = apply_commit_mutations(&their_files, successes);
                                 Ok(ColdPlan::Overwrite {
                                     files,
-                                    etag: live_etag,
+                                    etag: cond_etag,
                                 })
                             }
                         },
-                        // Present but corrupt: heal via If-Match live etag.
+                        // Present but corrupt: heal via If-Match the etag of
+                        // the validated-per-HEAD generation.
                         Err(_) => Ok(ColdPlan::Overwrite {
                             files: apply_base(base_files),
-                            etag: live_etag,
+                            etag: cond_etag,
                         }),
                     }
                 }
@@ -2886,6 +2906,146 @@ mod tests {
             Some(6),
             "our Upload must win on the touched key (mtime)"
         );
+    }
+
+    #[test]
+    fn resolve_head_get_etag_mismatch_fails_closed() {
+        // W316 (PR50-r2 M2, review 5476798257): H1-V must condition on the
+        // GET entity etag when the validate probe returns one, and a HEAD
+        // etag that DIFFERS from the GET etag means the live object changed
+        // between HEAD and GET (another writer) - fail CLOSED (Err), never
+        // Adopt/If-Match a mixed pair. RED: today the code discards the GET
+        // etag and Adopts with the HEAD etag, so head="etag-head"/
+        // get="etag-get" returns Ok(Adopt) instead of Err.
+        struct MixedEtagStore {
+            inner: MemoryStore,
+        }
+        impl ObjectStore for MixedEtagStore {
+            fn list(&self, prefix: &str) -> Result<crate::store::Listing, Error> {
+                self.inner.list(prefix)
+            }
+            fn head(&self, key: &str) -> Result<crate::entity::Entity, Error> {
+                if key == crate::local::MANIFEST_KEY {
+                    return Ok(crate::entity::Entity {
+                        key: key.to_string(),
+                        size: 100,
+                        mtime_ms: None,
+                        etag: Some("etag-head".to_string()),
+                    });
+                }
+                self.inner.head(key)
+            }
+            fn get_to(
+                &self,
+                key: &str,
+                w: &mut dyn std::io::Write,
+            ) -> Result<crate::entity::Entity, Error> {
+                if key == crate::local::MANIFEST_KEY {
+                    let body = manifest_body(&[("a.md", 1, None)]);
+                    std::io::Write::write_all(w, &body).unwrap();
+                    return Ok(crate::entity::Entity {
+                        key: key.to_string(),
+                        size: body.len() as u64,
+                        mtime_ms: None,
+                        etag: Some("etag-get".to_string()),
+                    });
+                }
+                self.inner.get_to(key, w)
+            }
+            fn put_from(
+                &self,
+                key: &str,
+                r: &mut dyn std::io::Read,
+                size: u64,
+                mtime_ms: Option<u64>,
+            ) -> Result<crate::entity::Entity, Error> {
+                self.inner.put_from(key, r, size, mtime_ms)
+            }
+            fn delete(&self, key: &str) -> Result<(), Error> {
+                self.inner.delete(key)
+            }
+        }
+
+        let store = MixedEtagStore {
+            inner: MemoryStore::new(),
+        };
+        let base_files = vec![crate::entity::file("a.md", 1, None)];
+        let err = resolve_cold_put_plan(&store, &base_files, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("etag mismatch"),
+            "HEAD/GET etag mismatch must fail closed: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_uses_get_etag_when_present() {
+        // W317 (PR50-r2 M2): when the HEAD and GET etags agree, H1-V
+        // conditions on the GET entity etag (the generation we validated),
+        // not the stale HEAD token. Equal pair => Adopt carries the shared
+        // etag. characterization: GREEN on arrival (HEAD==GET here).
+        struct EqualEtagStore {
+            inner: MemoryStore,
+        }
+        impl ObjectStore for EqualEtagStore {
+            fn list(&self, prefix: &str) -> Result<crate::store::Listing, Error> {
+                self.inner.list(prefix)
+            }
+            fn head(&self, key: &str) -> Result<crate::entity::Entity, Error> {
+                if key == crate::local::MANIFEST_KEY {
+                    return Ok(crate::entity::Entity {
+                        key: key.to_string(),
+                        size: 100,
+                        mtime_ms: None,
+                        etag: Some("etag-x".to_string()),
+                    });
+                }
+                self.inner.head(key)
+            }
+            fn get_to(
+                &self,
+                key: &str,
+                w: &mut dyn std::io::Write,
+            ) -> Result<crate::entity::Entity, Error> {
+                if key == crate::local::MANIFEST_KEY {
+                    let body = manifest_body(&[("a.md", 1, None)]);
+                    std::io::Write::write_all(w, &body).unwrap();
+                    return Ok(crate::entity::Entity {
+                        key: key.to_string(),
+                        size: body.len() as u64,
+                        mtime_ms: None,
+                        etag: Some("etag-x".to_string()),
+                    });
+                }
+                self.inner.get_to(key, w)
+            }
+            fn put_from(
+                &self,
+                key: &str,
+                r: &mut dyn std::io::Read,
+                size: u64,
+                mtime_ms: Option<u64>,
+            ) -> Result<crate::entity::Entity, Error> {
+                self.inner.put_from(key, r, size, mtime_ms)
+            }
+            fn delete(&self, key: &str) -> Result<(), Error> {
+                self.inner.delete(key)
+            }
+        }
+
+        let store = EqualEtagStore {
+            inner: MemoryStore::new(),
+        };
+        let base_files = vec![crate::entity::file("a.md", 1, None)];
+        match resolve_cold_put_plan(&store, &base_files, None).unwrap() {
+            ColdPlan::Adopt {
+                etag, entry_count, ..
+            } => {
+                assert_eq!(etag, "etag-x");
+                assert_eq!(entry_count, 1);
+            }
+            other => panic!("expected Adopt with GET etag, got {other:?}"),
+        }
     }
 
     #[test]
