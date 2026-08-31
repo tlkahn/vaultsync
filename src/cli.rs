@@ -431,11 +431,7 @@ pub fn run_with_io(
             if json {
                 return reject_json(err);
             }
-            let opts = crate::inventory::RepairOpts {
-                force,
-                dry_run,
-                concurrency: ctx.concurrency,
-            };
+            let opts = crate::inventory::RepairOpts { force, dry_run };
             // M1/F1 (W251): repair refreshes the local mirror like push - the
             // rebuilt manifest's meta records the fresh remote etag.
             let cache = crate::inventory::CachePaths::new(&vault);
@@ -500,7 +496,6 @@ pub fn run_with_io(
                 &ctx.ignore,
                 &crate::inventory::InventoryOpts {
                     mode: ctx.inventory_mode,
-                    concurrency: ctx.concurrency,
                     vault_root: Some(vault.clone()),
                 },
             ) {
@@ -718,7 +713,6 @@ fn dispatch_plan(
         &flags.ignore,
         &crate::inventory::InventoryOpts {
             mode: flags.inventory_mode,
-            concurrency: flags.concurrency,
             vault_root: Some(vault.clone()),
         },
     ) {

@@ -50,14 +50,15 @@ pub struct RemoteInventory {
 
 /// Load the remote inventory for plan build (issue 45, section 6.1).
 ///
-/// `mode` selects warm vs cold; `concurrency` bounds the cold path's heads
-/// (via the store's own list enrichment on S3); `cache` is `None` until S7.
-/// Cold path: `store.list("")` + reserved partition (second-line guard; S3
-/// already pre-partitions) - I15 stays intact.
+/// `mode` selects warm vs cold; `cache` is `None` until S7. Cold-path head
+/// concurrency is a store-construction concern (`S3Store::new(...,
+/// settings.concurrency)`, `[transfer].concurrency`) - the facade does not
+/// re-bind it through `dyn ObjectStore` (M3/F3, reviews 5472028291 +
+/// 5472033449). Cold path: `store.list("")` + reserved partition
+/// (second-line guard; S3 already pre-partitions) - I15 stays intact.
 pub fn load_remote_inventory(
     store: &dyn ObjectStore,
     mode: InventoryMode,
-    _concurrency: u32,
     cache: Option<&CachePaths>,
 ) -> Result<RemoteInventory, Error> {
     match mode {
@@ -474,13 +475,13 @@ fn invalidate_cache(cache: &CachePaths) {
 }
 
 /// Inventory knobs threaded into [`crate::build_plan`] (issue 45,
-/// D-plan-seam): the resolved `[inventory].mode`, the transfer concurrency
-/// (bounds the cold path's heads via the store), and the vault root
-/// (`Some` enables the S7 local cache; `None` until W243).
+/// D-plan-seam): the resolved `[inventory].mode` and the vault root (`Some`
+/// enables the S7 local cache; `None` until W243). Cold-head concurrency is
+/// owned by store construction (M3/F3, reviews 5472028291 + 5472033449) -
+/// not re-bound here.
 #[derive(Debug, Clone)]
 pub struct InventoryOpts {
     pub mode: InventoryMode,
-    pub concurrency: u32,
     pub vault_root: Option<std::path::PathBuf>,
 }
 
@@ -492,19 +493,16 @@ impl InventoryOpts {
     pub fn list_head() -> Self {
         InventoryOpts {
             mode: InventoryMode::ListHead,
-            concurrency: 1,
             vault_root: None,
         }
     }
 }
 
 impl Default for InventoryOpts {
-    /// Product default (Q1): `auto`, concurrency 1 (callers override with
-    /// their resolved settings), no cache until S7.
+    /// Product default (Q1): `auto`, no cache until S7.
     fn default() -> Self {
         InventoryOpts {
             mode: InventoryMode::Auto,
-            concurrency: 1,
             vault_root: None,
         }
     }
@@ -566,7 +564,9 @@ pub(crate) fn apply_commit_mutations(
     map.into_values().collect()
 }
 
-/// Repair options (issue 45, D-repair / section 10).
+/// Repair options (issue 45, D-repair / section 10). Cold list+head head
+/// concurrency is a store-construction concern, not re-bound here (M3/F3,
+/// reviews 5472028291 + 5472033449).
 #[derive(Debug, Clone)]
 pub struct RepairOpts {
     /// Overwrite the manifest unconditionally (no If-Match; used after a
@@ -574,8 +574,6 @@ pub struct RepairOpts {
     pub force: bool,
     /// Compute the body and report the entry count but write nothing.
     pub dry_run: bool,
-    /// Bounds the cold list+head path's heads (via the store).
-    pub concurrency: u32,
 }
 
 /// Report of a repair run (W241).
@@ -844,7 +842,7 @@ mod tests {
             .inner
             .put_from(crate::local::MANIFEST_KEY, &mut c, body_len, None)
             .unwrap();
-        let inv = load_remote_inventory(&store, InventoryMode::Auto, 1, None).unwrap();
+        let inv = load_remote_inventory(&store, InventoryMode::Auto, None).unwrap();
         assert_eq!(
             inv.base.source,
             InventorySource::Manifest {
@@ -878,7 +876,7 @@ mod tests {
         store
             .put_from("a.md", &mut c, 3, Some(1_600_000_000_000))
             .unwrap();
-        let inv = load_remote_inventory(&store, InventoryMode::Auto, 1, None).unwrap();
+        let inv = load_remote_inventory(&store, InventoryMode::Auto, None).unwrap();
         assert_eq!(inv.base.source, InventorySource::LiveListHead);
         let file_keys: Vec<&str> = inv
             .base
@@ -911,7 +909,7 @@ mod tests {
         store
             .put_from("a.md", &mut c, 3, Some(1_600_000_000_000))
             .unwrap();
-        let inv = load_remote_inventory(&store, InventoryMode::Auto, 1, None).unwrap();
+        let inv = load_remote_inventory(&store, InventoryMode::Auto, None).unwrap();
         assert_eq!(inv.base.source, InventorySource::LiveListHead);
         let warn = inv.warnings.join(" ");
         assert!(warn.contains("falling back"), "warnings: {warn}");
@@ -928,7 +926,7 @@ mod tests {
         store
             .put_from("a.md", &mut c, 3, Some(1_600_000_000_000))
             .unwrap();
-        let err = load_remote_inventory(&store, InventoryMode::Manifest, 1, None).unwrap_err();
+        let err = load_remote_inventory(&store, InventoryMode::Manifest, None).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("repair"), "error must suggest repair: {msg}");
 
@@ -942,7 +940,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let err = load_remote_inventory(&store2, InventoryMode::Manifest, 1, None).unwrap_err();
+        let err = load_remote_inventory(&store2, InventoryMode::Manifest, None).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("repair"), "error must suggest repair: {msg}");
     }
@@ -979,13 +977,9 @@ mod tests {
                 self.0.delete(key)
             }
         }
-        let err = load_remote_inventory(
-            &FailGetStore(MemoryStore::new()),
-            InventoryMode::Auto,
-            1,
-            None,
-        )
-        .unwrap_err();
+        let err =
+            load_remote_inventory(&FailGetStore(MemoryStore::new()), InventoryMode::Auto, None)
+                .unwrap_err();
         assert!(matches!(err, Error::Unavailable(_)), "got {err:?}");
     }
 
@@ -1010,7 +1004,7 @@ mod tests {
                 Some(1_600_000_000_000),
             )
             .unwrap();
-        let inv = load_remote_inventory(&store, InventoryMode::ListHead, 1, None).unwrap();
+        let inv = load_remote_inventory(&store, InventoryMode::ListHead, None).unwrap();
         let keys: Vec<&str> = inv.entities.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(
             keys,
@@ -1367,7 +1361,7 @@ mod tests {
         let store = NoGetOverCapStore {
             inner: MemoryStore::new(),
         };
-        let inv = load_remote_inventory(&store, InventoryMode::Auto, 1, None).unwrap();
+        let inv = load_remote_inventory(&store, InventoryMode::Auto, None).unwrap();
         assert_eq!(inv.base.source, InventorySource::LiveListHead);
         assert!(
             inv.warnings
@@ -1386,7 +1380,7 @@ mod tests {
         let store = NoGetOverCapStore {
             inner: MemoryStore::new(),
         };
-        let err = load_remote_inventory(&store, InventoryMode::Manifest, 1, None).unwrap_err();
+        let err = load_remote_inventory(&store, InventoryMode::Manifest, None).unwrap_err();
         assert!(
             err.to_string().contains("requires a valid remote manifest"),
             "err: {err}"
@@ -1424,7 +1418,6 @@ mod tests {
             &RepairOpts {
                 force: false,
                 dry_run: false,
-                concurrency: 1,
             },
             None,
         )
@@ -1456,7 +1449,6 @@ mod tests {
             &RepairOpts {
                 force: false,
                 dry_run: true,
-                concurrency: 1,
             },
             None,
         )
@@ -1496,7 +1488,6 @@ mod tests {
             &RepairOpts {
                 force: false,
                 dry_run: false,
-                concurrency: 1,
             },
             None,
         )
@@ -1516,7 +1507,6 @@ mod tests {
             &RepairOpts {
                 force: true,
                 dry_run: false,
-                concurrency: 1,
             },
             None,
         )
@@ -1666,7 +1656,7 @@ mod tests {
             .unwrap();
         let etag = put.etag.clone().unwrap();
 
-        let inv1 = load_remote_inventory(&store, InventoryMode::Auto, 1, Some(&cache)).unwrap();
+        let inv1 = load_remote_inventory(&store, InventoryMode::Auto, Some(&cache)).unwrap();
         assert_eq!(
             inv1.base.source,
             InventorySource::Manifest {
@@ -1678,7 +1668,7 @@ mod tests {
         let fetched1 = store.bytes_fetched();
 
         // Second load: 304 via the cache etag; no re-download.
-        let inv2 = load_remote_inventory(&store, InventoryMode::Auto, 1, Some(&cache)).unwrap();
+        let inv2 = load_remote_inventory(&store, InventoryMode::Auto, Some(&cache)).unwrap();
         assert_eq!(
             inv2.base.source,
             InventorySource::Manifest {
@@ -1737,8 +1727,7 @@ mod tests {
         let failing = crate::testutil::FailGetStore {
             inner: MemoryStore::new(),
         };
-        let err =
-            load_remote_inventory(&failing, InventoryMode::Auto, 1, Some(&cache)).unwrap_err();
+        let err = load_remote_inventory(&failing, InventoryMode::Auto, Some(&cache)).unwrap_err();
         assert!(
             matches!(err, Error::Unavailable(_)),
             "non-NotFound remote failure must fail closed (got {err:?})"
@@ -1783,7 +1772,6 @@ mod tests {
             &RepairOpts {
                 force: false,
                 dry_run: false,
-                concurrency: 1,
             },
             Some(&cache),
         )

@@ -83,7 +83,6 @@ pub fn build_plan(
     let remote = crate::inventory::load_remote_inventory(
         store,
         inventory.mode,
-        inventory.concurrency,
         inventory
             .vault_root
             .as_deref()
