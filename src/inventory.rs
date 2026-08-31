@@ -671,14 +671,19 @@ pub fn repair_manifest(
         });
     }
     let body_len = body.len() as u64;
+    // N2 (review 5472033449): the written etag comes from each PUT result -
+    // no trailing head RTT, and a head that fails after a successful write
+    // can no longer degrade the report.
+    let written_etag: Option<String>;
     if opts.force {
         let mut cursor = std::io::Cursor::new(body);
-        store.put_from_with(
+        let entity = store.put_from_with(
             crate::local::MANIFEST_KEY,
             &mut cursor,
             body_len,
             crate::store::PutOpts::default(),
         )?;
+        written_etag = entity.etag;
     } else {
         match store.head(crate::local::MANIFEST_KEY) {
             Ok(cur) => {
@@ -693,12 +698,12 @@ pub fn repair_manifest(
                         ..Default::default()
                     },
                 ) {
-                    Ok(_) => {}
+                    Ok(entity) => written_etag = entity.etag,
                     // Lost the race: retry ONCE against a fresh head.
                     Err(Error::PreconditionFailed(_)) => {
                         let cur = store.head(crate::local::MANIFEST_KEY)?;
                         let mut cursor = std::io::Cursor::new(body);
-                        store.put_from_with(
+                        let entity = store.put_from_with(
                             crate::local::MANIFEST_KEY,
                             &mut cursor,
                             body_len,
@@ -707,6 +712,7 @@ pub fn repair_manifest(
                                 ..Default::default()
                             },
                         )?;
+                        written_etag = entity.etag;
                     }
                     Err(e) => return Err(e),
                 }
@@ -714,7 +720,7 @@ pub fn repair_manifest(
             // No manifest yet: create (If-None-Match: *).
             Err(Error::NotFound(_)) => {
                 let mut cursor = std::io::Cursor::new(body);
-                store.put_from_with(
+                let entity = store.put_from_with(
                     crate::local::MANIFEST_KEY,
                     &mut cursor,
                     body_len,
@@ -723,23 +729,20 @@ pub fn repair_manifest(
                         ..Default::default()
                     },
                 )?;
+                written_etag = entity.etag;
             }
             Err(e) => return Err(e),
         }
     }
-    let etag = store
-        .head(crate::local::MANIFEST_KEY)
-        .ok()
-        .and_then(|e| e.etag);
     // W246: repair refreshes the local cache mirror (best-effort).
     if let Some(cache) = cache {
-        fill_cache(cache, &cache_body, etag.clone());
+        fill_cache(cache, &cache_body, written_etag.clone());
     }
     Ok(RepairReport {
         listed: files.len(),
         written: true,
         dry_run: false,
-        etag,
+        etag: written_etag,
         warnings: inv.warnings,
     })
 }
@@ -1628,6 +1631,70 @@ mod tests {
         let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
         let keys: Vec<&str> = m.entries.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(keys, vec!["a.md", "z.md"]);
+    }
+
+    #[test]
+    fn repair_force_uses_put_etag_without_trailing_head() {
+        // W258 (N2, review 5472033449): repair must carry the etag from the
+        // PUT result - no extra trailing head, and a head that fails after a
+        // successful write must not degrade the report (today the trailing
+        // head's error is swallowed into etag: None). Force mode never needs
+        // a pre-put head, so a double whose head always fails on MANIFEST_KEY
+        // proves the trailing head is gone.
+        struct HeadFailStore {
+            inner: MemoryStore,
+        }
+        impl ObjectStore for HeadFailStore {
+            fn list(&self, prefix: &str) -> Result<crate::store::Listing, Error> {
+                self.inner.list(prefix)
+            }
+            fn head(&self, _key: &str) -> Result<Entity, Error> {
+                Err(Error::Unavailable("head disabled".to_string()))
+            }
+            fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+                self.inner.get_to(key, w)
+            }
+            fn put_from(
+                &self,
+                key: &str,
+                r: &mut dyn std::io::Read,
+                size: u64,
+                mtime_ms: Option<u64>,
+            ) -> Result<Entity, Error> {
+                self.inner.put_from(key, r, size, mtime_ms)
+            }
+            fn put_from_with(
+                &self,
+                key: &str,
+                r: &mut dyn std::io::Read,
+                size: u64,
+                opts: crate::store::PutOpts,
+            ) -> Result<Entity, Error> {
+                self.inner.put_from_with(key, r, size, opts)
+            }
+            fn delete(&self, key: &str) -> Result<(), Error> {
+                self.inner.delete(key)
+            }
+        }
+        let store = HeadFailStore {
+            inner: MemoryStore::new(),
+        };
+        let mut c = std::io::Cursor::new(b"hi".to_vec());
+        store.put_from("a.md", &mut c, 2, Some(1)).unwrap();
+        let rep = repair_manifest(
+            &store,
+            &RepairOpts {
+                force: true,
+                dry_run: false,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(rep.written);
+        assert!(
+            rep.etag.is_some(),
+            "etag must come from the put result, not a trailing head"
+        );
     }
 
     #[test]
