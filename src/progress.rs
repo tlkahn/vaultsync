@@ -232,6 +232,91 @@ impl ProgressLine {
     }
 }
 
+/// Pure, IO-free plan-phase line state machine (I42-line, B2): fed the
+/// issue-42 plan-phase events (`PlanStart` / `ListPage` / `HeadsStart` /
+/// `HeadDone` / `PlanEnd`), it renders one bounded line per active phase - a
+/// cumulative listing line or a heading bar line. Foreign executor events
+/// never mutate it (W329), and the executor `ProgressLine` symmetrically
+/// ignores plan-phase events (W330). No byte rate / ETA on the plan phase
+/// (I42-line).
+///
+/// Line layout (mirrors the executor budgets): `Listing     page N  K keys`
+/// (12-col verb) and `Heading     D/T  [bar]  P%` (12-col verb + 8-cell bar).
+/// Exact strings are locked by the pure-line unit tests before any renderer
+/// wiring (W327/W328).
+#[derive(Debug, Default)]
+pub struct PlanProgressLine {
+    /// (page, keys_so_far) after the most recent `ListPage`.
+    listing: Option<(u32, u64)>,
+    /// Heading totals once `HeadsStart` armed: (done, total).
+    heading: Option<(u32, u32)>,
+}
+
+impl PlanProgressLine {
+    pub fn new() -> Self {
+        PlanProgressLine::default()
+    }
+
+    /// Fold one plan-phase event. `PlanStart` renders nothing on its own
+    /// (blank until the first `ListPage`/`HeadsStart`, W327 lock); `PlanEnd`
+    /// keeps the last frame state for the renderer to print with a newline
+    /// (I42-finalize); foreign executor events are ignored (W329).
+    pub fn on_event(&mut self, ev: ProgressEvent) {
+        match ev {
+            ProgressEvent::PlanStart => {}
+            ProgressEvent::ListPage {
+                page,
+                keys_so_far,
+            } => {
+                self.listing = Some((page, keys_so_far));
+            }
+            ProgressEvent::HeadsStart { total_keys } => {
+                self.heading = Some((0, total_keys));
+            }
+            ProgressEvent::HeadDone { done, total_keys } => {
+                self.heading = Some((done, total_keys));
+            }
+            ProgressEvent::PlanEnd => {}
+            ProgressEvent::PassStart { .. }
+            | ProgressEvent::KeyDone { .. }
+            | ProgressEvent::PassEnd { .. }
+            | ProgressEvent::RunEnd { .. } => {}
+        }
+    }
+
+    /// Render the current plan-phase line. Empty when nothing has arrived,
+    /// or a heading with `total_keys == 0` (mirrors the executor zero-total
+    /// policy, W328).
+    pub fn render(&self) -> String {
+        if let Some((done, total)) = self.heading {
+            if total == 0 {
+                return String::new();
+            }
+            let fraction = done as f64 / total as f64;
+            let pct = (done as u64 * 100) / total as u64;
+            format!(
+                "{:<width$}{}/{}  {}  {:>3}%",
+                "Heading",
+                done,
+                total,
+                bar(fraction),
+                pct,
+                width = VERB_BUDGET
+            )
+        } else if let Some((page, keys_so_far)) = self.listing {
+            format!(
+                "{:<width$}page {}  {} keys",
+                "Listing",
+                page,
+                keys_so_far,
+                width = VERB_BUDGET
+            )
+        } else {
+            String::new()
+        }
+    }
+}
+
 /// Truncate `s` to at most `budget` characters (char-boundary safe) and
 /// right-pad with spaces to exactly `budget`, so the following columns never
 /// jump (I27-width: long keys are truncated in the line).
@@ -1085,6 +1170,39 @@ mod tests {
             ProgressEvent::PlanEnd => {}
             _ => panic!("wrong variant"),
         }
+    }
+
+    // I42-line (W327): the plan-phase line machine renders cumulative
+    // listing frames. Empty until the first `ListPage` (PlanStart alone stays
+    // blank, W327 lock); each `ListPage` updates the frame in place; no byte
+    // rate / ETA substrings on the plan phase (I42-line).
+    #[test]
+    fn plan_line_listing_frames_are_cumulative() {
+        let mut line = PlanProgressLine::new();
+        assert_eq!(line.render(), "", "empty line machine renders empty");
+
+        line.on_event(ProgressEvent::PlanStart);
+        assert_eq!(
+            line.render(),
+            "",
+            "PlanStart alone stays blank until the first ListPage (W327 lock)"
+        );
+
+        line.on_event(ProgressEvent::ListPage {
+            page: 1,
+            keys_so_far: 1000,
+        });
+        assert_eq!(line.render(), "Listing     page 1  1000 keys");
+
+        line.on_event(ProgressEvent::ListPage {
+            page: 2,
+            keys_so_far: 2000,
+        });
+        assert_eq!(line.render(), "Listing     page 2  2000 keys");
+
+        let r = line.render();
+        assert!(!r.contains("B/s"), "no rate on plan phase: {r}");
+        assert!(!r.contains("ETA"), "no ETA on plan phase: {r}");
     }
 
     // I27-api: the default sink accepts every variant and does nothing.
