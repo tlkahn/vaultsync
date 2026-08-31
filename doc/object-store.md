@@ -137,6 +137,18 @@ HTTP 412 to `Error::PreconditionFailed` and 304 to
 `GetOutcome::NotModified`. The manifest commit and the local-cache refresh
 use these exclusively.
 
+**Conditional PUT is REQUIRED for manifest mode (N6, review 5472033449).**
+The whole manifest contract - warm If-Match commit, cold head-then-If-Match
+heal (H1), `repair`, and the local-cache etag mirror - assumes the backend
+supports conditional writes (If-Match / If-None-Match: *) and reports an
+etag from `head`/`put`. AWS S3 supports both natively. Some S3-compatible
+endpoints (notably older MinIO/Ceph builds) may not: there the manifest
+commit falls back to "bodies live, control plane never advances" - push
+warns (`manifest commit failed`), `repair` cannot conditionally write, and
+cold `auto` planning (list+head) still works fine. An etag-less backend
+(object present but `head` returns no etag) loses multi-writer safety on the
+cold-commit path (unconditional put; N5, review 5472033449).
+
 Zero-byte marker objects at the exact store prefix (e.g. an S3-console
 "Make Folder" marker that strips to an empty vault-relative key) are ignored;
 objects whose keys end in `/` (some tools write content into `dir/` markers)

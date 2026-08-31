@@ -375,9 +375,26 @@ Failed uploads that may have left a partial/new remote object are an existing ex
 
 ```text
 put manifest body to `.vaultsync/manifest/v1.json`
-  with If-Match: base.manifest_etag   when base.manifest_etag is Some
-  with If-None-Match: *               when creating (base was LiveListHead or missing)
+  WARM base (base.manifest_etag is Some):
+    with If-Match: base.manifest_etag
+  COLD base (base.manifest_etag is None - LiveListHead, missing, or forced
+  mode): resolve the condition against the LIVE object at commit time:
+    head(MANIFEST_KEY)
+      present => If-Match on the live etag        (overwrite; heals corrupt
+                                                 bodies and list_head-era
+                                                 objects)
+      absent  => If-None-Match: *                  (create)
+      present but head has no etag (etag-less backend) => unconditional put
+        on the cold resolve path ONLY - multi-writer safety is lost there
+        (design note: manifest mode assumes an etag-capable backend)
 ```
+
+A cold base means "resolve the live condition at commit time", NOT "always
+If-None-Match: *": a present corrupt body or a manifest written under
+`list_head` planning must be overwritable by the next push. `list_head`
+forces cold PLANNING only - push still commits, so other devices on `auto`
+keep a fresh control plane. A WARM base keeps If-Match on the base etag with
+no extra head.
 
 Outcomes:
 

@@ -120,6 +120,12 @@ a manifest on an existing bucket, after console/aws-cli uploads outside
 vaultsync, after repeated `manifest not committed` warnings, or when
 `status` disagrees with raw `aws s3 ls` expectations.
 
+Like `push`, `repair` refreshes the local manifest mirror
+(`.vaultsync/cache/`) with the rebuilt body + etag (issue 45, W246/W251).
+It requires a conditional-PUT-capable backend (see `object-store.md`); the
+etag reported on success comes from the write itself, not a follow-up
+head.
+
 ### `vaultsync version`
 
 Print version and optional feature flags.
@@ -392,6 +398,16 @@ succeeded (bodies are live; data ok):
 ```text
 warning: manifest not committed (lost race or changed under us); run vaultsync repair if status looks wrong
 ```
+
+**Corrupt / cold push (H1, review 5472028291).** A push planned from
+`list+head` (corrupt or missing manifest, or `mode = "list_head"`) still
+commits: at commit time vaultsync heads the manifest object and uses
+If-Match on the live etag when a (possibly corrupt) object is present,
+If-None-Match: * when absent. So a push after a corrupt manifest heals it;
+`list_head` planning never stops the control plane. A backend without
+conditional PUT cannot do this - push warns (`manifest commit failed`),
+bodies stay live, and the control plane never advances; cold `auto` planning
+still works (see `object-store.md`).
 
 ### JSON (`--json`)
 
