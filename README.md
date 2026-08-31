@@ -76,13 +76,18 @@ action a plan - or delete files - against a non-existent store).
   manifest wins, else cold list+head with a warning), `manifest` (fail
   closed if missing/corrupt, suggesting `repair`), or `list_head` (never
   read the manifest). The manifest is a snapshot, not a deletion journal: it
-  is written only after successful remote mutations (bodies first, manifest
-  last, conditional If-Match/If-None-Match put) and by `repair`; `pull` and
-  `status` never write it; the cold path stays I15-correct and
-  fail-closed. A lost conditional race warns (`manifest not committed...
-  run vaultsync repair if status looks wrong`) and exits 0 when the
-  transfers succeeded. The local cache mirror lives at
-  `<vault_root>/.vaultsync/cache/` (never walked or uploaded; 304
+  is written after successful remote mutations (bodies first, manifest last,
+  conditional If-Match/If-None-Match put), by `repair`, and - since issue
+  #48 - by a **push-time inventory bootstrap**: a cold `push` under
+  `[inventory].bootstrap = "push-ensure"` (default) publishes a baseline
+  manifest BEFORE transfers, or adopts a concurrent-valid one, so later plans
+  are warm even when this run's transfers fail or nothing is planned
+  (validate-before-overwrite H1-V - never a silent clobber). `pull` and
+  default `status` never write it; `status --write-manifest` is an explicit
+  opt-in; the cold path stays I15-correct and fail-closed. A lost
+  conditional race warns (`manifest not committed...` / bootstrap abort per
+  F2) and exits 0 when the transfers succeeded. The local cache mirror lives
+  at `<vault_root>/.vaultsync/cache/` (never walked or uploaded; 304
   conditional GET on repeat loads; never authority).
 - **Reserved-namespace leftovers are filtered before any head** (W118):
   `.vaultsync-check-*` / `.*.vaultsync-tmp-*` keys are partitioned out of a
