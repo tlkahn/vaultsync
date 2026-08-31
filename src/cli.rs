@@ -4524,6 +4524,16 @@ mod tests {
         let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
         let keys: Vec<&str> = m.entries.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(keys, vec!["a.md", "c.md"], "winner key c.md must survive");
+        // W314 (M1): the final manifest must carry the NEW uploaded body for
+        // the touched key, not the winner's stale size - i.e. the Upload
+        // fold wins, not just the key-set equality with the pre-upload
+        // winner.
+        let a = m.entries.iter().find(|e| e.key == "a.md").unwrap();
+        assert_eq!(
+            a.size,
+            b"newer-content".len() as u64,
+            "uploaded body must be folded"
+        );
     }
 
     #[test]
