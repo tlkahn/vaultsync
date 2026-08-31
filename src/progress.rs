@@ -55,6 +55,34 @@ pub enum ProgressEvent {
     PassEnd { kind: PassKind },
     /// The whole run finished (after the final pass fold).
     RunEnd { executed: u32, failed: u32 },
+    /// Issue 42 (I42-events, B1): the cold inventory is about to run. The
+    /// optional opening bracket of the plan phase; renders nothing on its
+    /// own (blank until the first `ListPage`/`HeadsStart`, W327 lock). Only
+    /// emitted on the COLD path - warm manifest loads emit zero plan-phase
+    /// events (I42-warm-events).
+    PlanStart,
+    /// Issue 42 (I42-pages): one `ListObjectsV2` page completed. `page` is
+    /// 1-based; `keys_so_far` is the CUMULATIVE raw object-row count from the
+    /// page `contents` (pre-folder-synth; matches wall-time work, W342 lock).
+    /// No total-page denominator - S3 does not know it up front.
+    ListPage {
+        page: u32,
+        keys_so_far: u64,
+    },
+    /// Issue 42 (I42-heads): the head-enrichment fan-out is about to start;
+    /// `total_keys` is the object rows that WILL be headed (post-reserved,
+    /// non-folder). Skipped when there are zero object rows.
+    HeadsStart { total_keys: u32 },
+    /// Issue 42 (I42-heads): one object head completed (`done` is 1..=total,
+    /// success or NotFound-vanish). Under concurrency > 1 the order may
+    /// interleave; totals are pinned, not order.
+    HeadDone { done: u32, total_keys: u32 },
+    /// Issue 42 (I42-finalize): the cold inventory finished (success path).
+    /// The renderer finalizes the plan frame with a newline here; the CLI
+    /// must observe this (or its own `finish_plan` belt-and-braces) before
+    /// printing W236 / warnings so `\r` bars never collide. Not emitted on
+    /// mid-cold failure (CLI clears defensively).
+    PlanEnd,
 }
 
 /// Sink for executor progress events (I27-thread): `Send + Sync` so worker
@@ -150,6 +178,14 @@ impl ProgressLine {
                 // the final 100% frame with a trailing newline.
             }
             ProgressEvent::RunEnd { .. } => {}
+            // I42 (W326): plan-phase events are foreign to the executor line
+            // machine - ignored here, routed to `PlanProgressLine` by the
+            // renderers (W330 pins the symmetric ignore).
+            ProgressEvent::PlanStart
+            | ProgressEvent::ListPage { .. }
+            | ProgressEvent::HeadsStart { .. }
+            | ProgressEvent::HeadDone { .. }
+            | ProgressEvent::PlanEnd => {}
         }
     }
 
@@ -997,6 +1033,56 @@ mod tests {
                 assert_eq!(executed, 7);
                 assert_eq!(failed, 2);
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // I42-events (W326): the plan-phase variants exist and are constructible;
+    // each carries its fields unchanged through construction + inspection
+    // (event-shape lock for the W-series).
+    #[test]
+    fn plan_progress_event_variants_carry_fields() {
+        use super::ProgressEvent;
+
+        match ProgressEvent::PlanStart {
+            ProgressEvent::PlanStart => {}
+            _ => panic!("wrong variant"),
+        }
+
+        match (ProgressEvent::ListPage {
+            page: 1,
+            keys_so_far: 1000,
+        }) {
+            ProgressEvent::ListPage {
+                page,
+                keys_so_far,
+            } => {
+                assert_eq!(page, 1);
+                assert_eq!(keys_so_far, 1000);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        match (ProgressEvent::HeadsStart { total_keys: 3 }) {
+            ProgressEvent::HeadsStart { total_keys } => {
+                assert_eq!(total_keys, 3);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        match (ProgressEvent::HeadDone {
+            done: 1,
+            total_keys: 3,
+        }) {
+            ProgressEvent::HeadDone { done, total_keys } => {
+                assert_eq!(done, 1);
+                assert_eq!(total_keys, 3);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        match ProgressEvent::PlanEnd {
+            ProgressEvent::PlanEnd => {}
             _ => panic!("wrong variant"),
         }
     }
