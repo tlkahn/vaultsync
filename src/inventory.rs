@@ -1028,7 +1028,9 @@ pub fn commit_manifest(
             ColdPlan::ForcePut { files } => (files, WriteCond::Force),
             ColdPlan::Overwrite { files, etag } => (files, WriteCond::IfMatch(etag)),
             ColdPlan::Adopt { .. } => {
-                unreachable!("commit with non-empty successes never adopts")
+                return Err(Error::Other(
+                    "internal: commit cold resolve returned Adopt; please retry".to_string(),
+                ));
             }
         },
     };
