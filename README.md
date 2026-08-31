@@ -84,9 +84,13 @@ action a plan - or delete files - against a non-existent store).
   are warm even when this run's transfers fail or nothing is planned
   (validate-before-overwrite H1-V - never a silent clobber). `pull` and
   default `status` never write it; `status --write-manifest` is an explicit
-  opt-in; the cold path stays I15-correct and fail-closed. A lost
-  conditional race warns (`manifest not committed...` / bootstrap abort per
-  F2) and exits 0 when the transfers succeeded. The local cache mirror lives
+  opt-in; the cold path stays I15-correct and fail-closed. A B1 lost
+  conditional race (bootstrap) aborts the push before transfers (exit 1, no
+  transfers; F0/F2); a lost race on the final manifest commit warns
+  (`manifest not committed... run vaultsync repair if status looks wrong`)
+  and exits 0 when the transfers succeeded (Q2). See
+  [cli.md](doc/cli.md#push-time-inventory-bootstrap-issue-48) for the F2
+  failure table. The local cache mirror lives
   at `<vault_root>/.vaultsync/cache/` (never walked or uploaded; 304
   conditional GET on repeat loads; never authority).
 - **Reserved-namespace leftovers are filtered before any head** (W118):

@@ -460,6 +460,13 @@ backend, the refreshed base is still a warm `Manifest { remote_etag: None }`
 - the residual multi-writer hole on etag-less backends is documented, not
 closed (N5).
 
+**Adopted refresh installs the winner snapshot (PR50-r1 H1).** After
+`Adopted`, the in-memory base's `file_entities` are replaced by the parsed
+adopted manifest's file set (not the stale cold list) and the source/etag
+warm - so before any transfer the base already holds the winner's complete
+snapshot, and the final commit folds our successes onto it without dropping
+their untouched keys (review 5476323432).
+
 **Failure policy (F2 split).** Push + `PreconditionFailed` (another writer
 won) aborts before any transfer - without B1 for a warm baseline,
 the final commitment could cascade-clobber the winner with a stale cold base
