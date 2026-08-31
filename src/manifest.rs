@@ -17,8 +17,12 @@ pub const MANIFEST_SCHEMA: &str = "vaultsync.manifest.v1";
 /// pathological stores.
 pub const MANIFEST_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
-/// A parsed manifest body (v1 schema).
+/// A parsed manifest body (v1 schema). v1 is a CLOSED schema: unknown
+/// fields fail closed (`deny_unknown_fields`, W256/L1 review 5472028291) so
+/// a typo'd hand-edit never silently drops data; the extension valve is the
+/// schema id (a future `vaultsync.manifest.v2` rejects here).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestV1 {
     pub schema: String,
     pub created_ms: u64,
@@ -31,8 +35,9 @@ pub struct ManifestV1 {
 }
 
 /// One file entry. `mtime_ms` is JSON `null` when unknown (maps to `None`);
-/// `etag` is optional.
+/// `etag` is optional. Closed schema (`deny_unknown_fields`, W256/L1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestEntry {
     pub key: String,
     pub size: u64,
@@ -343,6 +348,32 @@ mod tests {
         let body = br#"{"schema":"vaultsync.manifest.v1","created_ms":0,"entry_count":1,"entries":[{"key":".vaultsync/manifest/v1.json","size":1,"mtime_ms":100}]}"#;
         let err = parse_manifest_bytes(body).unwrap_err();
         assert!(format!("{err}").contains("reserved"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn parse_rejects_unknown_entry_field() {
+        // W256 (L1, review 5472028291): a typo'd / unknown entry field
+        // (e.g. `mTime_ms` instead of `mtime_ms`) must fail closed instead
+        // of silently dropping the field. RED until `deny_unknown_fields`.
+        let body = br#"{"schema":"vaultsync.manifest.v1","created_ms":0,"entry_count":1,"entries":[{"key":"a.md","size":1,"mTime_ms":100}]}"#;
+        let err = parse_manifest_bytes(body).unwrap_err();
+        assert!(
+            format!("{err}").contains("unknown field"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_unknown_top_level_field() {
+        // W256 (L1, review 5472028291): an unknown top-level field fails
+        // closed the same way (v1 is a closed schema; the extension valve is
+        // the schema id).
+        let body = br#"{"schema":"vaultsync.manifest.v1","created_ms":0,"entry_count":0,"entries":[],"version":2}"#;
+        let err = parse_manifest_bytes(body).unwrap_err();
+        assert!(
+            format!("{err}").contains("unknown field"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]
