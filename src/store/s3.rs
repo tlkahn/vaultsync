@@ -53,6 +53,11 @@ const MTIME_KEY: &str = "vaultsync-mtime";
 /// disk buffer + upload attempt and failing at the backend.
 const MAX_SINGLE_PUT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
+/// ListObjectsV2 page size (I42-max-keys, W361): 1000 stays - the issue-42
+/// measured regression lock (max_keys=100 is a measured regression, issue
+/// body). Named const so the request-builder value is pin-testable offline.
+const LIST_MAX_KEYS: i32 = 1000;
+
 /// Map resolved `[transfer.retry]` settings (millis) onto an SDK standard-
 /// mode [`RetryConfig`](aws_sdk_s3::config::retry::RetryConfig), which owns
 /// retry/backoff/jitter for every S3 op (I8-layer). `RetrySettings::default()`
@@ -183,7 +188,7 @@ impl S3Store {
                     .list_objects_v2()
                     .bucket(&self.bucket)
                     .prefix(&s3_prefix)
-                    .max_keys(1000);
+                    .max_keys(LIST_MAX_KEYS);
                 if let Some(t) = &tok {
                     req = req.continuation_token(t.clone());
                 }
@@ -1230,6 +1235,15 @@ mod tests {
     // I42-pages (W341/W342): the pure S3 page-loop fold emits one cumulative
     // ListPage per page; keys_so_far counts raw page `contents` rows
     // (folder-marker rows included - W342 lock: matches wall-time work).
+    // I42-max-keys (W361): the ListObjectsV2 page size stays 1000 - a shrink
+    // is a measured regression (issue-42 body: max_keys=100 is a measured
+    // regression; stay at 1000). The request builder uses the named const so
+    // this pin guards the actual value.
+    #[test]
+    fn max_keys_stays_1000() {
+        assert_eq!(super::LIST_MAX_KEYS, 1000);
+    }
+
     #[test]
     fn fold_list_page_emits_cumulative_pages() {
         use crate::progress::ProgressEvent;

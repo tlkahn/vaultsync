@@ -1068,6 +1068,47 @@ mod tests {
         );
     }
 
+    // I42 (W360): a hard head error during a cold build_plan_with_progress
+    // still fails closed with the same error class; no partial plan, no
+    // PlanEnd bracket (mid-cold failure - the CLI finalizes defensively).
+    #[test]
+    fn i15_fail_closed_with_progress() {
+        use crate::progress::ProgressEvent;
+        let dir = TempDir::new("vaultsync-lib-test");
+        std::fs::write(dir.join("a.md"), "aaa").unwrap();
+        let local = LocalFs::new(dir.path());
+        // S3LikeListStore degrades the listing and runs the REAL enrichment
+        // (heads), unlike bare MemoryStore - so a head failure is observable.
+        let mut store = crate::testutil::S3LikeListStore::new();
+        let mut c = std::io::Cursor::new(b"rrr".to_vec());
+        store
+            .inner()
+            .put_from("r.md", &mut c, 3, Some(1_600_000_000_000))
+            .unwrap();
+        store.fail_head("r.md");
+        let prog = crate::testutil::RecordingProgress::new();
+        let err = build_plan_with_progress(
+            &local,
+            &store,
+            Mode::Pull,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+            &prog,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::Unavailable(_)),
+            "I15 fail-closed error class unchanged: {err:?}"
+        );
+        let events = prog.events();
+        assert!(matches!(events.first(), Some(ProgressEvent::PlanStart)));
+        assert!(
+            !events.iter().any(|e| matches!(e, ProgressEvent::PlanEnd)),
+            "no PlanEnd on mid-cold failure: {events:?}"
+        );
+    }
+
     // I42 (W347): build_plan_with_progress forwards the sink on the cold
     // path (PlanStart..PlanEnd with ListPage from a paging store) and the
     // no-sink wrapper equals it under NoProgress on plan/warnings/source.

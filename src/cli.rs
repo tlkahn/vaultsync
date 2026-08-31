@@ -843,9 +843,9 @@ fn build_progress_renderer<'w>(
 /// finalizes inside the renderer) or not (mid-cold failure: `finish_plan`
 /// is the belt-and-braces). One helper shared by status / repair /
 /// dispatch_plan so the lifecycle cannot drift.
-fn with_plan_renderer<'w, T>(
+fn with_plan_renderer<T>(
     resolved: ResolvedMode,
-    err: &'w mut (dyn Write + Send),
+    err: &mut (dyn Write + Send),
     f: impl FnOnce(&dyn Progress) -> T,
 ) -> T {
     let renderer = build_progress_renderer(resolved, err);
