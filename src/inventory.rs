@@ -782,7 +782,23 @@ pub fn repair_manifest(
     opts: &RepairOpts,
     cache: Option<&CachePaths>,
 ) -> Result<RepairReport, Error> {
-    let inv = live_list_head(store, &crate::progress::NoProgress)?;
+    // I42-callers-no-sink: the no-sink wrapper behaves byte-identically to
+    // today (NoProgress emits nothing on the cold list).
+    repair_manifest_with_progress(store, opts, cache, &crate::progress::NoProgress)
+}
+
+/// Like [`repair_manifest`] with a plan-phase progress sink threaded into the
+/// cold list+head (issue 42, W349): brackets with `PlanStart`/`PlanEnd` (and
+/// `ListPage`/head events from the store's `list_with_progress`), including
+/// dry-run (which still lists cold before skipping the write). No executor
+/// `PassKind` events on this path (W350).
+pub fn repair_manifest_with_progress(
+    store: &dyn ObjectStore,
+    opts: &RepairOpts,
+    cache: Option<&CachePaths>,
+    progress: &dyn crate::progress::Progress,
+) -> Result<RepairReport, Error> {
+    let inv = live_list_head(store, progress)?;
     let files = &inv.base.file_entities;
     let created_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2201,6 +2217,102 @@ mod tests {
         assert!(
             err.to_string().contains("requires a valid remote manifest"),
             "err: {err}"
+        );
+    }
+
+    // I42 repair (W349): repair_manifest_with_progress brackets the cold
+    // list with PlanStart..PlanEnd; dry-run still emits them (it lists cold
+    // before skipping the write); the no-sink wrapper equals the NoProgress
+    // result on every report field.
+    #[test]
+    fn repair_manifest_with_progress_emits_cold_brackets() {
+        use crate::progress::ProgressEvent;
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"aaa".to_vec());
+        store
+            .put_from("a.md", &mut c, 3, Some(1_600_000_000_000))
+            .unwrap();
+        for opts in [
+            RepairOpts {
+                force: false,
+                dry_run: true,
+            },
+            RepairOpts {
+                force: false,
+                dry_run: false,
+            },
+        ] {
+            let prog = crate::testutil::RecordingProgress::new();
+            let rep = repair_manifest_with_progress(&store, &opts, None, &prog).unwrap();
+            let events = prog.events();
+            assert!(
+                matches!(events.first(), Some(ProgressEvent::PlanStart)),
+                "dry_run={} first event: {events:?}",
+                opts.dry_run
+            );
+            assert!(
+                matches!(events.last(), Some(ProgressEvent::PlanEnd)),
+                "dry_run={} last event: {events:?}",
+                opts.dry_run
+            );
+            assert_eq!(rep.listed, 1);
+        }
+        // no-sink wrapper equals the NoProgress result field-for-field.
+        let plain = repair_manifest(
+            &store,
+            &RepairOpts {
+                force: false,
+                dry_run: false,
+            },
+            None,
+        )
+        .unwrap();
+        let prog2 = crate::testutil::RecordingProgress::new();
+        let with = repair_manifest_with_progress(
+            &store,
+            &RepairOpts {
+                force: false,
+                dry_run: false,
+            },
+            None,
+            &prog2,
+        )
+        .unwrap();
+        assert_eq!(plain.listed, with.listed);
+        assert_eq!(plain.written, with.written);
+        assert_eq!(plain.dry_run, with.dry_run);
+        assert_eq!(plain.etag, with.etag);
+        assert_eq!(plain.warnings, with.warnings);
+    }
+
+    // I42 repair (W350): repair progress is plan-phase only - no executor
+    // PassKind events on the recording.
+    #[test]
+    fn repair_progress_is_plan_phase_only() {
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"aaa".to_vec());
+        store
+            .put_from("a.md", &mut c, 3, Some(1_600_000_000_000))
+            .unwrap();
+        let prog = crate::testutil::RecordingProgress::new();
+        repair_manifest_with_progress(
+            &store,
+            &RepairOpts {
+                force: false,
+                dry_run: false,
+            },
+            None,
+            &prog,
+        )
+        .unwrap();
+        let events = prog.events();
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                crate::progress::ProgressEvent::PassStart { .. }
+                    | crate::progress::ProgressEvent::KeyDone { .. }
+            )),
+            "repair must emit plan-phase events only: {events:?}"
         );
     }
 
