@@ -623,7 +623,7 @@ impl ObjectStore for S3Store {
         // any other head error fails the listing (I15-errors). I20-heads:
         // the enrichment heads fan out under `self.concurrency` (same
         // `[transfer].concurrency` cap as the transfer passes).
-        enrich_with_head_mtimes(self, Listing { entities, warnings }, self.concurrency)
+        enrich_with_head_mtimes(self, Listing { entities, warnings }, self.concurrency, &crate::progress::NoProgress)
     }
 
     fn head(&self, key: &str) -> Result<Entity, Error> {

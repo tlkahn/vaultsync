@@ -216,10 +216,26 @@ pub(crate) fn enrich_with_head_mtimes<S: ObjectStore + ?Sized>(
     store: &S,
     listing: Listing,
     concurrency: u32,
+    progress: &dyn crate::progress::Progress,
 ) -> Result<Listing, Error> {
     let mut warnings = listing.warnings;
     let mut entities = Vec::new();
     let mut vanished: Vec<String> = Vec::new();
+    // I42-heads (W335): one `HeadsStart` before the fan-out (object rows
+    // only - folder views are never headed, never counted), then one
+    // `HeadDone` per completed object head (success or NotFound-vanish).
+    // Skipped entirely when there are zero object rows (I42 emission rules).
+    let object_rows_total = listing
+        .entities
+        .iter()
+        .filter(|e| !e.is_folder())
+        .count() as u32;
+    if object_rows_total > 0 {
+        progress.event(crate::progress::ProgressEvent::HeadsStart {
+            total_keys: object_rows_total,
+        });
+    }
+    let mut heads_done: u32 = 0;
     if concurrency <= 1 {
         // Sequential path (I20-r1/F1): the pre-issue-20 loop verbatim
         // (recovered from a2fca0a) - folder passthrough, NotFound -> vanished
@@ -247,6 +263,13 @@ pub(crate) fn enrich_with_head_mtimes<S: ObjectStore + ?Sized>(
                 }
                 Err(err) => return Err(err),
             }
+            // I42-heads: NotFound-vanish still advances the count (W336); a
+            // hard error returns before this line (partial HeadDone ok).
+            heads_done += 1;
+            progress.event(crate::progress::ProgressEvent::HeadDone {
+                done: heads_done,
+                total_keys: object_rows_total,
+            });
         }
     } else {
         // I20-heads: fan the object-row heads out through the bounded pool;
@@ -280,6 +303,11 @@ pub(crate) fn enrich_with_head_mtimes<S: ObjectStore + ?Sized>(
                 }
                 Err(err) => return Err(err),
             }
+            heads_done += 1;
+            progress.event(crate::progress::ProgressEvent::HeadDone {
+                done: heads_done,
+                total_keys: object_rows_total,
+            });
         }
     }
     if let Some(msg) = vanished_warning(&vanished) {
@@ -463,6 +491,152 @@ mod tests {
         assert_eq!(format!("{err}"), "precondition failed: \"abc\"");
     }
 
+    // I42-heads (W335): enrich_with_head_mtimes emits HeadsStart then one
+    // HeadDone per object head; folder views are never headed and never
+    // counted in the total. Under concurrency 1 the HeadDone order is the
+    // listing order. I15 behavior (head mtimes win) is unchanged.
+    // I42-heads (W337): at concurrency > 1 the pooled enrichment still emits
+    // HeadsStart{20} + exactly 20 HeadDone (totals pin; order may interleave
+    // in general - here listing-order merge keeps done 1..=20 exactly once).
+    #[test]
+    fn enrich_head_progress_under_concurrency() {
+        use crate::progress::ProgressEvent;
+        let store = MemoryStore::new();
+        for i in 0..20 {
+            let mut c = std::io::Cursor::new(b"x".to_vec());
+            store
+                .put_from(&format!("k{i:02}.md"), &mut c, 1, Some(1000 + i))
+                .unwrap();
+        }
+        let listing = store.list("").unwrap();
+        let prog = crate::testutil::RecordingProgress::new();
+        let enriched = enrich_with_head_mtimes(&store, listing, 4, &prog).unwrap();
+        let events = prog.events();
+        assert!(matches!(
+            events[0],
+            ProgressEvent::HeadsStart { total_keys: 20 }
+        ));
+        let done: Vec<u32> = events[1..]
+            .iter()
+            .map(|e| match e {
+                ProgressEvent::HeadDone { done, total_keys } => {
+                    assert_eq!(*total_keys, 20);
+                    *done
+                }
+                other => panic!("expected HeadDone, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(done.len(), 20, "exactly 20 HeadDone");
+        assert_eq!(done.iter().max(), Some(&20), "done reaches the total");
+        let mut sorted = done.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 20, "done values 1..=20 each once: {done:?}");
+        assert_eq!(enriched.entities.len(), 20, "no vanishes");
+    }
+
+    // I42-heads (W336): a NotFound vanish still advances `HeadDone` (the
+    // vanish warning is unchanged); a hard head error fails closed with
+    // partial `HeadDone` emissions allowed (no PlanEnd requirement here).
+    #[test]
+    fn enrich_head_progress_on_vanish_and_error() {
+        use crate::progress::ProgressEvent;
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"a".to_vec());
+        store.put_from("a.md", &mut c, 1, Some(100)).unwrap();
+        // one healthy + two listed keys that no longer exist (vanish race)
+        let listing = Listing {
+            entities: vec![
+                file("a.md", 1, Some(9_999_999)),
+                file("gone-0.md", 5, Some(9_999_999)),
+                file("gone-1.md", 5, Some(9_999_999)),
+            ],
+            warnings: Vec::new(),
+        };
+        let prog = crate::testutil::RecordingProgress::new();
+        let enriched = enrich_with_head_mtimes(&store, listing, 1, &prog).unwrap();
+        let events = prog.events();
+        assert!(matches!(
+            events[0],
+            ProgressEvent::HeadsStart { total_keys: 3 }
+        ));
+        let done: Vec<u32> = events[1..]
+            .iter()
+            .map(|e| match e {
+                ProgressEvent::HeadDone { done, total_keys } => {
+                    assert_eq!(*total_keys, 3);
+                    *done
+                }
+                other => panic!("expected HeadDone, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(done, vec![1, 2, 3], "vanish still advances done");
+        assert_eq!(enriched.entities.len(), 1, "vanished rows dropped");
+        assert!(
+            enriched.warnings.iter().any(|w| w.contains("vanished")),
+            "vanish warning unchanged: {:?}",
+            enriched.warnings
+        );
+
+        // hard head error: fails closed; partial HeadDone allowed
+        let mut fail = KeyFailStore::new(MemoryStore::new());
+        let mut c = std::io::Cursor::new(b"a".to_vec());
+        fail.inner.put_from("a.md", &mut c, 1, Some(1)).unwrap();
+        fail.fail("a.md", "boom");
+        let listing2 = Listing {
+            entities: vec![file("a.md", 1, Some(1))],
+            warnings: Vec::new(),
+        };
+        let prog2 = crate::testutil::RecordingProgress::new();
+        let err = enrich_with_head_mtimes(&fail, listing2, 1, &prog2).unwrap_err();
+        assert!(format!("{err}").contains("boom"));
+        let events2 = prog2.events();
+        assert!(
+            matches!(events2.first(), Some(ProgressEvent::HeadsStart { total_keys: 1 })),
+            "HeadsStart may precede the fail-closed error: {events2:?}"
+        );
+    }
+
+    #[test]
+    fn enrich_emits_head_progress() {
+        use crate::progress::ProgressEvent;
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"a".to_vec());
+        store.put_from("a.md", &mut c, 1, Some(100)).unwrap();
+        let mut c = std::io::Cursor::new(b"b".to_vec());
+        store.put_from("b.md", &mut c, 1, Some(200)).unwrap();
+        let mut c = std::io::Cursor::new(b"c".to_vec());
+        store.put_from("n/c.md", &mut c, 1, Some(300)).unwrap();
+        let listing = store.list("").unwrap();
+        // sanity: 3 objects + 1 synthesized folder view (n/)
+        assert_eq!(listing.entities.len(), 4);
+        let prog = crate::testutil::RecordingProgress::new();
+        let enriched = enrich_with_head_mtimes(&store, listing, 1, &prog).unwrap();
+        let events = prog.events();
+        match &events[0] {
+            ProgressEvent::HeadsStart { total_keys } => assert_eq!(*total_keys, 3),
+            other => panic!("expected HeadsStart first, got {other:?}"),
+        }
+        let done: Vec<u32> = events[1..]
+            .iter()
+            .map(|e| match e {
+                ProgressEvent::HeadDone { done, total_keys } => {
+                    assert_eq!(*total_keys, 3);
+                    *done
+                }
+                other => panic!("expected HeadDone, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(done, vec![1, 2, 3], "concurrency 1: listing order");
+        assert_eq!(events.len(), 4, "HeadsStart + 3 HeadDone");
+        // I15 unchanged: head mtimes win; folder view passes through unheaded.
+        let a = enriched.entities.iter().find(|e| e.key == "a.md").unwrap();
+        assert_eq!(a.mtime_ms, Some(100));
+        let folders: Vec<&Entity> =
+            enriched.entities.iter().filter(|e| e.is_folder()).collect();
+        assert_eq!(folders.len(), 1, "folder view survives unheaded");
+    }
+
     #[test]
     fn enrich_corrects_stale_listing_size_with_head_size() {
         let (store, mut listing) = degraded_listing();
@@ -477,7 +651,7 @@ mod tests {
             .find(|e| e.key == "a.md")
             .unwrap();
         a.size = 9_999;
-        let enriched = enrich_with_head_mtimes(&store, listing, 1).unwrap();
+        let enriched = enrich_with_head_mtimes(&store, listing, 1, &crate::progress::NoProgress).unwrap();
         let a = enriched.entities.iter().find(|e| e.key == "a.md").unwrap();
         assert_eq!(a.size, store.head("a.md").unwrap().size);
         assert_eq!(
@@ -489,7 +663,7 @@ mod tests {
     #[test]
     fn enrich_overrides_listing_mtime_with_head_mtime() {
         let (store, listing) = degraded_listing();
-        let enriched = enrich_with_head_mtimes(&store, listing, 1).unwrap();
+        let enriched = enrich_with_head_mtimes(&store, listing, 1, &crate::progress::NoProgress).unwrap();
         // head reports the true (earlier) metadata mtimes and the real etag.
         let a = enriched.entities.iter().find(|e| e.key == "a.md").unwrap();
         assert_eq!(a.mtime_ms, Some(100));
@@ -531,7 +705,7 @@ mod tests {
             entities,
             warnings: vec!["pre-existing".to_string()],
         };
-        let enriched = enrich_with_head_mtimes(&store, listing, 1).unwrap();
+        let enriched = enrich_with_head_mtimes(&store, listing, 1, &crate::progress::NoProgress).unwrap();
         // Healthy row kept; all vanished rows dropped.
         let keys: Vec<_> = enriched.entities.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(keys, vec!["a.md"]);
@@ -552,7 +726,7 @@ mod tests {
         // A listed key that vanishes between LIST and HEAD (concurrent-delete
         // race): head answers NotFound, so the row is dropped, siblings kept.
         listing.entities.push(file("gone.md", 5, Some(9_999_999)));
-        let enriched = enrich_with_head_mtimes(&store, listing, 1).unwrap();
+        let enriched = enrich_with_head_mtimes(&store, listing, 1, &crate::progress::NoProgress).unwrap();
         let keys: Vec<_> = enriched.entities.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(keys, vec!["a.md", "notes/", "notes/b.md"]);
     }
@@ -680,8 +854,8 @@ mod tests {
         // so a conc-1 pass through the gauge deadlocks (target=2 never
         // reached; `n_workers` was sized for the N leg). Same trap as
         // `enrich_parallel_vanished_warning_order_stable`.
-        let enriched1 = enrich_with_head_mtimes(&store.inner, listing.clone(), 1).unwrap();
-        let enriched4 = enrich_with_head_mtimes(&store, listing, 4).unwrap();
+        let enriched1 = enrich_with_head_mtimes(&store.inner, listing.clone(), 1, &crate::progress::NoProgress).unwrap();
+        let enriched4 = enrich_with_head_mtimes(&store, listing, 4, &crate::progress::NoProgress).unwrap();
         assert!(
             store.max_in_flight() > 1,
             "heads must overlap at concurrency 4 (max in-flight {})",
@@ -714,8 +888,8 @@ mod tests {
             entities,
             warnings: vec!["pre-existing".to_string()],
         };
-        let r1 = enrich_with_head_mtimes(&store, listing.clone(), 1).unwrap();
-        let r4 = enrich_with_head_mtimes(&store, listing, 4).unwrap();
+        let r1 = enrich_with_head_mtimes(&store, listing.clone(), 1, &crate::progress::NoProgress).unwrap();
+        let r4 = enrich_with_head_mtimes(&store, listing, 4, &crate::progress::NoProgress).unwrap();
         assert_eq!(r1, r4);
         assert_eq!(
             r4.warnings[1],
@@ -751,7 +925,7 @@ mod tests {
             ],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&store, listing, 4).unwrap_err();
+        let err = enrich_with_head_mtimes(&store, listing, 4, &crate::progress::NoProgress).unwrap_err();
         assert_eq!(
             format!("{err}"),
             "a.md:boom-a",
@@ -877,7 +1051,7 @@ mod tests {
             ],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&store, listing, 1).unwrap_err();
+        let err = enrich_with_head_mtimes(&store, listing, 1, &crate::progress::NoProgress).unwrap_err();
         assert!(
             matches!(err, Error::Unauthorized(_)),
             "a.md's Unauthorized must fail the listing, got {err:?}"
@@ -915,7 +1089,7 @@ mod tests {
             ],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&store, listing, 4).unwrap_err();
+        let err = enrich_with_head_mtimes(&store, listing, 4, &crate::progress::NoProgress).unwrap_err();
         assert!(
             matches!(err, Error::Unauthorized(_)),
             "listing-earliest error must win, got {err:?}"
@@ -948,7 +1122,7 @@ mod tests {
             .filter(|e| !e.is_folder())
             .map(|e| e.key.clone())
             .collect();
-        let enriched = enrich_with_head_mtimes(&store, listing.clone(), 1).unwrap();
+        let enriched = enrich_with_head_mtimes(&store, listing.clone(), 1, &crate::progress::NoProgress).unwrap();
         assert_eq!(
             store.log(),
             expected,
@@ -1072,7 +1246,7 @@ mod tests {
             entities: vec![file("a.md", 9_999, Some(9_999_999))],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&flaky, listing, 1).unwrap_err();
+        let err = enrich_with_head_mtimes(&flaky, listing, 1, &crate::progress::NoProgress).unwrap_err();
         assert!(
             matches!(err, Error::Unavailable(_)),
             "a transient head error must fail the listing on the first attempt, got {err:?}"
@@ -1094,7 +1268,7 @@ mod tests {
             entities: vec![file("a.md", 1, Some(9_999_999))],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&store, listing, 1).unwrap_err();
+        let err = enrich_with_head_mtimes(&store, listing, 1, &crate::progress::NoProgress).unwrap_err();
         assert!(matches!(err, Error::Unavailable(_)));
         assert_eq!(store.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
@@ -1108,7 +1282,7 @@ mod tests {
             entities: vec![file("a.md", 1, None)],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&flaky, listing, 1).unwrap_err();
+        let err = enrich_with_head_mtimes(&flaky, listing, 1, &crate::progress::NoProgress).unwrap_err();
         assert!(matches!(err, Error::Unauthorized(_)));
         assert_eq!(flaky.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
@@ -1119,7 +1293,7 @@ mod tests {
             entities: vec![file("a.md", 1, Some(9_999_999))],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&HeadFailStore::new(), listing, 1).unwrap_err();
+        let err = enrich_with_head_mtimes(&HeadFailStore::new(), listing, 1, &crate::progress::NoProgress).unwrap_err();
         assert!(
             matches!(err, Error::Unavailable(_)),
             "non-NotFound head error must fail the listing, got {err:?}"
@@ -1137,6 +1311,7 @@ mod tests {
                 warnings: vec!["w".to_string()],
             },
             1,
+            &crate::progress::NoProgress,
         )
         .unwrap();
         assert!(empty.entities.is_empty());
@@ -1150,6 +1325,7 @@ mod tests {
                 warnings: Vec::new(),
             },
             1,
+            &crate::progress::NoProgress,
         )
         .unwrap();
         assert_eq!(folder_only.entities.len(), 1);
