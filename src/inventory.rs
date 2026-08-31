@@ -613,11 +613,18 @@ pub fn repair_manifest(
 
 /// Commit a new manifest after a mutating push (W238, D-commit-cond):
 /// bodies are already live (transfers ran first); this writes the manifest
-/// LAST (D-commit-order) with a conditional put - If-Match on the base etag
-/// when the plan read a manifest, If-None-Match: * when creating (base was
-/// list+head/missing). A lost race answers [`CommitOutcome::PreconditionFailed`]
-/// and never clobbers the other writer's manifest. Zero successes skip the
-/// write entirely (D-commit-when).
+/// LAST (D-commit-order) with a conditional put. A WARM base (read a
+/// manifest) uses If-Match on the base etag. A COLD base (`manifest_etag:
+/// None` - list+head, missing, or forced mode) resolves the condition
+/// against the LIVE object at commit time (H1, review 5472028291): a
+/// present object is overwritten via If-Match on its live etag (heals
+/// corrupt bodies / `list_head`-created objects), an absent object creates
+/// via If-None-Match: *, and a present object whose head has no etag
+/// (etag-less backend) degrades to an unconditional put - multi-writer
+/// safety is lost there (N5, docs). A lost race answers
+/// [`CommitOutcome::PreconditionFailed`] and never clobbers the other
+/// writer's manifest. Zero successes skip the write entirely
+/// (D-commit-when).
 pub fn commit_manifest(
     store: &dyn ObjectStore,
     base: &InventoryBase,
@@ -641,10 +648,25 @@ pub fn commit_manifest(
     let body = crate::manifest::serialize_manifest(&manifest)?;
     let body_len = body.len() as u64;
     let mut cursor = std::io::Cursor::new(body);
+    // H1 (W250): a cold base resolves its condition via a live head at
+    // commit time - present => If-Match on the live etag (overwrite),
+    // absent => If-None-Match: * create. A warm base keeps If-Match on the
+    // base etag (no extra head).
+    let (if_match_etag, if_none_match_star) = match &base.manifest_etag {
+        Some(e) => (Some(e.clone()), false),
+        None => match store.head(crate::local::MANIFEST_KEY) {
+            // Etag-less present object: unconditional put on the cold
+            // resolve path only (R46-h1-etagless); If-None-Match: * would
+            // fail forever on a present object.
+            Ok(ent) => (ent.etag, false),
+            Err(Error::NotFound(_)) => (None, true),
+            Err(e) => return Err(e),
+        },
+    };
     let opts = crate::store::PutOpts {
         mtime_ms: None,
-        if_match_etag: base.manifest_etag.clone(),
-        if_none_match_star: base.manifest_etag.is_none(),
+        if_match_etag,
+        if_none_match_star,
     };
     match store.put_from_with(crate::local::MANIFEST_KEY, &mut cursor, body_len, opts) {
         Ok(entity) => {
@@ -1045,6 +1067,81 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(out, GetOutcome::NotModified(_)));
+    }
+
+    #[test]
+    fn commit_manifest_cold_base_overwrites_existing_corrupt_body() {
+        // W249 (H1, review 5472028291): a COLD base (`manifest_etag: None`)
+        // must resolve the commit condition against the LIVE object: a
+        // present-but-corrupt body is overwritten via If-Match on the live
+        // etag, not rejected by create-only If-None-Match: *. Today
+        // (pre-fix) this answers PreconditionFailed and push can never heal
+        // the corrupt object.
+        let store = MemoryStore::new();
+        // Seed MANIFEST_KEY with garbage that is not a valid manifest.
+        let mut c = std::io::Cursor::new(b"this is not a manifest".to_vec());
+        store
+            .put_from(crate::local::MANIFEST_KEY, &mut c, 21, None)
+            .unwrap();
+        let cold = InventoryBase {
+            source: InventorySource::LiveListHead,
+            file_entities: vec![crate::entity::file("a.md", 5, Some(5))],
+            manifest_etag: None,
+        };
+        let out = commit_manifest(
+            &store,
+            &cold,
+            &[CommitMutation::Upload(crate::entity::file(
+                "a.md",
+                5,
+                Some(5),
+            ))],
+            None,
+        )
+        .unwrap();
+        let (etag, count) = match out {
+            CommitOutcome::Written { etag, entry_count } => (etag, entry_count),
+            other => panic!("expected Written, got {other:?}"),
+        };
+        assert_eq!(count, 1);
+        assert!(etag.is_some(), "mock returns etags");
+        // The overwritten body is a valid manifest containing a.md.
+        let mut buf = Vec::new();
+        store.get_to(crate::local::MANIFEST_KEY, &mut buf).unwrap();
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        assert_eq!(m.entry_count, 1);
+    }
+
+    #[test]
+    fn commit_manifest_cold_base_creates_when_absent() {
+        // W249 (H1 control): a cold base with NO object at MANIFEST_KEY still
+        // creates via If-None-Match: *. GREEN on arrival (characterization);
+        // mutation-checked by forcing a present object without the H1 fix
+        // -> PreconditionFailed.
+        let store = MemoryStore::new();
+        let cold = InventoryBase {
+            source: InventorySource::LiveListHead,
+            file_entities: Vec::new(),
+            manifest_etag: None,
+        };
+        let out = commit_manifest(
+            &store,
+            &cold,
+            &[CommitMutation::Upload(crate::entity::file(
+                "a.md",
+                5,
+                Some(5),
+            ))],
+            None,
+        )
+        .unwrap();
+        match out {
+            CommitOutcome::Written { etag, entry_count } => {
+                assert!(etag.is_some(), "mock returns etags");
+                assert_eq!(entry_count, 1);
+            }
+            other => panic!("expected Written, got {other:?}"),
+        }
     }
 
     #[test]

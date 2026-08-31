@@ -1956,6 +1956,51 @@ mod tests {
     }
 
     #[test]
+    fn push_auto_replaces_corrupt_remote_manifest() {
+        // W249/H1 (review 5472028291): under InventoryMode::Auto a corrupt
+        // remote manifest makes planning fall back to list+head (cold base,
+        // manifest_etag: None). The push must still commit - H1 heads at
+        // commit time and If-Match overwrites the corrupt object instead of
+        // create-only If-None-Match: * failing with PreconditionFailed and a
+        // stuck "manifest not committed" warning.
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "hi").unwrap();
+        let store = MemoryStore::new();
+        // Seed MANIFEST_KEY with garbage.
+        let mut c = std::io::Cursor::new(b"not a manifest".to_vec());
+        store
+            .put_from(crate::local::MANIFEST_KEY, &mut c, 14, None)
+            .unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::push(dir.path().into(), false),
+            &store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::Auto,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0, "err: {}", String::from_utf8_lossy(&err));
+        let err_s = String::from_utf8_lossy(&err);
+        assert!(
+            !err_s.contains("not committed"),
+            "no create-only stuck state: {err_s}"
+        );
+        // The overwritten remote manifest parses and lists a.md.
+        let mut buf = Vec::new();
+        store.get_to(crate::local::MANIFEST_KEY, &mut buf).unwrap();
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        assert_eq!(m.entry_count, 1);
+        assert_eq!(m.entries[0].key, "a.md");
+    }
+
+    #[test]
     fn pull_does_not_write_manifest() {
         // W240 / Q6 (issue 45): pull never commits the manifest - the body
         // arrives but the manifest etag/body stay untouched.
