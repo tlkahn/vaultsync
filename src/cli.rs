@@ -2191,10 +2191,21 @@ mod tests {
         store
             .put_from("a.md", &mut c, 2, Some(1_600_000_000_000))
             .unwrap();
+        // Explicit vault dir: with the W251 cache wiring, a real `repair`
+        // refreshes `<vault>/.vaultsync/cache/` - a `.` vault would pollute
+        // the test CWD.
+        let dir = TempDir::new("vaultsync-cli-test");
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = run_with_io(
-            Command::repair(),
+            Command::Repair {
+                vault: dir.path().into(),
+                json: false,
+                config: None,
+                verbose: 0,
+                dry_run: false,
+                force: false,
+            },
             &store,
             &DispatchCtx {
                 tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
