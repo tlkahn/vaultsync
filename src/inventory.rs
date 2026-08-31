@@ -2845,28 +2845,22 @@ mod tests {
             .unwrap()
             .etag;
         // Cold base is STALE: list+head saw only a.md (c.md is manifest-only).
-        let base = cold_base(vec![crate::entity::file("a.md", 5, Some(5))]);
+        let mut base = cold_base(vec![crate::entity::file("a.md", 5, Some(5))]);
         // B1 adopts the concurrent-valid manifest (W268); the outcome must
         // carry the parsed winner file set for a complete warm refresh.
         let out = ensure_remote_manifest(&store, &base, None).unwrap();
-        let (etag, adopted_files, entry_count) = match out {
-            EnsureOutcome::Adopted {
-                etag,
-                files,
-                entry_count,
-            } => (etag, files, entry_count),
+        let entry_count = match &out {
+            EnsureOutcome::Adopted { entry_count, .. } => *entry_count,
             other => panic!("expected Adopted, got {other:?}"),
         };
-        assert_eq!(etag, their_etag);
         assert_eq!(entry_count, 2);
-        // Production warm refresh post-W300: install the ADOPTED snapshot
-        // (files + source + etag). Today's etag-only refresh leaves
-        // file_entities stale == [a.md], which is the H1 bug.
-        let mut base = cold_base(adopted_files);
-        base.source = InventorySource::Manifest {
-            remote_etag: etag.clone(),
-        };
-        base.manifest_etag = etag;
+        // W313 (M1): route the library pin through the PRODUCTION
+        // apply_ensure_outcome (by value, no hand-rolled source/etag/files
+        // install) so this pin cannot drift from the real warm refresh that
+        // installs the complete adopted snapshot.
+        let apply = apply_ensure_outcome(&mut base, out).unwrap();
+        assert_eq!(apply, EnsureApply::Adopted { entry_count: 2 });
+        assert_eq!(base.manifest_etag, their_etag);
         // Push uploads a newer a.md; c.md is untouched by this run.
         let upload = crate::entity::file("a.md", 6, Some(6));
         let out = commit_manifest(&store, &base, &[CommitMutation::Upload(upload)], None).unwrap();
@@ -2881,6 +2875,17 @@ mod tests {
         let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
         let keys: Vec<&str> = m.entries.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(keys, vec!["a.md", "c.md"]);
+        // W313 (M1): the fold must ALSO assert our Upload won on the touched
+        // key - not just that the winner's untouched key survived. a.md's
+        // size/mtime come from the Upload entity (size 6, mtime 6), not the
+        // winner's stale size 1.
+        let a = m.entries.iter().find(|e| e.key == "a.md").unwrap();
+        assert_eq!(a.size, 6, "our Upload must win on the touched key (size)");
+        assert_eq!(
+            a.mtime_ms,
+            Some(6),
+            "our Upload must win on the touched key (mtime)"
+        );
     }
 
     #[test]
