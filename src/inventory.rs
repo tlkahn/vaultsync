@@ -276,9 +276,11 @@ fn try_load_manifest_cached(
             },
         ) {
             Ok(crate::store::GetOutcome::NotModified(_)) => {
-                if let Some(cached) = read_cache_body(cache) {
-                    // Cache valid: plan from it without re-download.
-                    let manifest = crate::manifest::parse_manifest_bytes(&cached)?;
+                if let Some((_cached, manifest)) = read_cache_body(cache) {
+                    // Cache valid: plan from it without re-download. W257
+                    // (L3): the body was parsed exactly once inside
+                    // read_cache_body - no second parse here; a corrupt
+                    // cached body already invalidated + fell through.
                     return manifest_inventory(&manifest, Some(etag)).map(ManifestWarm::Loaded);
                 }
                 // Corrupt/missing cache body was invalidated above: fall
@@ -489,16 +491,21 @@ fn read_cache_meta(cache: &CachePaths) -> Option<CacheMeta> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Read the cached manifest body; `None` when unreadable OR unparseable. A
-/// corrupt cached body is invalidated (removed, best-effort - W245) so the
-/// next load refetches instead of re-serving garbage.
-fn read_cache_body(cache: &CachePaths) -> Option<Vec<u8>> {
+/// Read the cached manifest body and parse it exactly ONCE; `None` when
+/// unreadable OR unparseable. A corrupt cached body is invalidated (removed,
+/// best-effort - W245) so the next load refetches instead of re-serving
+/// garbage. W257 (L3, review 5472028291): the caller reuses the returned
+/// parsed manifest - the 304 path never parses the same bytes twice, and a
+/// second failure is a fall-through to fresh fetch, not a hard error.
+fn read_cache_body(cache: &CachePaths) -> Option<(Vec<u8>, crate::manifest::ManifestV1)> {
     let bytes = std::fs::read(&cache.body).ok()?;
-    if crate::manifest::parse_manifest_bytes(&bytes).is_err() {
-        invalidate_cache(cache);
-        return None;
+    match crate::manifest::parse_manifest_bytes(&bytes) {
+        Ok(manifest) => Some((bytes, manifest)),
+        Err(_) => {
+            invalidate_cache(cache);
+            None
+        }
     }
-    Some(bytes)
 }
 
 /// Best-effort removal of both cache files (W245 invalidate-on-corrupt).
@@ -1647,7 +1654,7 @@ mod tests {
             "temp files must be renamed away"
         );
         // Body parses; meta round-trips.
-        let cached_body = read_cache_body(&cache).expect("cached body");
+        let (cached_body, _manifest) = read_cache_body(&cache).expect("cached body");
         assert_eq!(cached_body, body);
         let cached_meta = read_cache_meta(&cache).expect("cached meta");
         assert_eq!(cached_meta, meta);
@@ -1794,6 +1801,52 @@ mod tests {
     }
 
     #[test]
+    fn cached_garbage_body_304_path_refetches_fresh() {
+        // W257 (L3, review 5472028291): the 304 path parses the cached body
+        // exactly ONCE (no double parse) and a second failure (body rotted
+        // after the meta was written) invalidates and fresh-fetches - never
+        // a hard error from the 304 arm. Here the remote etag matches the
+        // meta (304) while the cached body is garbage: the load succeeds
+        // from a fresh fetch and heals the cache.
+        //
+        // Characterization: GREEN on arrival today (read_cache_body
+        // invalidates garbage and the arm falls through); mutation-checked
+        // by re-adding a `?` second parse on raw bytes -> hard Err from the
+        // 304 arm -> pin re-fails.
+        let dir = crate::testutil::TempDir::new("vaultsync-cache-test");
+        let cache = CachePaths::new(dir.path());
+        let store = CountingGetStore::new();
+        let body = manifest_body(&[("a.md", 3, Some(100))]);
+        let body_len = body.len() as u64;
+        let mut c = std::io::Cursor::new(body);
+        let put = store
+            .inner
+            .put_from(crate::local::MANIFEST_KEY, &mut c, body_len, None)
+            .unwrap();
+        let etag = put.etag.clone().unwrap();
+        // Meta claims the CURRENT etag; the cached BODY is garbage (rot).
+        let meta = CacheMeta {
+            remote_etag: Some(etag.clone()),
+            fetched_at_ms: 1,
+            source_key: crate::local::MANIFEST_KEY.to_string(),
+        };
+        write_cache_files(b"garbage body", &meta, &cache).unwrap();
+        let inv = load_remote_inventory(&store, InventoryMode::Auto, Some(&cache)).unwrap();
+        assert_eq!(
+            inv.base.source,
+            InventorySource::Manifest {
+                remote_etag: Some(etag.clone())
+            }
+        );
+        // The garbage cached body was invalidated and the cache re-filled
+        // with the fresh (valid) body.
+        let (cached_body, _m) = read_cache_body(&cache).expect("cache healed");
+        let m = crate::manifest::parse_manifest_bytes(&cached_body).unwrap();
+        assert_eq!(m.entry_count, 1);
+        assert_eq!(m.entries[0].key, "a.md");
+    }
+
+    #[test]
     fn cache_is_never_authority_on_remote_failure() {
         // W245 (issue 45): a warm cache present does NOT let the facade plan
         // from stale data when the remote conditional GET fails with a
@@ -1861,9 +1914,8 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(etag, read_cache_meta(&cache).unwrap().remote_etag);
         let cached = read_cache_body(&cache).expect("cache body written");
-        let m = crate::manifest::parse_manifest_bytes(&cached).unwrap();
-        assert_eq!(m.entry_count, 1);
-        assert_eq!(m.entries[0].key, "a.md");
+        assert_eq!(cached.1.entry_count, 1);
+        assert_eq!(cached.1.entries[0].key, "a.md");
 
         // Repair also refreshes the cache (add bodies as the executor would,
         // then repair sees both files).
@@ -1887,7 +1939,6 @@ mod tests {
             "repair must refresh the cache etag"
         );
         let cached = read_cache_body(&cache).unwrap();
-        let m = crate::manifest::parse_manifest_bytes(&cached).unwrap();
-        assert_eq!(m.entry_count, 2);
+        assert_eq!(cached.1.entry_count, 2);
     }
 }
