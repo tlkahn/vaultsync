@@ -392,6 +392,33 @@ pub(crate) mod testutil {
     use std::sync::{Condvar, Mutex};
     use std::time::{Duration, Instant};
 
+    /// I27/42 test double (W334 shared helper): records every event into a
+    /// `Mutex<Vec<ProgressEvent>>` (thread-safe for pool-driven emission,
+    /// I27-thread). Shared so exec, progress, inventory, and store tests use
+    /// ONE recording double instead of forking divergent copies (I42-
+    /// recording).
+    #[derive(Default)]
+    pub(crate) struct RecordingProgress {
+        events: std::sync::Mutex<Vec<crate::progress::ProgressEvent>>,
+    }
+
+    impl RecordingProgress {
+        pub(crate) fn new() -> Self {
+            RecordingProgress {
+                events: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        pub(crate) fn events(&self) -> Vec<crate::progress::ProgressEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::progress::Progress for RecordingProgress {
+        fn event(&self, ev: crate::progress::ProgressEvent) {
+            self.events.lock().unwrap().push(ev);
+        }
+    }
+
     /// Deterministic overlap rendezvous for concurrency gauges (I17-gauges).
     ///
     /// Single gauge pass per instance: `released` latches once the target
