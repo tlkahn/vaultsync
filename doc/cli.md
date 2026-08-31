@@ -90,7 +90,9 @@ ttys) remains a follow-up option.
   stdout is never touched: it carries the plan text (and the `--json` stream
   later, Phase 3).
 - Passes with nothing to do render nothing; each pass ends with a newline.
-- `status`, `check`, `--dry-run` and `--json` never render progress.
+- `check` and `--json` never render progress. `status`, `repair`, and
+  `--dry-run` push/pull render the *plan-phase* feed below when the inventory
+  is cold, but never an executor bar (no transfers run).
 - Rate is cumulative (`bytes / elapsed`); ETA is `remaining / rate` - no
   sliding window, so a mixed-size vault shows a jittery ETA (accepted v1).
 - Rate/ETA count bytes of **successful** transfers only: a failed key still
@@ -99,6 +101,43 @@ ttys) remains a follow-up option.
   ETA.
 - There is no `--progress=` flag yet; the mode seam (`Auto`/`Off`/`Always`)
   is the extension point for one.
+
+### Plan-phase progress (cold inventory, issue 42)
+
+The **cold** inventory path (live `ListObjectsV2` pages + per-object
+`HeadObject`s, i.e. `mode = "list_head"`, an auto fallback, or `repair`) is
+multi-minute on large vaults and previously silent. Issue 42 adds a stderr
+feed over the same TTY-only `Auto`/`Off`/`Always` seam, e.g.:
+
+```text
+Listing     page 7  6900 keys
+Heading     1200/6894  [====>---]   17%
+```
+
+The plan-phase lines use the same 12-column verb budget and 8-cell bar as
+push/pull (no byte rate/ETA - there is no byte stream yet). They are
+`\r`-refreshed per `ListObjectsV2` page (`Listing`) and per completed head
+(`Heading`), and finalized with a newline before the W236 inventory source
+line (below) so a mid-line bar can never collide with it - including on
+error paths, where the partial bar is cleared defensively.
+
+- **Heading is live head-by-head:** under `[transfer].concurrency > 1` the
+  `Heading D/T` still advances as each head **completes** (emitted from the
+  pool workers, not only after the fan-out joins); `D` order may interleave
+  across workers, but totals stay exact and the bar reaches `T/T` when all
+  object heads are done.
+- **Mid-cold failure finalize:** when the cold inventory fails before
+  `PlanEnd` (e.g. a head error), the CLI clears the partial bar via the
+  renderer's `finish_plan` belt-and-braces, so every later `warning:` / W236 /
+  `error:` line starts on a fresh line and no orphan `\r` frame survives.
+
+- **Coverage:** cold `status`, `push`, `pull`, `--dry-run`, and `repair`
+  (repair has no executor phase at all - plan-phase only).
+- **Warm runs are silent:** a warm manifest load emits zero plan-phase
+  events, so warm runs show exactly one `inventory: manifest (N entries)`
+  line and gain no fake bar.
+- `check` and `--json` never render any progress (JSON is rejected before a
+  renderer is built).
 
 ### `vaultsync check`
 

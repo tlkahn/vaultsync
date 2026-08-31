@@ -2967,26 +2967,11 @@ mod tests {
     }
 
     /// I27 test double: records every event into a `Mutex<Vec<ProgressEvent>>`
-    /// (thread-safe for pool-driven emission, I27-thread).
-    #[derive(Default)]
-    struct RecordingProgress {
-        events: Mutex<Vec<ProgressEvent>>,
-    }
-    impl RecordingProgress {
-        fn new() -> Self {
-            RecordingProgress {
-                events: Mutex::new(Vec::new()),
-            }
-        }
-        fn events(&self) -> Vec<ProgressEvent> {
-            self.events.lock().unwrap().clone()
-        }
-    }
-    impl Progress for RecordingProgress {
-        fn event(&self, ev: ProgressEvent) {
-            self.events.lock().unwrap().push(ev);
-        }
-    }
+    /// (thread-safe for pool-driven emission, I27-thread). Shared helper -
+    /// lives in `crate::testutil` (W334) so inventory/store/progress tests
+    /// use one recording double; this alias keeps the exec suite's local
+    /// spelling.
+    use crate::testutil::RecordingProgress;
 
     /// Store wrapper that fails `put_from` for poisoned keys (I27 cycle 2:
     /// per-key failure events).

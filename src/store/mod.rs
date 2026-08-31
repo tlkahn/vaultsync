@@ -95,6 +95,21 @@ pub trait ObjectStore: Send + Sync {
     /// trailing `/` (e.g. `notes/`); passing `notes` will also match `notes.md`
     /// and any sibling whose key merely starts with `notes`.
     fn list(&self, prefix: &str) -> Result<Listing, Error>;
+    /// Issue 42 (I42-list-api): like [`list`] with a plan-phase progress
+    /// sink threaded through the page loop (S3 emits `ListPage` per
+    /// `ListObjectsV2` page and the head enrichment emits
+    /// `HeadsStart`/`HeadDone`). The DEFAULT body ignores the sink and
+    /// delegates to [`list`] - every existing impl keeps compiling and stays
+    /// byte-identical (same additive spirit as `put_from_with`, W339).
+    /// Backends without paging or without cold-list cost emit nothing.
+    fn list_with_progress(
+        &self,
+        prefix: &str,
+        progress: &dyn crate::progress::Progress,
+    ) -> Result<Listing, Error> {
+        let _ = progress;
+        self.list(prefix)
+    }
     /// Fetch metadata for a single object.
     fn head(&self, key: &str) -> Result<Entity, Error>;
     /// Stream object bytes into `w`, returning its metadata.
@@ -211,15 +226,31 @@ pub trait ObjectStore: Send + Sync {
 /// still fails the whole listing - no partial entities, no vanished warning
 /// (the warning is built on the success path only). In the POOLED path
 /// in-flight heads are not cancelled when a sibling fails: extra completed
-/// requests are accepted (documented, no-cancellation behavior).
+/// requests are accepted (documented, no-cancellation behavior). In the pooled
+/// path `HeadDone` progress is emitted LIVE from each worker as its attempt
+/// completes (W374) - so the Heading bar advances during the fan-out - while the
+/// merge loop keeps results in listing order and does not re-emit (totals stay
+/// exactly N `HeadDone` for N object rows; order may interleave).
 pub(crate) fn enrich_with_head_mtimes<S: ObjectStore + ?Sized>(
     store: &S,
     listing: Listing,
     concurrency: u32,
+    progress: &dyn crate::progress::Progress,
 ) -> Result<Listing, Error> {
     let mut warnings = listing.warnings;
     let mut entities = Vec::new();
     let mut vanished: Vec<String> = Vec::new();
+    // I42-heads (W335): one `HeadsStart` before the fan-out (object rows
+    // only - folder views are never headed, never counted), then one
+    // `HeadDone` per completed object head (success or NotFound-vanish).
+    // Skipped entirely when there are zero object rows (I42 emission rules).
+    let object_rows_total = listing.entities.iter().filter(|e| !e.is_folder()).count() as u32;
+    if object_rows_total > 0 {
+        progress.event(crate::progress::ProgressEvent::HeadsStart {
+            total_keys: object_rows_total,
+        });
+    }
+    let mut heads_done: u32 = 0;
     if concurrency <= 1 {
         // Sequential path (I20-r1/F1): the pre-issue-20 loop verbatim
         // (recovered from a2fca0a) - folder passthrough, NotFound -> vanished
@@ -247,6 +278,13 @@ pub(crate) fn enrich_with_head_mtimes<S: ObjectStore + ?Sized>(
                 }
                 Err(err) => return Err(err),
             }
+            // I42-heads: NotFound-vanish still advances the count (W336); a
+            // hard error returns before this line (partial HeadDone ok).
+            heads_done += 1;
+            progress.event(crate::progress::ProgressEvent::HeadDone {
+                done: heads_done,
+                total_keys: object_rows_total,
+            });
         }
     } else {
         // I20-heads: fan the object-row heads out through the bounded pool;
@@ -257,7 +295,24 @@ pub(crate) fn enrich_with_head_mtimes<S: ObjectStore + ?Sized>(
         // (extra completed requests accepted - documented pooled behavior).
         let object_rows: Vec<&Entity> =
             listing.entities.iter().filter(|e| !e.is_folder()).collect();
-        let results = crate::pool::run_bounded(concurrency, &object_rows, |e| store.head(&e.key));
+        // I42-heads (W374, H2): emit HeadDone LIVE from each worker as its
+        // head attempt completes (Ok, NotFound, or hard Err) so the Heading bar
+        // advances during the multi-minute fan-out, not only after the join.
+        // `done` is a monotonic AtomicU32 -> a permutation of 1..=N (order may
+        // interleave, matching the HeadDone contract). The merge loop below
+        // does NOT re-emit (would double-count). Hard-Err attempts still get a
+        // HeadDone - the bar reflects attempts completed; I15 still fails
+        // closed at the merge on the listing-order first hard error.
+        let heads_done = std::sync::atomic::AtomicU32::new(0);
+        let results = crate::pool::run_bounded(concurrency, &object_rows, |e| {
+            let result = store.head(&e.key);
+            let done = heads_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            progress.event(crate::progress::ProgressEvent::HeadDone {
+                done,
+                total_keys: object_rows_total,
+            });
+            result
+        });
         let mut results = results.into_iter();
         for e in listing.entities {
             if e.is_folder() {
@@ -280,6 +335,8 @@ pub(crate) fn enrich_with_head_mtimes<S: ObjectStore + ?Sized>(
                 }
                 Err(err) => return Err(err),
             }
+            // HeadDone already emitted inside the worker (W374) - do not
+            // re-emit here (that would double-count).
         }
     }
     if let Some(msg) = vanished_warning(&vanished) {
@@ -463,6 +520,373 @@ mod tests {
         assert_eq!(format!("{err}"), "precondition failed: \"abc\"");
     }
 
+    // I42-pages (W340): FakePagingStore is the offline stand-in for the S3
+    // page loop - list_with_progress chunks the listed rows into pages of P
+    // and emits one cumulative ListPage per chunk (ceil(N/P) pages), then
+    // returns the full listing.
+    #[test]
+    fn fake_paging_store_emits_list_pages() {
+        use crate::progress::ProgressEvent;
+        let store = crate::testutil::FakePagingStore::new(3);
+        for i in 0..7 {
+            let mut c = std::io::Cursor::new(b"x".to_vec());
+            store
+                .inner
+                .put_from(&format!("k{i}.md"), &mut c, 1, Some(1000 + i))
+                .unwrap();
+        }
+        let prog = crate::testutil::RecordingProgress::new();
+        let listing = store.list_with_progress("", &prog).unwrap();
+        let events = prog.events();
+        let pages: Vec<(u32, u64)> = events
+            .iter()
+            .map(|e| match e {
+                ProgressEvent::ListPage { page, keys_so_far } => (*page, *keys_so_far),
+                other => panic!("expected ListPage, got {other:?}"),
+            })
+            .collect();
+        // 7 rows, page_size 3 -> 3 pages (3, 3, 1) with cumulative counts.
+        assert_eq!(pages, vec![(1, 3), (2, 6), (3, 7)]);
+        assert_eq!(listing.entities.len(), 7, "full listing returned");
+    }
+
+    // I42-list-api (W339): the trait DEFAULT `list_with_progress` ignores
+    // the sink and equals `list()`; the recording stays empty (same additive
+    // spirit as `put_from_with` - every existing impl keeps compiling).
+    #[test]
+    fn list_with_progress_default_ignores_sink() {
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"a".to_vec());
+        store.put_from("a.md", &mut c, 1, Some(100)).unwrap();
+        let prog = crate::testutil::RecordingProgress::new();
+        let plain = store.list("").unwrap();
+        let with = store.list_with_progress("", &prog).unwrap();
+        assert_eq!(with, plain, "default must delegate to list()");
+        assert!(
+            prog.events().is_empty(),
+            "default must emit zero events: {:?}",
+            prog.events()
+        );
+    }
+
+    // I42-heads (W335): enrich_with_head_mtimes emits HeadsStart then one
+    // HeadDone per object head; folder views are never headed and never
+    // counted in the total. Under concurrency 1 the HeadDone order is the
+    // listing order. I15 behavior (head mtimes win) is unchanged.
+    // I42-heads (W337): at concurrency > 1 the pooled enrichment still emits
+    // HeadsStart{20} + exactly 20 HeadDone (totals pin; order may interleave
+    // in general - here listing-order merge keeps done 1..=20 exactly once).
+    #[test]
+    fn enrich_head_progress_under_concurrency() {
+        use crate::progress::ProgressEvent;
+        let store = MemoryStore::new();
+        for i in 0..20 {
+            let mut c = std::io::Cursor::new(b"x".to_vec());
+            store
+                .put_from(&format!("k{i:02}.md"), &mut c, 1, Some(1000 + i))
+                .unwrap();
+        }
+        let listing = store.list("").unwrap();
+        let prog = crate::testutil::RecordingProgress::new();
+        let enriched = enrich_with_head_mtimes(&store, listing, 4, &prog).unwrap();
+        let events = prog.events();
+        assert!(matches!(
+            events[0],
+            ProgressEvent::HeadsStart { total_keys: 20 }
+        ));
+        let done: Vec<u32> = events[1..]
+            .iter()
+            .map(|e| match e {
+                ProgressEvent::HeadDone { done, total_keys } => {
+                    assert_eq!(*total_keys, 20);
+                    *done
+                }
+                other => panic!("expected HeadDone, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(done.len(), 20, "exactly 20 HeadDone");
+        assert_eq!(done.iter().max(), Some(&20), "done reaches the total");
+        let mut sorted = done.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 20, "done values 1..=20 each once: {done:?}");
+        assert_eq!(enriched.entities.len(), 20, "no vanishes");
+    }
+
+    // I42-heads (W373, H2 RED): a progress sink that NOTIFIES on each
+    // completion, plus a head that blocks the LAST key until it has observed
+    // (N-1) HeadDone. Under today's join-then-burst emission the last head
+    // never sees a live HeadDone before the fan-out joins (it times out and
+    // `observed_before_join` stays false => RED). After W374 the workers emit
+    // HeadDone as each attempt completes, so the last head observes N-1 live
+    // HeadDone before it returns => GREEN.
+    #[test]
+    fn enrich_concurrent_headdone_streams_before_join() {
+        use crate::progress::ProgressEvent;
+        let inner = MemoryStore::new();
+        for i in 1..=8 {
+            let mut c = std::io::Cursor::new(b"x".to_vec());
+            inner
+                .put_from(&format!("f{i}.md"), &mut c, 1, Some(1000 + i as u64))
+                .unwrap();
+        }
+        let listing = inner.list("").unwrap();
+        let last_key = listing.entities.last().unwrap().key.clone();
+        let progress = std::sync::Arc::new(NotifyHeadProgress::new());
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let store = BlockingLastHeadStore {
+            inner,
+            last_key,
+            progress: progress.clone(),
+            target_headdone: 7, // N-1 for N=8
+            observed_before_join: observed.clone(),
+        };
+        let result = enrich_with_head_mtimes(&store, listing, 4, progress.as_ref());
+        result.expect("all heads succeed");
+        assert!(
+            observed.load(std::sync::atomic::Ordering::Relaxed),
+            "HeadDone must stream live before run_bounded joins (H2)"
+        );
+        // final totals: HeadsStart{8} first, then exactly 8 HeadDone covering
+        // 1..=8 (order is a permutation under concurrency > 1).
+        let evs = progress.events();
+        assert!(matches!(
+            evs[0],
+            ProgressEvent::HeadsStart { total_keys: 8 }
+        ));
+        let mut dones: Vec<u32> = Vec::new();
+        for e in &evs[1..] {
+            match e {
+                ProgressEvent::HeadDone { done, total_keys } => {
+                    assert_eq!(*total_keys, 8);
+                    dones.push(*done);
+                }
+                other => panic!("expected HeadDone, got {other:?}"),
+            }
+        }
+        assert_eq!(dones.len(), 8, "exactly 8 HeadDone");
+        dones.sort();
+        dones.dedup();
+        assert_eq!(dones, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    /// W373 recording sink that NOTIFIES a condvar on every event (so a
+    /// blocking head can wait on live HeadDone instead of polling).
+    struct NotifyHeadProgress {
+        events: std::sync::Mutex<Vec<crate::progress::ProgressEvent>>,
+        cv: std::sync::Condvar,
+    }
+    impl NotifyHeadProgress {
+        fn new() -> Self {
+            NotifyHeadProgress {
+                events: std::sync::Mutex::new(Vec::new()),
+                cv: std::sync::Condvar::new(),
+            }
+        }
+        fn events(&self) -> Vec<crate::progress::ProgressEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+    impl crate::progress::Progress for NotifyHeadProgress {
+        fn event(&self, ev: crate::progress::ProgressEvent) {
+            let mut e = self.events.lock().unwrap();
+            e.push(ev);
+            self.cv.notify_all();
+        }
+    }
+
+    /// W373 double: `head` delegates for every key except `last_key`, which
+    /// blocks (bounded `wait_timeout`) until `target_headdone` live `HeadDone`
+    /// events have been observed on the shared sink - proving emission happens
+    /// BEFORE `run_bounded` joins. Sets the shared `observed_before_join` flag
+    /// on success; on timeout it still completes (no suite hang) with the flag
+    /// false, which is the RED assertion for today's join-then-burst code.
+    struct BlockingLastHeadStore {
+        inner: MemoryStore,
+        last_key: String,
+        progress: std::sync::Arc<NotifyHeadProgress>,
+        target_headdone: u32,
+        observed_before_join: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl crate::store::ObjectStore for BlockingLastHeadStore {
+        fn list(&self, prefix: &str) -> Result<crate::store::Listing, crate::error::Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
+            if key != self.last_key {
+                return self.inner.head(key);
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+            let mut ev = self.progress.events.lock().unwrap();
+            loop {
+                let n = ev
+                    .iter()
+                    .filter(|e| matches!(e, crate::progress::ProgressEvent::HeadDone { .. }))
+                    .count();
+                if n as u32 >= self.target_headdone {
+                    self.observed_before_join
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    self.observed_before_join
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+                let (g, _) = self.progress.cv.wait_timeout(ev, deadline - now).unwrap();
+                ev = g;
+            }
+            self.inner.head(key)
+        }
+        fn get_to(
+            &self,
+            key: &str,
+            w: &mut dyn std::io::Write,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime_ms: Option<u64>,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.put_from(key, r, size, mtime_ms)
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    // I42-heads (W336): a NotFound vanish still advances `HeadDone` (the
+    // vanish warning is unchanged); a hard head error fails closed with
+    // partial `HeadDone` emissions allowed (no PlanEnd requirement here).
+    #[test]
+    fn enrich_head_progress_on_vanish_and_error() {
+        use crate::progress::ProgressEvent;
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"a".to_vec());
+        store.put_from("a.md", &mut c, 1, Some(100)).unwrap();
+        // one healthy + two listed keys that no longer exist (vanish race)
+        let listing = Listing {
+            entities: vec![
+                file("a.md", 1, Some(9_999_999)),
+                file("gone-0.md", 5, Some(9_999_999)),
+                file("gone-1.md", 5, Some(9_999_999)),
+            ],
+            warnings: Vec::new(),
+        };
+        let prog = crate::testutil::RecordingProgress::new();
+        let enriched = enrich_with_head_mtimes(&store, listing, 1, &prog).unwrap();
+        let events = prog.events();
+        assert!(matches!(
+            events[0],
+            ProgressEvent::HeadsStart { total_keys: 3 }
+        ));
+        let done: Vec<u32> = events[1..]
+            .iter()
+            .map(|e| match e {
+                ProgressEvent::HeadDone { done, total_keys } => {
+                    assert_eq!(*total_keys, 3);
+                    *done
+                }
+                other => panic!("expected HeadDone, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(done, vec![1, 2, 3], "vanish still advances done");
+        assert_eq!(enriched.entities.len(), 1, "vanished rows dropped");
+        assert!(
+            enriched.warnings.iter().any(|w| w.contains("vanished")),
+            "vanish warning unchanged: {:?}",
+            enriched.warnings
+        );
+
+        // hard head error: fails closed; partial HeadDone allowed
+        let mut fail = KeyFailStore::new(MemoryStore::new());
+        let mut c = std::io::Cursor::new(b"a".to_vec());
+        fail.inner.put_from("a.md", &mut c, 1, Some(1)).unwrap();
+        fail.fail("a.md", "boom");
+        let listing2 = Listing {
+            entities: vec![file("a.md", 1, Some(1))],
+            warnings: Vec::new(),
+        };
+        let prog2 = crate::testutil::RecordingProgress::new();
+        let err = enrich_with_head_mtimes(&fail, listing2, 1, &prog2).unwrap_err();
+        assert!(format!("{err}").contains("boom"));
+        let events2 = prog2.events();
+        assert!(
+            matches!(
+                events2.first(),
+                Some(ProgressEvent::HeadsStart { total_keys: 1 })
+            ),
+            "HeadsStart may precede the fail-closed error: {events2:?}"
+        );
+    }
+
+    // I42-callers-no-sink (W338): enrich with &NoProgress is the compat
+    // regression lock at the enrich layer - the recording stays empty and the
+    // output matches the pre-42 expected shape (head mtime/etag override,
+    // keys + warnings preserved verbatim).
+    #[test]
+    fn enrich_no_progress_listing_unchanged() {
+        let (store, listing) = degraded_listing();
+        // Compat lock: the no-op sink must leave the enriched output exactly
+        // at the pre-42 shape (head mtime/etag override, keys + warnings
+        // preserved verbatim). NoProgress discards every event, so the
+        // assertion is on the OUTPUT, not the sink.
+        let enriched =
+            enrich_with_head_mtimes(&store, listing.clone(), 1, &crate::progress::NoProgress)
+                .unwrap();
+        // head mtime/etag override (I15), keys + warnings preserved.
+        let a = enriched.entities.iter().find(|e| e.key == "a.md").unwrap();
+        assert_eq!(a.mtime_ms, Some(100));
+        assert_eq!(a.etag, store.head("a.md").unwrap().etag);
+        let keys: Vec<&str> = enriched.entities.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["a.md", "notes/", "notes/b.md"]);
+        assert_eq!(enriched.warnings, listing.warnings);
+    }
+
+    #[test]
+    fn enrich_emits_head_progress() {
+        use crate::progress::ProgressEvent;
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"a".to_vec());
+        store.put_from("a.md", &mut c, 1, Some(100)).unwrap();
+        let mut c = std::io::Cursor::new(b"b".to_vec());
+        store.put_from("b.md", &mut c, 1, Some(200)).unwrap();
+        let mut c = std::io::Cursor::new(b"c".to_vec());
+        store.put_from("n/c.md", &mut c, 1, Some(300)).unwrap();
+        let listing = store.list("").unwrap();
+        // sanity: 3 objects + 1 synthesized folder view (n/)
+        assert_eq!(listing.entities.len(), 4);
+        let prog = crate::testutil::RecordingProgress::new();
+        let enriched = enrich_with_head_mtimes(&store, listing, 1, &prog).unwrap();
+        let events = prog.events();
+        match &events[0] {
+            ProgressEvent::HeadsStart { total_keys } => assert_eq!(*total_keys, 3),
+            other => panic!("expected HeadsStart first, got {other:?}"),
+        }
+        let done: Vec<u32> = events[1..]
+            .iter()
+            .map(|e| match e {
+                ProgressEvent::HeadDone { done, total_keys } => {
+                    assert_eq!(*total_keys, 3);
+                    *done
+                }
+                other => panic!("expected HeadDone, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(done, vec![1, 2, 3], "concurrency 1: listing order");
+        assert_eq!(events.len(), 4, "HeadsStart + 3 HeadDone");
+        // I15 unchanged: head mtimes win; folder view passes through unheaded.
+        let a = enriched.entities.iter().find(|e| e.key == "a.md").unwrap();
+        assert_eq!(a.mtime_ms, Some(100));
+        let folders: Vec<&Entity> = enriched.entities.iter().filter(|e| e.is_folder()).collect();
+        assert_eq!(folders.len(), 1, "folder view survives unheaded");
+    }
+
     #[test]
     fn enrich_corrects_stale_listing_size_with_head_size() {
         let (store, mut listing) = degraded_listing();
@@ -477,7 +901,8 @@ mod tests {
             .find(|e| e.key == "a.md")
             .unwrap();
         a.size = 9_999;
-        let enriched = enrich_with_head_mtimes(&store, listing, 1).unwrap();
+        let enriched =
+            enrich_with_head_mtimes(&store, listing, 1, &crate::progress::NoProgress).unwrap();
         let a = enriched.entities.iter().find(|e| e.key == "a.md").unwrap();
         assert_eq!(a.size, store.head("a.md").unwrap().size);
         assert_eq!(
@@ -489,7 +914,8 @@ mod tests {
     #[test]
     fn enrich_overrides_listing_mtime_with_head_mtime() {
         let (store, listing) = degraded_listing();
-        let enriched = enrich_with_head_mtimes(&store, listing, 1).unwrap();
+        let enriched =
+            enrich_with_head_mtimes(&store, listing, 1, &crate::progress::NoProgress).unwrap();
         // head reports the true (earlier) metadata mtimes and the real etag.
         let a = enriched.entities.iter().find(|e| e.key == "a.md").unwrap();
         assert_eq!(a.mtime_ms, Some(100));
@@ -531,7 +957,8 @@ mod tests {
             entities,
             warnings: vec!["pre-existing".to_string()],
         };
-        let enriched = enrich_with_head_mtimes(&store, listing, 1).unwrap();
+        let enriched =
+            enrich_with_head_mtimes(&store, listing, 1, &crate::progress::NoProgress).unwrap();
         // Healthy row kept; all vanished rows dropped.
         let keys: Vec<_> = enriched.entities.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(keys, vec!["a.md"]);
@@ -552,7 +979,8 @@ mod tests {
         // A listed key that vanishes between LIST and HEAD (concurrent-delete
         // race): head answers NotFound, so the row is dropped, siblings kept.
         listing.entities.push(file("gone.md", 5, Some(9_999_999)));
-        let enriched = enrich_with_head_mtimes(&store, listing, 1).unwrap();
+        let enriched =
+            enrich_with_head_mtimes(&store, listing, 1, &crate::progress::NoProgress).unwrap();
         let keys: Vec<_> = enriched.entities.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(keys, vec!["a.md", "notes/", "notes/b.md"]);
     }
@@ -680,8 +1108,15 @@ mod tests {
         // so a conc-1 pass through the gauge deadlocks (target=2 never
         // reached; `n_workers` was sized for the N leg). Same trap as
         // `enrich_parallel_vanished_warning_order_stable`.
-        let enriched1 = enrich_with_head_mtimes(&store.inner, listing.clone(), 1).unwrap();
-        let enriched4 = enrich_with_head_mtimes(&store, listing, 4).unwrap();
+        let enriched1 = enrich_with_head_mtimes(
+            &store.inner,
+            listing.clone(),
+            1,
+            &crate::progress::NoProgress,
+        )
+        .unwrap();
+        let enriched4 =
+            enrich_with_head_mtimes(&store, listing, 4, &crate::progress::NoProgress).unwrap();
         assert!(
             store.max_in_flight() > 1,
             "heads must overlap at concurrency 4 (max in-flight {})",
@@ -714,8 +1149,9 @@ mod tests {
             entities,
             warnings: vec!["pre-existing".to_string()],
         };
-        let r1 = enrich_with_head_mtimes(&store, listing.clone(), 1).unwrap();
-        let r4 = enrich_with_head_mtimes(&store, listing, 4).unwrap();
+        let r1 = enrich_with_head_mtimes(&store, listing.clone(), 1, &crate::progress::NoProgress)
+            .unwrap();
+        let r4 = enrich_with_head_mtimes(&store, listing, 4, &crate::progress::NoProgress).unwrap();
         assert_eq!(r1, r4);
         assert_eq!(
             r4.warnings[1],
@@ -751,7 +1187,8 @@ mod tests {
             ],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&store, listing, 4).unwrap_err();
+        let err =
+            enrich_with_head_mtimes(&store, listing, 4, &crate::progress::NoProgress).unwrap_err();
         assert_eq!(
             format!("{err}"),
             "a.md:boom-a",
@@ -877,7 +1314,8 @@ mod tests {
             ],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&store, listing, 1).unwrap_err();
+        let err =
+            enrich_with_head_mtimes(&store, listing, 1, &crate::progress::NoProgress).unwrap_err();
         assert!(
             matches!(err, Error::Unauthorized(_)),
             "a.md's Unauthorized must fail the listing, got {err:?}"
@@ -915,7 +1353,8 @@ mod tests {
             ],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&store, listing, 4).unwrap_err();
+        let err =
+            enrich_with_head_mtimes(&store, listing, 4, &crate::progress::NoProgress).unwrap_err();
         assert!(
             matches!(err, Error::Unauthorized(_)),
             "listing-earliest error must win, got {err:?}"
@@ -948,7 +1387,9 @@ mod tests {
             .filter(|e| !e.is_folder())
             .map(|e| e.key.clone())
             .collect();
-        let enriched = enrich_with_head_mtimes(&store, listing.clone(), 1).unwrap();
+        let enriched =
+            enrich_with_head_mtimes(&store, listing.clone(), 1, &crate::progress::NoProgress)
+                .unwrap();
         assert_eq!(
             store.log(),
             expected,
@@ -1072,7 +1513,8 @@ mod tests {
             entities: vec![file("a.md", 9_999, Some(9_999_999))],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&flaky, listing, 1).unwrap_err();
+        let err =
+            enrich_with_head_mtimes(&flaky, listing, 1, &crate::progress::NoProgress).unwrap_err();
         assert!(
             matches!(err, Error::Unavailable(_)),
             "a transient head error must fail the listing on the first attempt, got {err:?}"
@@ -1094,7 +1536,8 @@ mod tests {
             entities: vec![file("a.md", 1, Some(9_999_999))],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&store, listing, 1).unwrap_err();
+        let err =
+            enrich_with_head_mtimes(&store, listing, 1, &crate::progress::NoProgress).unwrap_err();
         assert!(matches!(err, Error::Unavailable(_)));
         assert_eq!(store.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
@@ -1108,7 +1551,8 @@ mod tests {
             entities: vec![file("a.md", 1, None)],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&flaky, listing, 1).unwrap_err();
+        let err =
+            enrich_with_head_mtimes(&flaky, listing, 1, &crate::progress::NoProgress).unwrap_err();
         assert!(matches!(err, Error::Unauthorized(_)));
         assert_eq!(flaky.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
@@ -1119,7 +1563,13 @@ mod tests {
             entities: vec![file("a.md", 1, Some(9_999_999))],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&HeadFailStore::new(), listing, 1).unwrap_err();
+        let err = enrich_with_head_mtimes(
+            &HeadFailStore::new(),
+            listing,
+            1,
+            &crate::progress::NoProgress,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, Error::Unavailable(_)),
             "non-NotFound head error must fail the listing, got {err:?}"
@@ -1137,6 +1587,7 @@ mod tests {
                 warnings: vec!["w".to_string()],
             },
             1,
+            &crate::progress::NoProgress,
         )
         .unwrap();
         assert!(empty.entities.is_empty());
@@ -1150,6 +1601,7 @@ mod tests {
                 warnings: Vec::new(),
             },
             1,
+            &crate::progress::NoProgress,
         )
         .unwrap();
         assert_eq!(folder_only.entities.len(), 1);

@@ -55,6 +55,34 @@ pub enum ProgressEvent {
     PassEnd { kind: PassKind },
     /// The whole run finished (after the final pass fold).
     RunEnd { executed: u32, failed: u32 },
+    /// Issue 42 (I42-events, B1): the cold inventory is about to run. The
+    /// optional opening bracket of the plan phase; renders nothing on its
+    /// own (blank until the first `ListPage`/`HeadsStart`, W327 lock). Only
+    /// emitted on the COLD path - warm manifest loads emit zero plan-phase
+    /// events (I42-warm-events).
+    PlanStart,
+    /// Issue 42 (I42-pages): one `ListObjectsV2` page completed. `page` is
+    /// 1-based; `keys_so_far` is the CUMULATIVE raw object-row count from the
+    /// page `contents` (pre-folder-synth; matches wall-time work, W342 lock).
+    /// No total-page denominator - S3 does not know it up front.
+    ListPage { page: u32, keys_so_far: u64 },
+    /// Issue 42 (I42-heads): the head-enrichment fan-out is about to start;
+    /// `total_keys` is the object rows that WILL be headed (post-reserved,
+    /// non-folder). Skipped when there are zero object rows.
+    HeadsStart { total_keys: u32 },
+    /// Issue 42 (I42-heads): one object head completed (`done` is 1..=total,
+    /// success or NotFound-vanish). Emitted LIVE as each attempt completes -
+    /// including under concurrency > 1 (from the pool workers, W374) - so the
+    /// Heading bar advances during the fan-out rather than only after it.
+    /// `done` values are a permutation of 1..=total (order may interleave);
+    /// totals are pinned, not order. The merge loop does not re-emit.
+    HeadDone { done: u32, total_keys: u32 },
+    /// Issue 42 (I42-finalize): the cold inventory finished (success path).
+    /// The renderer finalizes the plan frame with a newline here; the CLI
+    /// must observe this (or its own `finish_plan` belt-and-braces) before
+    /// printing W236 / warnings so `\r` bars never collide. Not emitted on
+    /// mid-cold failure (CLI clears defensively).
+    PlanEnd,
 }
 
 /// Sink for executor progress events (I27-thread): `Send + Sync` so worker
@@ -62,6 +90,15 @@ pub enum ProgressEvent {
 /// internally.
 pub trait Progress: Send + Sync {
     fn event(&self, ev: ProgressEvent);
+
+    /// Issue 42 belt-and-braces (I42-finalize): finalize a partial plan bar
+    /// with a newline so later stderr lines (warnings, W236, errors) never
+    /// collide with a mid-line `\r` frame - even when the library could not
+    /// emit `PlanEnd` (mid-cold failure). The CLI calls this after every
+    /// cold plan attempt; the TTY renderer finalizes at `PlanEnd` already, so
+    /// this is a no-op there. Default: no-op (Quiet/NoProgress sinks write
+    /// nothing).
+    fn finish_plan(&self) {}
 }
 
 /// The default no-op sink: `execute_plan` (the wrapper) passes this so
@@ -107,15 +144,18 @@ impl ProgressLine {
     /// Fold one executor event. Time (`now_ms`) is injected so tests never
     /// touch a wall clock (I27-rate). `PassStart` resets the counters for the
     /// new pass; `KeyDone`/`PassEnd` for the current pass update them;
-    /// `RunEnd` and foreign-kind events are ignored.
+    /// `RunEnd` and foreign-kind events are ignored. The injected clock only
+    /// advances on ACCEPTED events (W330): foreign/plan-phase events leave
+    /// the line machine byte-identical, so `render()` after them equals the
+    /// previous executor state exactly.
     pub fn on_event(&mut self, ev: ProgressEvent, now_ms: u64) {
-        self.now_ms = now_ms;
         match ev {
             ProgressEvent::PassStart {
                 kind,
                 total_keys,
                 total_bytes,
             } => {
+                self.now_ms = now_ms;
                 self.pass = Some(kind);
                 self.total_keys = total_keys;
                 self.total_bytes = total_bytes;
@@ -131,6 +171,7 @@ impl ProgressLine {
                 ok,
             } => {
                 if self.pass == Some(kind) {
+                    self.now_ms = now_ms;
                     self.done += 1;
                     // I27-bytes (policy B, PR 28 r1 F1): failed keys still
                     // advance the key count but only successful bytes
@@ -150,6 +191,14 @@ impl ProgressLine {
                 // the final 100% frame with a trailing newline.
             }
             ProgressEvent::RunEnd { .. } => {}
+            // I42 (W326): plan-phase events are foreign to the executor line
+            // machine - ignored here, routed to `PlanProgressLine` by the
+            // renderers (W330 pins the symmetric ignore).
+            ProgressEvent::PlanStart
+            | ProgressEvent::ListPage { .. }
+            | ProgressEvent::HeadsStart { .. }
+            | ProgressEvent::HeadDone { .. }
+            | ProgressEvent::PlanEnd => {}
         }
     }
 
@@ -193,6 +242,88 @@ impl ProgressLine {
             }
         }
         line
+    }
+}
+
+/// Pure, IO-free plan-phase line state machine (I42-line, B2): fed the
+/// issue-42 plan-phase events (`PlanStart` / `ListPage` / `HeadsStart` /
+/// `HeadDone` / `PlanEnd`), it renders one bounded line per active phase - a
+/// cumulative listing line or a heading bar line. Foreign executor events
+/// never mutate it (W329), and the executor `ProgressLine` symmetrically
+/// ignores plan-phase events (W330). No byte rate / ETA on the plan phase
+/// (I42-line).
+///
+/// Line layout (mirrors the executor budgets): `Listing     page N  K keys`
+/// (12-col verb) and `Heading     D/T  [bar]  P%` (12-col verb + 8-cell bar).
+/// Exact strings are locked by the pure-line unit tests before any renderer
+/// wiring (W327/W328).
+#[derive(Debug, Default)]
+pub struct PlanProgressLine {
+    /// (page, keys_so_far) after the most recent `ListPage`.
+    listing: Option<(u32, u64)>,
+    /// Heading totals once `HeadsStart` armed: (done, total).
+    heading: Option<(u32, u32)>,
+}
+
+impl PlanProgressLine {
+    pub fn new() -> Self {
+        PlanProgressLine::default()
+    }
+
+    /// Fold one plan-phase event. `PlanStart` renders nothing on its own
+    /// (blank until the first `ListPage`/`HeadsStart`, W327 lock); `PlanEnd`
+    /// keeps the last frame state for the renderer to print with a newline
+    /// (I42-finalize); foreign executor events are ignored (W329).
+    pub fn on_event(&mut self, ev: ProgressEvent) {
+        match ev {
+            ProgressEvent::PlanStart => {}
+            ProgressEvent::ListPage { page, keys_so_far } => {
+                self.listing = Some((page, keys_so_far));
+            }
+            ProgressEvent::HeadsStart { total_keys } => {
+                self.heading = Some((0, total_keys));
+            }
+            ProgressEvent::HeadDone { done, total_keys } => {
+                self.heading = Some((done, total_keys));
+            }
+            ProgressEvent::PlanEnd => {}
+            ProgressEvent::PassStart { .. }
+            | ProgressEvent::KeyDone { .. }
+            | ProgressEvent::PassEnd { .. }
+            | ProgressEvent::RunEnd { .. } => {}
+        }
+    }
+
+    /// Render the current plan-phase line. Empty when nothing has arrived,
+    /// or a heading with `total_keys == 0` (mirrors the executor zero-total
+    /// policy, W328).
+    pub fn render(&self) -> String {
+        if let Some((done, total)) = self.heading {
+            if total == 0 {
+                return String::new();
+            }
+            let fraction = done as f64 / total as f64;
+            let pct = (done as u64 * 100) / total as u64;
+            format!(
+                "{:<width$}{}/{}  {}  {:>3}%",
+                "Heading",
+                done,
+                total,
+                bar(fraction),
+                pct,
+                width = VERB_BUDGET
+            )
+        } else if let Some((page, keys_so_far)) = self.listing {
+            format!(
+                "{:<width$}page {}  {} keys",
+                "Listing",
+                page,
+                keys_so_far,
+                width = VERB_BUDGET
+            )
+        } else {
+            String::new()
+        }
     }
 }
 
@@ -254,12 +385,30 @@ fn format_eta(secs: f64) -> String {
     }
 }
 
+/// True for issue-42 plan-phase events, routed to [`PlanProgressLine`] by the
+/// renderers (W331). Executor events route to [`ProgressLine`].
+fn is_plan_phase(ev: &ProgressEvent) -> bool {
+    matches!(
+        ev,
+        ProgressEvent::PlanStart
+            | ProgressEvent::ListPage { .. }
+            | ProgressEvent::HeadsStart { .. }
+            | ProgressEvent::HeadDone { .. }
+            | ProgressEvent::PlanEnd
+    )
+}
+
 /// TTY renderer (I27-home/I27-render): wraps a writer + a [`ProgressLine`]
 /// and refreshes one line in place - `\r{line}\x1b[K` on `PassStart`/
 /// `KeyDone`, `\r{line}\x1b[K\n` to finalize a `PassEnd`. `RunEnd` and
 /// zero-total passes render nothing. `event()` serializes through an internal
 /// `Mutex`, so worker-thread emission (I27-thread) is safe and the writer is
 /// flushed after every frame (a buffered cursor cannot freeze the bar).
+///
+/// Issue 42 (W331+): plan-phase events route to a [`PlanProgressLine`]
+/// beside the executor line. `PlanEnd` finalizes the plan frame with a
+/// newline; `finish_plan()` is the belt-and-braces finalize for error paths
+/// where the library could not emit `PlanEnd` (I42-finalize).
 ///
 /// The writer is `&mut (dyn Write + Send)` (not bare `dyn Write`) so the
 /// `Mutex` keeps `TermProgress: Send + Sync` and thus usable behind `dyn
@@ -271,6 +420,10 @@ pub struct TermProgress<'w> {
 
 struct TermInner<'w> {
     line: ProgressLine,
+    plan_line: PlanProgressLine,
+    /// Set once the plan frame was finalized with a newline (`PlanEnd` or
+    /// `finish_plan`) so the belt-and-braces finalize is idempotent.
+    plan_finalized: bool,
     writer: &'w mut (dyn std::io::Write + Send),
 }
 
@@ -279,6 +432,8 @@ impl<'w> TermProgress<'w> {
         TermProgress {
             inner: Mutex::new(TermInner {
                 line: ProgressLine::new(),
+                plan_line: PlanProgressLine::new(),
+                plan_finalized: false,
                 writer,
             }),
             start: std::time::Instant::now(),
@@ -286,11 +441,68 @@ impl<'w> TermProgress<'w> {
     }
 }
 
+/// Issue 42 finalize (I42-finalize, W370/W372): write the single plan
+/// finalize frame - `\r{rendered}\x1b[K\n` - exactly once. Idempotent (guards
+/// on `plan_finalized`); marks `plan_finalized` even when there is nothing to
+/// render (L1: a `PlanEnd` with an empty render still finalizes, so a later
+/// belt-and-braces call cannot race a future non-empty state). Shared by both
+/// the `PlanEnd` path in `event` and the `finish_plan` trait override so the
+/// finalize frame format string lives in one place (no drift).
+fn finalize_plan_frame(inner: &mut TermInner) {
+    if inner.plan_finalized {
+        return;
+    }
+    inner.plan_finalized = true;
+    let rendered = inner.plan_line.render();
+    if rendered.is_empty() {
+        return;
+    }
+    let frame = format!("\r{rendered}\x1b[K\n");
+    let _ = inner.writer.write_all(frame.as_bytes());
+    let _ = inner.writer.flush();
+}
+
 impl Progress for TermProgress<'_> {
+    /// Issue 42 belt-and-braces (I42-finalize, W370): finalize a partial plan
+    /// bar with a newline so later stderr lines (warnings, W236, errors) never
+    /// collide with a mid-line `\r` frame - even when the library could not
+    /// emit `PlanEnd` (mid-cold failure). No-op when the plan line was already
+    /// finalized via `PlanEnd` or there is nothing to render. This override is
+    /// what makes `Box<dyn Progress>::finish_plan()` (the CLI's renderer
+    /// boundary) run the real body; before it, dispatch hit the trait default
+    /// no-op (H1).
+    fn finish_plan(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        finalize_plan_frame(&mut inner);
+    }
+
     fn event(&self, ev: ProgressEvent) {
         if matches!(ev, ProgressEvent::RunEnd { .. }) {
             // The pass line was finalized with a newline at PassEnd; a RunEnd
             // frame would overwrite it without one.
+            return;
+        }
+        // Issue 42 (W331): plan-phase events drive the plan line machine and
+        // finalize at `PlanEnd` (newline). The executor line machine never
+        // sees them, and the plan line never sees executor events (W329/W330).
+        if is_plan_phase(&ev) {
+            let finalize = matches!(ev, ProgressEvent::PlanEnd);
+            let mut inner = self.inner.lock().unwrap();
+            inner.plan_line.on_event(ev);
+            if finalize {
+                // PlanEnd updates the line state first (keeps the last frame);
+                // the shared helper writes the single finalize frame. L1: it
+                // marks finalize even when the render is empty.
+                finalize_plan_frame(&mut inner);
+            } else {
+                let rendered = inner.plan_line.render();
+                if rendered.is_empty() {
+                    return;
+                }
+                let frame = format!("\r{rendered}\x1b[K");
+                let _ = inner.writer.write_all(frame.as_bytes());
+                let _ = inner.writer.flush();
+            }
             return;
         }
         let finalize = matches!(ev, ProgressEvent::PassEnd { .. });
@@ -672,6 +884,116 @@ mod tests {
         assert_eq!(bar_cells(&l.render()), "=====>--");
     }
 
+    // I42-render (W333): the non-TTY renderer swallows the full plan-phase
+    // sequence - the writer stays empty (same contract as the executor path).
+    #[test]
+    fn quiet_renderer_swallows_plan_phase() {
+        let mut buf = Vec::new();
+        {
+            let p = QuietProgress::new(&mut buf);
+            p.event(ProgressEvent::PlanStart);
+            p.event(ProgressEvent::ListPage {
+                page: 1,
+                keys_so_far: 1000,
+            });
+            p.event(ProgressEvent::HeadsStart { total_keys: 5 });
+            p.event(ProgressEvent::HeadDone {
+                done: 2,
+                total_keys: 5,
+            });
+            p.event(ProgressEvent::PlanEnd);
+        }
+        assert!(buf.is_empty(), "quiet renderer must write nothing");
+    }
+
+    // I42-render (W332): `PlanEnd` finalizes the plan frame with a newline
+    // (and clear); a subsequent executor pass starts a fresh line that never
+    // corrupts the finalized plan line (split contents on `\n` and assert).
+    #[test]
+    fn tty_renderer_plan_end_then_executor_pass() {
+        let mut buf = Vec::new();
+        {
+            let p = TermProgress::new(&mut buf);
+            p.event(ProgressEvent::PlanStart);
+            p.event(ProgressEvent::ListPage {
+                page: 1,
+                keys_so_far: 1000,
+            });
+            p.event(ProgressEvent::ListPage {
+                page: 2,
+                keys_so_far: 2000,
+            });
+            p.event(ProgressEvent::PlanEnd);
+            p.event(ProgressEvent::PassStart {
+                kind: PassKind::Upload,
+                total_keys: 2,
+                total_bytes: 20,
+            });
+            p.event(ProgressEvent::KeyDone {
+                kind: PassKind::Upload,
+                key: "a.md".to_string(),
+                bytes: 10,
+                ok: true,
+            });
+        }
+        let s = String::from_utf8(buf).unwrap();
+        let mut lines = s.split('\n');
+        let plan_part = lines.next().unwrap();
+        let exec_part = lines.next().unwrap();
+        assert!(
+            plan_part.contains("Listing"),
+            "plan frames on the first line: {plan_part:?}"
+        );
+        assert!(
+            plan_part.contains("2000 keys"),
+            "final plan frame state: {plan_part:?}"
+        );
+        assert!(
+            plan_part.ends_with("\x1b[K"),
+            "plan end clears the line: {plan_part:?}"
+        );
+        assert!(
+            exec_part.contains("Uploading"),
+            "executor frames on the next line: {exec_part:?}"
+        );
+        assert!(exec_part.contains("1/2"), "{exec_part:?}");
+        assert_eq!(lines.next(), None, "no stray extra lines: {s:?}");
+    }
+
+    // I42-render (W331): TermProgress routes plan-phase events to the plan
+    // line machine with in-place `\r` refresh per `ListPage`; no newline is
+    // written until `PlanEnd` (I42-finalize).
+    #[test]
+    fn tty_renderer_refreshes_plan_listing_frames() {
+        let mut buf = Vec::new();
+        {
+            let p = TermProgress::new(&mut buf);
+            p.event(ProgressEvent::PlanStart);
+            p.event(ProgressEvent::ListPage {
+                page: 1,
+                keys_so_far: 1000,
+            });
+            p.event(ProgressEvent::ListPage {
+                page: 2,
+                keys_so_far: 2000,
+            });
+        }
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(
+            s.matches('\r').count(),
+            2,
+            "one refresh per ListPage: {s:?}"
+        );
+        assert_eq!(
+            s.matches('\n').count(),
+            0,
+            "no newline before PlanEnd: {s:?}"
+        );
+        assert!(s.contains("Listing"), "{s:?}");
+        assert!(s.contains("2000 keys"), "latest key count: {s:?}");
+        assert!(s.contains("\x1b[K"), "clear-to-EOL: {s:?}");
+    }
+
     // I27-render: a pass with total_keys == 0 renders nothing.
     #[test]
     fn progress_line_zero_total_pass_renders_nothing() {
@@ -1001,6 +1323,248 @@ mod tests {
         }
     }
 
+    // I42-events (W326): the plan-phase variants exist and are constructible;
+    // each carries its fields unchanged through construction + inspection
+    // (event-shape lock for the W-series).
+    #[test]
+    fn plan_progress_event_variants_carry_fields() {
+        use super::ProgressEvent;
+
+        match ProgressEvent::PlanStart {
+            ProgressEvent::PlanStart => {}
+            _ => panic!("wrong variant"),
+        }
+
+        match (ProgressEvent::ListPage {
+            page: 1,
+            keys_so_far: 1000,
+        }) {
+            ProgressEvent::ListPage { page, keys_so_far } => {
+                assert_eq!(page, 1);
+                assert_eq!(keys_so_far, 1000);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        match (ProgressEvent::HeadsStart { total_keys: 3 }) {
+            ProgressEvent::HeadsStart { total_keys } => {
+                assert_eq!(total_keys, 3);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        match (ProgressEvent::HeadDone {
+            done: 1,
+            total_keys: 3,
+        }) {
+            ProgressEvent::HeadDone { done, total_keys } => {
+                assert_eq!(done, 1);
+                assert_eq!(total_keys, 3);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        match ProgressEvent::PlanEnd {
+            ProgressEvent::PlanEnd => {}
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // I42-line (W330): the executor `ProgressLine` ignores plan-phase
+    // variants - state unchanged, and an active executor frame survives them
+    // intact (symmetric with `PlanProgressLine` ignoring executor events,
+    // W329).
+    #[test]
+    fn progress_line_ignores_plan_phase_events() {
+        let mut line = ProgressLine::new();
+        line.on_event(ProgressEvent::PlanStart, 0);
+        line.on_event(
+            ProgressEvent::ListPage {
+                page: 1,
+                keys_so_far: 1000,
+            },
+            0,
+        );
+        line.on_event(ProgressEvent::HeadsStart { total_keys: 5 }, 0);
+        line.on_event(
+            ProgressEvent::HeadDone {
+                done: 1,
+                total_keys: 5,
+            },
+            0,
+        );
+        line.on_event(ProgressEvent::PlanEnd, 0);
+        assert_eq!(
+            line.render(),
+            "",
+            "plan-phase events must not arm an executor frame"
+        );
+
+        // an active executor pass survives plan-phase events unchanged
+        line.on_event(
+            ProgressEvent::PassStart {
+                kind: PassKind::Upload,
+                total_keys: 2,
+                total_bytes: 20,
+            },
+            0,
+        );
+        line.on_event(
+            ProgressEvent::KeyDone {
+                kind: PassKind::Upload,
+                key: "a.md".to_string(),
+                bytes: 10,
+                ok: true,
+            },
+            100,
+        );
+        let before = line.render();
+        assert!(before.contains("1/2"), "{before}");
+        line.on_event(ProgressEvent::PlanStart, 200);
+        line.on_event(
+            ProgressEvent::ListPage {
+                page: 2,
+                keys_so_far: 2000,
+            },
+            200,
+        );
+        line.on_event(ProgressEvent::PlanEnd, 200);
+        assert_eq!(
+            line.render(),
+            before,
+            "plan-phase events must not disturb an active executor frame"
+        );
+    }
+
+    // I42-line (W329): `PlanEnd` keeps the last frame state (the renderer
+    // prints it with a trailing newline, I42-finalize); foreign executor
+    // events never mutate `PlanProgressLine`.
+    #[test]
+    fn plan_line_plan_end_keeps_frame_and_ignores_executor_events() {
+        let mut line = PlanProgressLine::new();
+        line.on_event(ProgressEvent::ListPage {
+            page: 1,
+            keys_so_far: 1000,
+        });
+        line.on_event(ProgressEvent::PlanEnd);
+        assert_eq!(
+            line.render(),
+            "Listing     page 1  1000 keys",
+            "PlanEnd keeps the last frame state"
+        );
+
+        // foreign executor events do not mutate the plan line
+        line.on_event(ProgressEvent::PassStart {
+            kind: PassKind::Upload,
+            total_keys: 3,
+            total_bytes: 60,
+        });
+        line.on_event(ProgressEvent::KeyDone {
+            kind: PassKind::Upload,
+            key: "a.md".to_string(),
+            bytes: 20,
+            ok: true,
+        });
+        line.on_event(ProgressEvent::PassEnd {
+            kind: PassKind::Upload,
+        });
+        line.on_event(ProgressEvent::RunEnd {
+            executed: 1,
+            failed: 0,
+        });
+        assert_eq!(
+            line.render(),
+            "Listing     page 1  1000 keys",
+            "executor events must not mutate the plan line"
+        );
+
+        // a fresh line stays empty under only executor events
+        let mut fresh = PlanProgressLine::new();
+        fresh.on_event(ProgressEvent::PassStart {
+            kind: PassKind::Upload,
+            total_keys: 1,
+            total_bytes: 1,
+        });
+        assert_eq!(fresh.render(), "");
+    }
+
+    // I42-line (W328): `HeadsStart` arms heading mode with a 0/total frame;
+    // `HeadDone` advances the bar/percent; 100% fills the bar; a zero-total
+    // heading renders nothing (mirrors the executor zero-total policy).
+    #[test]
+    fn plan_line_heading_frames() {
+        let mut line = PlanProgressLine::new();
+        line.on_event(ProgressEvent::HeadsStart { total_keys: 100 });
+        assert_eq!(
+            line.render(),
+            "Heading     0/100  [--------]    0%",
+            "HeadsStart arms the 0/total frame"
+        );
+
+        line.on_event(ProgressEvent::HeadDone {
+            done: 40,
+            total_keys: 100,
+        });
+        assert_eq!(
+            line.render(),
+            "Heading     40/100  [===>----]   40%",
+            "40/100 renders the bar + percent"
+        );
+
+        line.on_event(ProgressEvent::HeadDone {
+            done: 100,
+            total_keys: 100,
+        });
+        assert_eq!(
+            line.render(),
+            "Heading     100/100  [========]  100%",
+            "100% fills the bar"
+        );
+
+        // zero-total heading renders empty (W328, executor zero-total policy)
+        let mut zero = PlanProgressLine::new();
+        zero.on_event(ProgressEvent::HeadsStart { total_keys: 0 });
+        assert_eq!(zero.render(), "");
+        zero.on_event(ProgressEvent::HeadDone {
+            done: 0,
+            total_keys: 0,
+        });
+        assert_eq!(zero.render(), "");
+    }
+
+    // I42-line (W327): the plan-phase line machine renders cumulative
+    // listing frames. Empty until the first `ListPage` (PlanStart alone stays
+    // blank, W327 lock); each `ListPage` updates the frame in place; no byte
+    // rate / ETA substrings on the plan phase (I42-line).
+    #[test]
+    fn plan_line_listing_frames_are_cumulative() {
+        let mut line = PlanProgressLine::new();
+        assert_eq!(line.render(), "", "empty line machine renders empty");
+
+        line.on_event(ProgressEvent::PlanStart);
+        assert_eq!(
+            line.render(),
+            "",
+            "PlanStart alone stays blank until the first ListPage (W327 lock)"
+        );
+
+        line.on_event(ProgressEvent::ListPage {
+            page: 1,
+            keys_so_far: 1000,
+        });
+        assert_eq!(line.render(), "Listing     page 1  1000 keys");
+
+        line.on_event(ProgressEvent::ListPage {
+            page: 2,
+            keys_so_far: 2000,
+        });
+        assert_eq!(line.render(), "Listing     page 2  2000 keys");
+
+        let r = line.render();
+        assert!(!r.contains("B/s"), "no rate on plan phase: {r}");
+        assert!(!r.contains("ETA"), "no ETA on plan phase: {r}");
+    }
+
     // I27-api: the default sink accepts every variant and does nothing.
     #[test]
     fn no_progress_accepts_events() {
@@ -1219,5 +1783,87 @@ mod tests {
         assert_eq!(format_eta(3661.0), "1:01:01");
         // just below an hour stays `m:ss` (the m:ss -> h:mm:ss transition)
         assert_eq!(format_eta(3599.4), "59:59");
+    }
+
+    // I42-finalize (W369, H1 RED): `finish_plan` called through `Box<dyn
+    // Progress>` - the exact dispatch boundary the CLI uses - must finalize a
+    // partial plan bar (no `PlanEnd`) with a newline. Today the trait default
+    // no-op leaves only `\r` refreshes with no trailing newline, so the
+    // finalize assertions fail (RED). This is characterization-GREEN on the
+    // W370 trait override.
+    #[test]
+    fn finish_plan_via_dyn_progress_finalizes_partial_bar() {
+        let mut buf = Vec::new();
+        {
+            let boxed: Box<dyn Progress> = Box::new(TermProgress::new(&mut buf));
+            boxed.event(ProgressEvent::PlanStart);
+            boxed.event(ProgressEvent::ListPage {
+                page: 1,
+                keys_so_far: 1000,
+            });
+            boxed.event(ProgressEvent::ListPage {
+                page: 2,
+                keys_so_far: 2000,
+            });
+            // belt-and-braces finalize with NO PlanEnd (mid-cold failure)
+            boxed.finish_plan();
+            // second finalize must be idempotent (no extra newline)
+            boxed.finish_plan();
+        }
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("Listing"), "last frame state: {s:?}");
+        assert!(s.contains("2000 keys"), "latest frame content: {s:?}");
+        assert!(
+            s.ends_with("\x1b[K\n"),
+            "finalize must clear then newline: {s:?}"
+        );
+        assert_eq!(
+            s.matches('\r').count(),
+            3,
+            "two refreshes + one finalize frame: {s:?}"
+        );
+        assert_eq!(
+            s.matches('\n').count(),
+            1,
+            "exactly one finalize newline (idempotent): {s:?}"
+        );
+    }
+
+    // I42-finalize (W369 characterization): after a success-path `PlanEnd`
+    // (which writes its own newline), a subsequent belt-and-braces
+    // `finish_plan` is a no-op - still a single plan-line newline.
+    #[test]
+    fn plan_end_then_finish_plan_is_idempotent() {
+        let mut buf = Vec::new();
+        {
+            let boxed: Box<dyn Progress> = Box::new(TermProgress::new(&mut buf));
+            boxed.event(ProgressEvent::PlanStart);
+            boxed.event(ProgressEvent::ListPage {
+                page: 1,
+                keys_so_far: 1000,
+            });
+            boxed.event(ProgressEvent::PlanEnd);
+            boxed.finish_plan(); // belt-and-braces after success: no-op
+        }
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s.matches('\n').count(), 1, "single plan newline: {s:?}");
+        assert!(s.ends_with("\x1b[K\n"), "{s:?}");
+    }
+
+    // I42-finalize (L1 fold): `PlanEnd` with an empty render (PlanStart only,
+    // no ListPage/HeadsStart) must still mark the plan finalized, so a later
+    // belt-and-braces `finish_plan` writes nothing extra rather than racing a
+    // future non-empty state.
+    #[test]
+    fn finish_plan_after_empty_plan_end_writes_nothing() {
+        let mut buf = Vec::new();
+        {
+            let boxed: Box<dyn Progress> = Box::new(TermProgress::new(&mut buf));
+            boxed.event(ProgressEvent::PlanStart);
+            boxed.event(ProgressEvent::PlanEnd);
+            boxed.finish_plan();
+        }
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s, "", "empty plan must render nothing: {s:?}");
     }
 }

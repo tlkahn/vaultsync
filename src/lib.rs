@@ -72,6 +72,33 @@ pub fn build_plan(
     ignore: &IgnoreSet,
     inventory: &crate::inventory::InventoryOpts,
 ) -> Result<PlanReport, Error> {
+    // I42-callers-no-sink: the no-sink wrapper behaves byte-identically to
+    // today (NoProgress emits nothing on the cold path).
+    build_plan_with_progress(
+        local,
+        store,
+        mode,
+        opts,
+        ignore,
+        inventory,
+        &crate::progress::NoProgress,
+    )
+}
+
+/// Like [`build_plan`] with a plan-phase progress sink threaded into the
+/// remote inventory load (issue 42, W347): cold ListHead planning emits
+/// `PlanStart`/`PlanEnd` (and `ListPage`/head events from the store's
+/// `list_with_progress`); warm planning emits nothing (I42-warm-events).
+/// The local walk emits no counters in v1 (I42-walk).
+pub fn build_plan_with_progress(
+    local: &LocalFs,
+    store: &dyn ObjectStore,
+    mode: Mode,
+    opts: &PlanOpts,
+    ignore: &IgnoreSet,
+    inventory: &crate::inventory::InventoryOpts,
+    progress: &dyn crate::progress::Progress,
+) -> Result<PlanReport, Error> {
     let (local_entities, walk_report) = local.list_report()?;
     // W235 (issue 45): the remote file set comes from the inventory facade
     // (warm manifest or live list+head), which also owns the reserved
@@ -79,8 +106,9 @@ pub fn build_plan(
     // aggregates the facade's warnings with its own into
     // `PlanReport.warnings` for the CLI to print - library code must not
     // write to process stderr. The base (source + files + etag) rides along
-    // for the commit path (D-plan-seam).
-    let remote = crate::inventory::load_remote_inventory(
+    // for the commit path (D-plan-seam). Issue 42: the progress sink is
+    // threaded into the facade (cold path only).
+    let remote = crate::inventory::load_remote_inventory_with_progress(
         store,
         inventory.mode,
         inventory
@@ -88,6 +116,7 @@ pub fn build_plan(
             .as_deref()
             .and_then(cache_paths)
             .as_ref(),
+        progress,
     )?;
     let mut warnings = remote.warnings;
     let remote_entities = remote.entities;
@@ -392,6 +421,108 @@ pub(crate) mod testutil {
     use std::sync::{Condvar, Mutex};
     use std::time::{Duration, Instant};
 
+    /// Offline stand-in for the S3 page loop (I42-pages, W340): wraps a
+    /// [`crate::store::mock::MemoryStore`] and `list_with_progress` chunks the
+    /// listed rows into pages of `page_size`, emitting one cumulative
+    /// `ListPage` per chunk (`keys_so_far` counts raw page rows, W342 lock),
+    /// then returns the full listing unchanged (like MemoryStore: no head
+    /// enrichment). Used by the store/inventory/CLI tests that need
+    /// `ListPage` emissions without network. The bare `list` path delegates
+    /// to the mock (no events), so warm/quiet pins stay clean.
+    pub(crate) struct FakePagingStore {
+        pub(crate) inner: crate::store::mock::MemoryStore,
+        page_size: usize,
+    }
+
+    impl FakePagingStore {
+        pub(crate) fn new(page_size: usize) -> Self {
+            FakePagingStore {
+                inner: crate::store::mock::MemoryStore::new(),
+                page_size: page_size.max(1),
+            }
+        }
+    }
+
+    impl crate::store::ObjectStore for FakePagingStore {
+        fn list(&self, prefix: &str) -> Result<crate::store::Listing, crate::error::Error> {
+            self.inner.list(prefix)
+        }
+        fn list_with_progress(
+            &self,
+            prefix: &str,
+            progress: &dyn crate::progress::Progress,
+        ) -> Result<crate::store::Listing, crate::error::Error> {
+            let listing = self.inner.list(prefix)?;
+            let mut keys_so_far: u64 = 0;
+            for (page, chunk) in (1_u32..).zip(listing.entities.chunks(self.page_size)) {
+                keys_so_far += chunk.len() as u64;
+                progress.event(crate::progress::ProgressEvent::ListPage { page, keys_so_far });
+            }
+            Ok(listing)
+        }
+        fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.head(key)
+        }
+        fn get_to(
+            &self,
+            key: &str,
+            w: &mut dyn std::io::Write,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime_ms: Option<u64>,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.put_from(key, r, size, mtime_ms)
+        }
+        fn put_from_with(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            opts: crate::store::PutOpts,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            // Delegate the conditional put to the inner mock (repair/commit
+            // use If-Match / If-None-Match on MANIFEST_KEY; the trait default
+            // would reject it loudly).
+            self.inner.put_from_with(key, r, size, opts)
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// I27/42 test double (W334 shared helper): records every event into a
+    /// `Mutex<Vec<ProgressEvent>>` (thread-safe for pool-driven emission,
+    /// I27-thread). Shared so exec, progress, inventory, and store tests use
+    /// ONE recording double instead of forking divergent copies (I42-
+    /// recording).
+    #[derive(Default)]
+    pub(crate) struct RecordingProgress {
+        events: std::sync::Mutex<Vec<crate::progress::ProgressEvent>>,
+    }
+
+    impl RecordingProgress {
+        pub(crate) fn new() -> Self {
+            RecordingProgress {
+                events: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        pub(crate) fn events(&self) -> Vec<crate::progress::ProgressEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::progress::Progress for RecordingProgress {
+        fn event(&self, ev: crate::progress::ProgressEvent) {
+            self.events.lock().unwrap().push(ev);
+        }
+    }
+
     /// Deterministic overlap rendezvous for concurrency gauges (I17-gauges).
     ///
     /// Single gauge pass per instance: `released` latches once the target
@@ -577,7 +708,7 @@ pub(crate) mod testutil {
             listing.entities = entities;
             // I20-heads: the test double stays sequential (concurrency 1) so
             // existing lib tests keep their deterministic head-attempt order.
-            crate::store::enrich_with_head_mtimes(self, listing, 1)
+            crate::store::enrich_with_head_mtimes(self, listing, 1, &crate::progress::NoProgress)
         }
         fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
             self.head_log.lock().unwrap().push(key.to_string());
@@ -889,6 +1020,153 @@ mod tests {
             dropped_keys,
             vec![".git/objects/aa", ".git/HEAD"],
             "dropped order wrong"
+        );
+    }
+
+    // I42-warm (W348): warm build_plan_with_progress stays silent - the
+    // recording is empty and the report source is Manifest (W236 remains a
+    // CLI concern only; the library never prints it).
+    #[test]
+    fn warm_build_plan_with_progress_silent() {
+        let dir = TempDir::new("vaultsync-lib-test");
+        std::fs::write(dir.join("a.md"), "aaa").unwrap();
+        let local = LocalFs::new(dir.path());
+        let (local_entities, _) = local.list_report().unwrap();
+        let files: Vec<Entity> = local_entities
+            .iter()
+            .filter(|e| !e.is_folder())
+            .cloned()
+            .collect();
+        let store = MemoryStore::new();
+        let m = crate::manifest::file_entities_to_manifest(&files, 0, None, None).unwrap();
+        let body = crate::manifest::serialize_manifest(&m).unwrap();
+        let body_len = body.len() as u64;
+        let mut c = std::io::Cursor::new(body);
+        store
+            .put_from(crate::local::MANIFEST_KEY, &mut c, body_len, None)
+            .unwrap();
+        let prog = crate::testutil::RecordingProgress::new();
+        let report = build_plan_with_progress(
+            &local,
+            &store,
+            Mode::Status,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::default(),
+            &prog,
+        )
+        .unwrap();
+        assert!(
+            prog.events().is_empty(),
+            "warm build_plan must be silent: {:?}",
+            prog.events()
+        );
+        assert!(
+            matches!(
+                report.inventory_base.source,
+                crate::inventory::InventorySource::Manifest { .. }
+            ),
+            "source must be Manifest"
+        );
+    }
+
+    // I42 (W360): a hard head error during a cold build_plan_with_progress
+    // still fails closed with the same error class; no partial plan, no
+    // PlanEnd bracket (mid-cold failure - the CLI finalizes defensively).
+    #[test]
+    fn i15_fail_closed_with_progress() {
+        use crate::progress::ProgressEvent;
+        let dir = TempDir::new("vaultsync-lib-test");
+        std::fs::write(dir.join("a.md"), "aaa").unwrap();
+        let local = LocalFs::new(dir.path());
+        // S3LikeListStore degrades the listing and runs the REAL enrichment
+        // (heads), unlike bare MemoryStore - so a head failure is observable.
+        let mut store = crate::testutil::S3LikeListStore::new();
+        let mut c = std::io::Cursor::new(b"rrr".to_vec());
+        store
+            .inner()
+            .put_from("r.md", &mut c, 3, Some(1_600_000_000_000))
+            .unwrap();
+        store.fail_head("r.md");
+        let prog = crate::testutil::RecordingProgress::new();
+        let err = build_plan_with_progress(
+            &local,
+            &store,
+            Mode::Pull,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+            &prog,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::Unavailable(_)),
+            "I15 fail-closed error class unchanged: {err:?}"
+        );
+        let events = prog.events();
+        assert!(matches!(events.first(), Some(ProgressEvent::PlanStart)));
+        assert!(
+            !events.iter().any(|e| matches!(e, ProgressEvent::PlanEnd)),
+            "no PlanEnd on mid-cold failure: {events:?}"
+        );
+    }
+
+    // I42 (W347): build_plan_with_progress forwards the sink on the cold
+    // path (PlanStart..PlanEnd with ListPage from a paging store) and the
+    // no-sink wrapper equals it under NoProgress on plan/warnings/source.
+    #[test]
+    fn build_plan_with_progress_forwards_sink_and_wrapper_matches() {
+        use crate::progress::ProgressEvent;
+        let dir = TempDir::new("vaultsync-lib-test");
+        std::fs::write(dir.join("a.md"), "aaa").unwrap();
+        let local = LocalFs::new(dir.path());
+        let store = crate::testutil::FakePagingStore::new(2);
+        let mut c = std::io::Cursor::new(b"rrr".to_vec());
+        store
+            .inner
+            .put_from("r.md", &mut c, 3, Some(1_600_000_000_000))
+            .unwrap();
+        let prog = crate::testutil::RecordingProgress::new();
+        let report = build_plan_with_progress(
+            &local,
+            &store,
+            Mode::Status,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+            &prog,
+        )
+        .unwrap();
+        let events = prog.events();
+        assert!(matches!(events.first(), Some(ProgressEvent::PlanStart)));
+        assert!(matches!(events.last(), Some(ProgressEvent::PlanEnd)));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::ListPage { .. })),
+            "paging store emits ListPage through build_plan_with_progress: {events:?}"
+        );
+
+        // no-sink wrapper equals with-progress under NoProgress
+        let report2 = build_plan(
+            &local,
+            &store,
+            Mode::Status,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap();
+        assert_eq!(report.plan, report2.plan);
+        assert_eq!(report.warnings, report2.warnings);
+        assert_eq!(report.inventory_base.source, report2.inventory_base.source);
+        assert_eq!(
+            report.inventory_base.file_entities,
+            report2.inventory_base.file_entities
+        );
+        assert_eq!(
+            report.inventory_base.manifest_etag,
+            report2.inventory_base.manifest_etag
         );
     }
 
