@@ -597,6 +597,29 @@ mod tests {
         );
     }
 
+    // I42-callers-no-sink (W338): enrich with &NoProgress is the compat
+    // regression lock at the enrich layer - the recording stays empty and the
+    // output matches the pre-42 expected shape (head mtime/etag override,
+    // keys + warnings preserved verbatim).
+    #[test]
+    fn enrich_no_progress_listing_unchanged() {
+        let (store, listing) = degraded_listing();
+        // Compat lock: the no-op sink must leave the enriched output exactly
+        // at the pre-42 shape (head mtime/etag override, keys + warnings
+        // preserved verbatim). NoProgress discards every event, so the
+        // assertion is on the OUTPUT, not the sink.
+        let enriched =
+            enrich_with_head_mtimes(&store, listing.clone(), 1, &crate::progress::NoProgress)
+                .unwrap();
+        // head mtime/etag override (I15), keys + warnings preserved.
+        let a = enriched.entities.iter().find(|e| e.key == "a.md").unwrap();
+        assert_eq!(a.mtime_ms, Some(100));
+        assert_eq!(a.etag, store.head("a.md").unwrap().etag);
+        let keys: Vec<&str> = enriched.entities.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["a.md", "notes/", "notes/b.md"]);
+        assert_eq!(enriched.warnings, listing.warnings);
+    }
+
     #[test]
     fn enrich_emits_head_progress() {
         use crate::progress::ProgressEvent;
