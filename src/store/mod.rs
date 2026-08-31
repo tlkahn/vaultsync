@@ -226,7 +226,11 @@ pub trait ObjectStore: Send + Sync {
 /// still fails the whole listing - no partial entities, no vanished warning
 /// (the warning is built on the success path only). In the POOLED path
 /// in-flight heads are not cancelled when a sibling fails: extra completed
-/// requests are accepted (documented, no-cancellation behavior).
+/// requests are accepted (documented, no-cancellation behavior). In the pooled
+/// path `HeadDone` progress is emitted LIVE from each worker as its attempt
+/// completes (W374) - so the Heading bar advances during the fan-out - while the
+/// merge loop keeps results in listing order and does not re-emit (totals stay
+/// exactly N `HeadDone` for N object rows; order may interleave).
 pub(crate) fn enrich_with_head_mtimes<S: ObjectStore + ?Sized>(
     store: &S,
     listing: Listing,
@@ -291,7 +295,24 @@ pub(crate) fn enrich_with_head_mtimes<S: ObjectStore + ?Sized>(
         // (extra completed requests accepted - documented pooled behavior).
         let object_rows: Vec<&Entity> =
             listing.entities.iter().filter(|e| !e.is_folder()).collect();
-        let results = crate::pool::run_bounded(concurrency, &object_rows, |e| store.head(&e.key));
+        // I42-heads (W374, H2): emit HeadDone LIVE from each worker as its
+        // head attempt completes (Ok, NotFound, or hard Err) so the Heading bar
+        // advances during the multi-minute fan-out, not only after the join.
+        // `done` is a monotonic AtomicU32 -> a permutation of 1..=N (order may
+        // interleave, matching the HeadDone contract). The merge loop below
+        // does NOT re-emit (would double-count). Hard-Err attempts still get a
+        // HeadDone - the bar reflects attempts completed; I15 still fails
+        // closed at the merge on the listing-order first hard error.
+        let heads_done = std::sync::atomic::AtomicU32::new(0);
+        let results = crate::pool::run_bounded(concurrency, &object_rows, |e| {
+            let result = store.head(&e.key);
+            let done = heads_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            progress.event(crate::progress::ProgressEvent::HeadDone {
+                done,
+                total_keys: object_rows_total,
+            });
+            result
+        });
         let mut results = results.into_iter();
         for e in listing.entities {
             if e.is_folder() {
@@ -314,11 +335,8 @@ pub(crate) fn enrich_with_head_mtimes<S: ObjectStore + ?Sized>(
                 }
                 Err(err) => return Err(err),
             }
-            heads_done += 1;
-            progress.event(crate::progress::ProgressEvent::HeadDone {
-                done: heads_done,
-                total_keys: object_rows_total,
-            });
+            // HeadDone already emitted inside the worker (W374) - do not
+            // re-emit here (that would double-count).
         }
     }
     if let Some(msg) = vanished_warning(&vanished) {
@@ -593,6 +611,153 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), 20, "done values 1..=20 each once: {done:?}");
         assert_eq!(enriched.entities.len(), 20, "no vanishes");
+    }
+
+    // I42-heads (W373, H2 RED): a progress sink that NOTIFIES on each
+    // completion, plus a head that blocks the LAST key until it has observed
+    // (N-1) HeadDone. Under today's join-then-burst emission the last head
+    // never sees a live HeadDone before the fan-out joins (it times out and
+    // `observed_before_join` stays false => RED). After W374 the workers emit
+    // HeadDone as each attempt completes, so the last head observes N-1 live
+    // HeadDone before it returns => GREEN.
+    #[test]
+    fn enrich_concurrent_headdone_streams_before_join() {
+        use crate::progress::ProgressEvent;
+        let inner = MemoryStore::new();
+        for i in 1..=8 {
+            let mut c = std::io::Cursor::new(b"x".to_vec());
+            inner
+                .put_from(&format!("f{i}.md"), &mut c, 1, Some(1000 + i as u64))
+                .unwrap();
+        }
+        let listing = inner.list("").unwrap();
+        let last_key = listing.entities.last().unwrap().key.clone();
+        let progress = std::sync::Arc::new(NotifyHeadProgress::new());
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let store = BlockingLastHeadStore {
+            inner,
+            last_key,
+            progress: progress.clone(),
+            target_headdone: 7, // N-1 for N=8
+            observed_before_join: observed.clone(),
+        };
+        let result = enrich_with_head_mtimes(&store, listing, 4, progress.as_ref());
+        result.expect("all heads succeed");
+        assert!(
+            observed.load(std::sync::atomic::Ordering::Relaxed),
+            "HeadDone must stream live before run_bounded joins (H2)"
+        );
+        // final totals: HeadsStart{8} first, then exactly 8 HeadDone covering
+        // 1..=8 (order is a permutation under concurrency > 1).
+        let evs = progress.events();
+        assert!(matches!(
+            evs[0],
+            ProgressEvent::HeadsStart { total_keys: 8 }
+        ));
+        let mut dones: Vec<u32> = Vec::new();
+        for e in &evs[1..] {
+            match e {
+                ProgressEvent::HeadDone { done, total_keys } => {
+                    assert_eq!(*total_keys, 8);
+                    dones.push(*done);
+                }
+                other => panic!("expected HeadDone, got {other:?}"),
+            }
+        }
+        assert_eq!(dones.len(), 8, "exactly 8 HeadDone");
+        dones.sort();
+        dones.dedup();
+        assert_eq!(dones, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    /// W373 recording sink that NOTIFIES a condvar on every event (so a
+    /// blocking head can wait on live HeadDone instead of polling).
+    struct NotifyHeadProgress {
+        events: std::sync::Mutex<Vec<crate::progress::ProgressEvent>>,
+        cv: std::sync::Condvar,
+    }
+    impl NotifyHeadProgress {
+        fn new() -> Self {
+            NotifyHeadProgress {
+                events: std::sync::Mutex::new(Vec::new()),
+                cv: std::sync::Condvar::new(),
+            }
+        }
+        fn events(&self) -> Vec<crate::progress::ProgressEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+    impl crate::progress::Progress for NotifyHeadProgress {
+        fn event(&self, ev: crate::progress::ProgressEvent) {
+            let mut e = self.events.lock().unwrap();
+            e.push(ev);
+            self.cv.notify_all();
+        }
+    }
+
+    /// W373 double: `head` delegates for every key except `last_key`, which
+    /// blocks (bounded `wait_timeout`) until `target_headdone` live `HeadDone`
+    /// events have been observed on the shared sink - proving emission happens
+    /// BEFORE `run_bounded` joins. Sets the shared `observed_before_join` flag
+    /// on success; on timeout it still completes (no suite hang) with the flag
+    /// false, which is the RED assertion for today's join-then-burst code.
+    struct BlockingLastHeadStore {
+        inner: MemoryStore,
+        last_key: String,
+        progress: std::sync::Arc<NotifyHeadProgress>,
+        target_headdone: u32,
+        observed_before_join: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl crate::store::ObjectStore for BlockingLastHeadStore {
+        fn list(&self, prefix: &str) -> Result<crate::store::Listing, crate::error::Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
+            if key != self.last_key {
+                return self.inner.head(key);
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+            let mut ev = self.progress.events.lock().unwrap();
+            loop {
+                let n = ev
+                    .iter()
+                    .filter(|e| matches!(e, crate::progress::ProgressEvent::HeadDone { .. }))
+                    .count();
+                if n as u32 >= self.target_headdone {
+                    self.observed_before_join
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    self.observed_before_join
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+                let (g, _) = self.progress.cv.wait_timeout(ev, deadline - now).unwrap();
+                ev = g;
+            }
+            self.inner.head(key)
+        }
+        fn get_to(
+            &self,
+            key: &str,
+            w: &mut dyn std::io::Write,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime_ms: Option<u64>,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.put_from(key, r, size, mtime_ms)
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
+            self.inner.delete(key)
+        }
     }
 
     // I42-heads (W336): a NotFound vanish still advances `HeadDone` (the

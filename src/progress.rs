@@ -71,8 +71,11 @@ pub enum ProgressEvent {
     /// non-folder). Skipped when there are zero object rows.
     HeadsStart { total_keys: u32 },
     /// Issue 42 (I42-heads): one object head completed (`done` is 1..=total,
-    /// success or NotFound-vanish). Under concurrency > 1 the order may
-    /// interleave; totals are pinned, not order.
+    /// success or NotFound-vanish). Emitted LIVE as each attempt completes -
+    /// including under concurrency > 1 (from the pool workers, W374) - so the
+    /// Heading bar advances during the fan-out rather than only after it.
+    /// `done` values are a permutation of 1..=total (order may interleave);
+    /// totals are pinned, not order. The merge loop does not re-emit.
     HeadDone { done: u32, total_keys: u32 },
     /// Issue 42 (I42-finalize): the cold inventory finished (success path).
     /// The renderer finalizes the plan frame with a newline here; the CLI
