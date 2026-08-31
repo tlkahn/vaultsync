@@ -834,6 +834,7 @@ time vaultsync status    # expect only inventory: manifest (N entries) for inven
 | Date | Change |
 | --- | --- |
 | 2026-08-31 | Initial plan against tip `8f13f1b` (612 offline tests), issue body finalized same day. W325-W368. Locks I42-* including events-on-ProgressEvent, list_with_progress additive API, PlanProgressLine, repair+build_plan dual call sites, walk counters deferred, std-only. |
+| 2026-08-31 | PR51-r1 fix series planned (W369-W384) for review 5478749681 + CI run 33394432270: `finish_plan` trait override; live concurrent `HeadDone`; restore W196 `#[test]`; FakePagingStore 1-based zip; `cargo fmt`. See pr-51-fix-5478749681.md. |
 
 ---
 

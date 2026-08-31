@@ -121,6 +121,16 @@ push/pull (no byte rate/ETA - there is no byte stream yet). They are
 line (below) so a mid-line bar can never collide with it - including on
 error paths, where the partial bar is cleared defensively.
 
+- **Heading is live head-by-head:** under `[transfer].concurrency > 1` the
+  `Heading D/T` still advances as each head **completes** (emitted from the
+  pool workers, not only after the fan-out joins); `D` order may interleave
+  across workers, but totals stay exact and the bar reaches `T/T` when all
+  object heads are done.
+- **Mid-cold failure finalize:** when the cold inventory fails before
+  `PlanEnd` (e.g. a head error), the CLI clears the partial bar via the
+  renderer's `finish_plan` belt-and-braces, so every later `warning:` / W236 /
+  `error:` line starts on a fresh line and no orphan `\r` frame survives.
+
 - **Coverage:** cold `status`, `push`, `pull`, `--dry-run`, and `repair`
   (repair has no executor phase at all - plan-phase only).
 - **Warm runs are silent:** a warm manifest load emits zero plan-phase

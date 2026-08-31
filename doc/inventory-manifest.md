@@ -331,7 +331,10 @@ path only (warm loads emit zero plan-phase events). The pure
 `\r` frames never collide. S3 emits one `ListPage` per `ListObjectsV2` page
 (keys_so_far = cumulative raw contents count, `max_keys` stays 1000) and the
 head enrichment emits `HeadsStart`/`HeadDone` per object (folder views never
-headed).
+headed). Under `[transfer].concurrency > 1` the `HeadDone` are emitted live
+from the pool workers as each head completes - order may interleave, totals
+stay exact - so the `Heading` bar advances during the fan-out rather than
+only after it (issue 42 fix pass, H2).
 
 ---
 
