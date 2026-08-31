@@ -135,15 +135,18 @@ impl ProgressLine {
     /// Fold one executor event. Time (`now_ms`) is injected so tests never
     /// touch a wall clock (I27-rate). `PassStart` resets the counters for the
     /// new pass; `KeyDone`/`PassEnd` for the current pass update them;
-    /// `RunEnd` and foreign-kind events are ignored.
+    /// `RunEnd` and foreign-kind events are ignored. The injected clock only
+    /// advances on ACCEPTED events (W330): foreign/plan-phase events leave
+    /// the line machine byte-identical, so `render()` after them equals the
+    /// previous executor state exactly.
     pub fn on_event(&mut self, ev: ProgressEvent, now_ms: u64) {
-        self.now_ms = now_ms;
         match ev {
             ProgressEvent::PassStart {
                 kind,
                 total_keys,
                 total_bytes,
             } => {
+                self.now_ms = now_ms;
                 self.pass = Some(kind);
                 self.total_keys = total_keys;
                 self.total_bytes = total_bytes;
@@ -159,6 +162,7 @@ impl ProgressLine {
                 ok,
             } => {
                 if self.pass == Some(kind) {
+                    self.now_ms = now_ms;
                     self.done += 1;
                     // I27-bytes (policy B, PR 28 r1 F1): failed keys still
                     // advance the key count but only successful bytes
@@ -1170,6 +1174,72 @@ mod tests {
             ProgressEvent::PlanEnd => {}
             _ => panic!("wrong variant"),
         }
+    }
+
+    // I42-line (W330): the executor `ProgressLine` ignores plan-phase
+    // variants - state unchanged, and an active executor frame survives them
+    // intact (symmetric with `PlanProgressLine` ignoring executor events,
+    // W329).
+    #[test]
+    fn progress_line_ignores_plan_phase_events() {
+        let mut line = ProgressLine::new();
+        line.on_event(ProgressEvent::PlanStart, 0);
+        line.on_event(
+            ProgressEvent::ListPage {
+                page: 1,
+                keys_so_far: 1000,
+            },
+            0,
+        );
+        line.on_event(ProgressEvent::HeadsStart { total_keys: 5 }, 0);
+        line.on_event(
+            ProgressEvent::HeadDone {
+                done: 1,
+                total_keys: 5,
+            },
+            0,
+        );
+        line.on_event(ProgressEvent::PlanEnd, 0);
+        assert_eq!(
+            line.render(),
+            "",
+            "plan-phase events must not arm an executor frame"
+        );
+
+        // an active executor pass survives plan-phase events unchanged
+        line.on_event(
+            ProgressEvent::PassStart {
+                kind: PassKind::Upload,
+                total_keys: 2,
+                total_bytes: 20,
+            },
+            0,
+        );
+        line.on_event(
+            ProgressEvent::KeyDone {
+                kind: PassKind::Upload,
+                key: "a.md".to_string(),
+                bytes: 10,
+                ok: true,
+            },
+            100,
+        );
+        let before = line.render();
+        assert!(before.contains("1/2"), "{before}");
+        line.on_event(ProgressEvent::PlanStart, 200);
+        line.on_event(
+            ProgressEvent::ListPage {
+                page: 2,
+                keys_so_far: 2000,
+            },
+            200,
+        );
+        line.on_event(ProgressEvent::PlanEnd, 200);
+        assert_eq!(
+            line.render(),
+            before,
+            "plan-phase events must not disturb an active executor frame"
+        );
     }
 
     // I42-line (W329): `PlanEnd` keeps the last frame state (the renderer
