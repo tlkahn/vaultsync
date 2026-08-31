@@ -951,6 +951,8 @@ pub(crate) fn resolve_cold_put_plan(
                                 let files =
                                     crate::manifest::manifest_to_file_entities(&their)
                                         .expect("parsed manifest maps cleanly");
+                                // N4: the carried files/count stay lock-step.
+                                debug_assert_eq!(files.len(), their.entries.len());
                                 Ok(ColdPlan::Adopt {
                                     etag: cond_etag,
                                     files,
@@ -1067,10 +1069,13 @@ pub enum EnsureOutcome {
         entry_count: usize,
     },
     Adopted {
-        etag: Option<String>,
+        /// Live manifest etag: this branch is present+etag-only, so the
+        /// adopted generation is a bare `String` (N1, PR50-r2) not an
+        /// `Option`.
+        etag: String,
         /// Parsed winner FILE set, carried so a warm refresh installs a
         /// complete base (PR50-r1 H1). `len() == entry_count` after
-        /// `manifest_to_file_entities` (asserted in debug/tests).
+        /// `manifest_to_file_entities` (debug_asserted, N4 PR50-r2).
         files: Vec<Entity>,
         entry_count: usize,
     },
@@ -1110,7 +1115,7 @@ pub fn ensure_remote_manifest(
             files,
             entry_count,
         } => Ok(EnsureOutcome::Adopted {
-            etag: Some(etag),
+            etag,
             files,
             entry_count,
         }),
@@ -1174,12 +1179,13 @@ pub(crate) fn apply_ensure_outcome(
             entry_count,
         } => {
             // H1: install the COMPLETE adopted snapshot, not the stale cold
-            // list view.
+            // list view. N4: the carried files/count must stay in lock-step.
+            debug_assert_eq!(files.len(), entry_count);
             base.file_entities = files;
             base.source = InventorySource::Manifest {
-                remote_etag: etag.clone(),
+                remote_etag: Some(etag.clone()),
             };
-            base.manifest_etag = etag;
+            base.manifest_etag = Some(etag);
             Some(EnsureApply::Adopted { entry_count })
         }
         EnsureOutcome::PreconditionFailed => None,
@@ -2840,7 +2846,7 @@ mod tests {
             } => (etag, files, entry_count),
             other => panic!("expected Adopted, got {other:?}"),
         };
-        assert_eq!(etag, live_etag);
+        assert_eq!(etag, live_etag.unwrap());
         assert_eq!(count, 1);
         let adopted_keys: Vec<&str> = files.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(
@@ -3209,7 +3215,7 @@ mod tests {
         // not left stale, and source/etag warm. Characterization pin.
         let mut base = cold_base(vec![crate::entity::file("a.md", 1, None)]);
         let outcome = EnsureOutcome::Adopted {
-            etag: Some("etag-x".to_string()),
+            etag: "etag-x".to_string(),
             files: vec![
                 crate::entity::file("a.md", 1, None),
                 crate::entity::file("c.md", 2, None),
