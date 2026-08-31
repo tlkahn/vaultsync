@@ -387,7 +387,13 @@ put manifest body to `.vaultsync/manifest/v1.json`
         cold resolve path ONLY - multi-writer safety is lost there (design
         note: manifest mode assumes an etag-capable backend)
       present with etag => GET + parse/validate the live body (H1-V, issue
-        48, F1):
+        48, F1/F1b): the conditional If-Match etag is the GET entity etag
+        when the validate probe returns one (the generation we validated,
+        matching the warm-load GET authority); a HEAD etag that DIFFERS from
+        the GET etag means another writer changed the object between HEAD
+        and GET - fail closed (Err; F2 policy decides abort/continue), never
+        If-Match a mixed pair. Oversize-pre-GET and tripped-writer heals
+        still If-Match the HEAD etag (no trustworthy GET body).
         VALID body => fold successes onto THEIR entries
           (apply(base.successes) onto their.file_entities) and If-Match
           THEIR etag - their untouched keys survive this commit (never a
