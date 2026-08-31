@@ -130,18 +130,102 @@ fn manifest_inventory(
 }
 
 /// Unconditional warm fetch (no cache): GET the manifest, parse, and serve.
+/// M2 (review 5472028291): the fetch heads first and streams through a
+/// capped writer, so a pathological/hostile object at MANIFEST_KEY cannot
+/// force a full download + peak RSS before refusal. An over-cap object is
+/// treated like a corrupt body (`Ok(None)` - the caller decides auto
+/// fallback vs strict error).
 fn try_load_manifest_fresh(store: &dyn ObjectStore) -> Result<Option<RemoteInventory>, Error> {
-    let mut buf = Vec::new();
-    let entity = match store.get_to(crate::local::MANIFEST_KEY, &mut buf) {
-        Ok(e) => e,
-        Err(Error::NotFound(_)) => return Ok(None),
-        Err(e) => return Err(e),
+    let (entity, buf) = match head_then_get_manifest(store, crate::manifest::MANIFEST_MAX_BYTES)? {
+        WarmFetch::Body(entity, buf) => (entity, buf),
+        // Absent OR over-cap: same "no valid manifest" signal the caller
+        // already handles for corrupt bodies.
+        WarmFetch::Absent | WarmFetch::OverCap(_) => return Ok(None),
     };
     let manifest = match crate::manifest::parse_manifest_bytes(&buf) {
         Ok(m) => m,
         Err(_) => return Ok(None), // corrupt: caller falls back / errors per mode
     };
     manifest_inventory(&manifest, entity.etag).map(Some)
+}
+
+/// Result of a warm manifest fetch attempt (M2, review 5472028291).
+/// `Absent` = NotFound; `OverCap` = present but above the soft cap
+/// (corrupt-like: Auto falls back, strict mode errors); `Body` = fetched
+/// bytes within cap.
+#[derive(Debug)]
+enum WarmFetch {
+    Absent,
+    // Message carried for diagnostics (unit tests read it today; W255
+    // surfaces it in the auto/strict strings). Unread in the lib build until
+    // then.
+    #[allow(dead_code)]
+    OverCap(String),
+    Body(crate::entity::Entity, Vec<u8>),
+}
+
+/// Warm manifest fetch (M2): HEAD MANIFEST_KEY first - refuse when the
+/// reported size already exceeds `cap` (cheap loud path, zero body bytes) -
+/// then GET through a [`CappedWriter`] so a lying or changing object cannot
+/// blow RSS. `Ok(Absent)` = NotFound; `Ok(OverCap)` = present but over the
+/// cap (head size or mid-stream); a non-NotFound fetch error still fails
+/// closed.
+fn head_then_get_manifest(store: &dyn ObjectStore, cap: u64) -> Result<WarmFetch, Error> {
+    let head = match store.head(crate::local::MANIFEST_KEY) {
+        Ok(e) => e,
+        Err(Error::NotFound(_)) => return Ok(WarmFetch::Absent),
+        Err(e) => return Err(e),
+    };
+    if head.size > cap {
+        return Ok(WarmFetch::OverCap(format!(
+            "manifest object is {} bytes, above the {} byte soft cap; refusing to download (run vaultsync repair to rebuild it)",
+            head.size, cap
+        )));
+    }
+    let mut writer = CappedWriter::new(cap);
+    match store.get_to(crate::local::MANIFEST_KEY, &mut writer) {
+        Ok(entity) => Ok(WarmFetch::Body(entity, writer.buf)),
+        Err(Error::NotFound(_)) => Ok(WarmFetch::Absent),
+        // The writer tripped mid-stream: over-cap (belt-and-braces).
+        Err(_) if writer.tripped => Ok(WarmFetch::OverCap(format!(
+            "manifest body exceeded the {cap} byte soft cap while streaming; refusing to use it (run vaultsync repair to rebuild it)"
+        ))),
+        Err(e) => Err(e),
+    }
+}
+
+/// Body writer for the warm manifest fetch (M2, review 5472028291): accepts
+/// up to `cap` bytes, then sets `tripped` and answers an io error so a
+/// hostile/lying object cannot force an unbounded buffer. Belt-and-braces
+/// behind the head size check in [`head_then_get_manifest`].
+struct CappedWriter {
+    buf: Vec<u8>,
+    cap: u64,
+    tripped: bool,
+}
+
+impl CappedWriter {
+    fn new(cap: u64) -> Self {
+        CappedWriter {
+            buf: Vec::new(),
+            cap,
+            tripped: false,
+        }
+    }
+}
+
+impl std::io::Write for CappedWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len() as u64 + data.len() as u64 > self.cap {
+            self.tripped = true;
+            return Err(std::io::Error::other("soft cap exceeded"));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Cache-aware warm fetch (W244, section 6.1 step 2a): with a cached remote
@@ -158,10 +242,13 @@ fn try_load_manifest_cached(
 ) -> Result<Option<RemoteInventory>, Error> {
     // Conditional attempt when we hold a remote etag.
     if let Some(etag) = read_cache_meta(cache).and_then(|m| m.remote_etag) {
-        let mut buf = Vec::new();
+        // M2 (review 5472028291): the conditional Body streams through a
+        // capped writer too - no extra head here (the conditional GET already
+        // round-tripped; a head would double every warm load's RTT).
+        let mut writer = CappedWriter::new(crate::manifest::MANIFEST_MAX_BYTES);
         match store.get_to_with(
             crate::local::MANIFEST_KEY,
-            &mut buf,
+            &mut writer,
             crate::store::GetOpts {
                 if_none_match_etag: Some(etag.clone()),
             },
@@ -176,7 +263,11 @@ fn try_load_manifest_cached(
                 // through to a fresh fetch below.
             }
             Ok(crate::store::GetOutcome::Body(entity)) => {
-                let manifest = match crate::manifest::parse_manifest_bytes(&buf) {
+                if writer.tripped {
+                    invalidate_cache(cache);
+                    return Ok(None);
+                }
+                let manifest = match crate::manifest::parse_manifest_bytes(&writer.buf) {
                     Ok(m) => m,
                     Err(_) => {
                         invalidate_cache(cache);
@@ -184,7 +275,7 @@ fn try_load_manifest_cached(
                     }
                 };
                 let inv = manifest_inventory(&manifest, entity.etag.clone())?;
-                fill_cache(cache, &buf, entity.etag);
+                fill_cache(cache, &writer.buf, entity.etag);
                 return Ok(Some(inv));
             }
             Err(Error::NotFound(_)) => {
@@ -192,20 +283,24 @@ fn try_load_manifest_cached(
                 return Ok(None);
             }
             // W245: any non-NotFound failure fails closed - never plan from
-            // the stale cache alone.
+            // the stale cache alone. The capped writer's own trip is
+            // over-cap (corrupt-like), not a store failure.
+            Err(_) if writer.tripped => {
+                invalidate_cache(cache);
+                return Ok(None);
+            }
             Err(e) => return Err(e),
         }
     }
     // No usable cache etag (or 304 with an invalidated body): unconditional
-    // fetch, then fill the cache with the fresh body + etag.
-    let mut buf = Vec::new();
-    let entity = match store.get_to(crate::local::MANIFEST_KEY, &mut buf) {
-        Ok(e) => e,
-        Err(Error::NotFound(_)) => {
+    // fetch (head-then-capped-GET, M2), then fill the cache with the fresh
+    // body + etag.
+    let (entity, buf) = match head_then_get_manifest(store, crate::manifest::MANIFEST_MAX_BYTES)? {
+        WarmFetch::Body(entity, buf) => (entity, buf),
+        WarmFetch::Absent | WarmFetch::OverCap(_) => {
             invalidate_cache(cache);
             return Ok(None);
         }
-        Err(e) => return Err(e),
     };
     let manifest = match crate::manifest::parse_manifest_bytes(&buf) {
         Ok(m) => m,
@@ -863,8 +958,10 @@ mod tests {
             fn list(&self, prefix: &str) -> Result<crate::store::Listing, Error> {
                 self.0.list(prefix)
             }
-            fn head(&self, key: &str) -> Result<Entity, Error> {
-                self.0.head(key)
+            fn head(&self, _key: &str) -> Result<Entity, Error> {
+                // A down store fails head too (M2 head-first fetch): the
+                // load must still fail closed, never silently plan empty.
+                Err(Error::Unavailable("store down".to_string()))
             }
             fn get_to(&self, _key: &str, _w: &mut dyn std::io::Write) -> Result<Entity, Error> {
                 Err(Error::Unavailable("store down".to_string()))
@@ -1142,6 +1239,158 @@ mod tests {
             }
             other => panic!("expected Written, got {other:?}"),
         }
+    }
+
+    /// Double whose `head` reports an over-cap manifest size WITHOUT any
+    /// body, and whose `get_to` PANICS: the M2 head-size refuse must prevent
+    /// any GET (zero body bytes is the contract; a panic is the loudest
+    /// proof).
+    struct NoGetOverCapStore {
+        inner: MemoryStore,
+    }
+    impl ObjectStore for NoGetOverCapStore {
+        fn list(&self, prefix: &str) -> Result<crate::store::Listing, Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<Entity, Error> {
+            if key == crate::local::MANIFEST_KEY {
+                return Ok(Entity {
+                    key: key.to_string(),
+                    size: crate::manifest::MANIFEST_MAX_BYTES + 1,
+                    mtime_ms: None,
+                    etag: Some("fake-etag".to_string()),
+                });
+            }
+            self.inner.head(key)
+        }
+        fn get_to(&self, _key: &str, _w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            panic!("M2: get_to must not be called when head already refuses (over cap)");
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime_ms: Option<u64>,
+        ) -> Result<Entity, Error> {
+            self.inner.put_from(key, r, size, mtime_ms)
+        }
+        fn delete(&self, key: &str) -> Result<(), Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// Double whose `head` LIES about the size (reports small) while `get_to`
+    /// streams a body above the cap: the capped writer must trip and refuse
+    /// (belt-and-braces behind the head check, M2).
+    struct LyingSizeStore {
+        inner: MemoryStore,
+    }
+    impl ObjectStore for LyingSizeStore {
+        fn list(&self, prefix: &str) -> Result<crate::store::Listing, Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<Entity, Error> {
+            if key == crate::local::MANIFEST_KEY {
+                return Ok(Entity {
+                    key: key.to_string(),
+                    size: 4,
+                    mtime_ms: None,
+                    etag: Some("fake-etag".to_string()),
+                });
+            }
+            self.inner.head(key)
+        }
+        fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            if key == crate::local::MANIFEST_KEY {
+                w.write_all(b"0123456789abcdef")?;
+                return Ok(Entity {
+                    key: key.to_string(),
+                    size: 16,
+                    mtime_ms: None,
+                    etag: Some("real-etag".to_string()),
+                });
+            }
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime_ms: Option<u64>,
+        ) -> Result<Entity, Error> {
+            self.inner.put_from(key, r, size, mtime_ms)
+        }
+        fn delete(&self, key: &str) -> Result<(), Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    #[test]
+    fn head_then_get_manifest_refuses_over_cap_without_get() {
+        // W253 (M2, review 5472028291): the warm fetch heads MANIFEST_KEY
+        // first and refuses when the reported size exceeds the soft cap -
+        // `get_to` is never called (the double panics).
+        let store = NoGetOverCapStore {
+            inner: MemoryStore::new(),
+        };
+        match head_then_get_manifest(&store, 8) {
+            Ok(WarmFetch::OverCap(msg)) => {
+                assert!(msg.contains("soft cap"), "msg: {msg}");
+            }
+            other => panic!("expected OverCap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn head_then_get_manifest_trips_on_lying_size() {
+        // W253 (M2, belt-and-braces): a store whose head lies about the size
+        // still cannot force an unbounded buffer - the capped writer trips
+        // mid-stream and the fetch refuses.
+        let store = LyingSizeStore {
+            inner: MemoryStore::new(),
+        };
+        match head_then_get_manifest(&store, 8) {
+            Ok(WarmFetch::OverCap(msg)) => {
+                assert!(msg.contains("soft cap"), "msg: {msg}");
+            }
+            other => panic!("expected OverCap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warm_auto_falls_back_when_head_over_cap() {
+        // W253 (M2, mode mapping): under Auto an over-cap manifest object is
+        // None-as-corrupt - the load falls back cold with the normative
+        // warning instead of failing the plan.
+        let store = NoGetOverCapStore {
+            inner: MemoryStore::new(),
+        };
+        let inv = load_remote_inventory(&store, InventoryMode::Auto, 1, None).unwrap();
+        assert_eq!(inv.base.source, InventorySource::LiveListHead);
+        assert!(
+            inv.warnings
+                .iter()
+                .any(|w| w.contains("missing or corrupt")),
+            "warnings: {:?}",
+            inv.warnings
+        );
+    }
+
+    #[test]
+    fn strict_manifest_mode_over_cap_is_invalid() {
+        // W253 (M2, mode mapping): under strict Manifest mode an over-cap
+        // object is Invalid - a hard error suggesting repair, never a cold
+        // fallback.
+        let store = NoGetOverCapStore {
+            inner: MemoryStore::new(),
+        };
+        let err = load_remote_inventory(&store, InventoryMode::Manifest, 1, None).unwrap_err();
+        assert!(
+            err.to_string().contains("requires a valid remote manifest"),
+            "err: {err}"
+        );
     }
 
     #[test]
