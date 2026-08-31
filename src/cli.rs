@@ -562,25 +562,14 @@ pub fn run_with_io(
                                 Ok(
                                     outcome @ (crate::inventory::EnsureOutcome::Written { .. }
                                     | crate::inventory::EnsureOutcome::Adopted { .. }),
-                                ) => match crate::inventory::apply_ensure_outcome(
-                                    &mut inventory_base,
-                                    outcome,
-                                )
-                                .expect("success outcomes always apply")
-                                {
-                                    crate::inventory::EnsureApply::Written { entry_count } => {
-                                        let _ = writeln!(
-                                            err,
-                                            "inventory: manifest bootstrap written ({entry_count} entries)"
-                                        );
-                                    }
-                                    crate::inventory::EnsureApply::Adopted { entry_count } => {
-                                        let _ = writeln!(
-                                            err,
-                                            "inventory: manifest bootstrap adopted (already present, {entry_count} entries)"
-                                        );
-                                    }
-                                },
+                                ) => {
+                                    let apply = crate::inventory::apply_ensure_outcome(
+                                        &mut inventory_base,
+                                        outcome,
+                                    )
+                                    .expect("success outcomes always apply");
+                                    print_ensure_apply(err, apply);
+                                }
                                 Ok(crate::inventory::EnsureOutcome::PreconditionFailed) => {
                                     let _ = writeln!(
                                         err,
@@ -713,6 +702,28 @@ fn inventory_mode_name(mode: crate::config::InventoryMode) -> &'static str {
         crate::config::InventoryMode::Auto => "auto",
         crate::config::InventoryMode::Manifest => "manifest",
         crate::config::InventoryMode::ListHead => "list_head",
+    }
+}
+
+/// Shared stderr line for a successful B1 bootstrap (PR50-r1 F3 / r2 N2,
+/// review 5476798257): one place for the Written/Adopted lines used by both
+/// push-time bootstrap and status `--write-manifest`. The library never
+/// writes stderr (W2); this is the CLI's single printer. Locked substrings:
+/// `inventory: manifest bootstrap written` / `... adopted (already present`.
+fn print_ensure_apply(err: &mut dyn Write, apply: crate::inventory::EnsureApply) {
+    match apply {
+        crate::inventory::EnsureApply::Written { entry_count } => {
+            let _ = writeln!(
+                err,
+                "inventory: manifest bootstrap written ({entry_count} entries)"
+            );
+        }
+        crate::inventory::EnsureApply::Adopted { entry_count } => {
+            let _ = writeln!(
+                err,
+                "inventory: manifest bootstrap adopted (already present, {entry_count} entries)"
+            );
+        }
     }
 }
 
@@ -865,22 +876,10 @@ fn dispatch_plan(
                         outcome @ (crate::inventory::EnsureOutcome::Written { .. }
                         | crate::inventory::EnsureOutcome::Adopted { .. }),
                     ) => {
-                        match crate::inventory::apply_ensure_outcome(&mut inventory_base, outcome)
-                            .expect("success outcomes always apply")
-                        {
-                            crate::inventory::EnsureApply::Written { entry_count } => {
-                                let _ = writeln!(
-                                    err,
-                                    "inventory: manifest bootstrap written ({entry_count} entries)"
-                                );
-                            }
-                            crate::inventory::EnsureApply::Adopted { entry_count } => {
-                                let _ = writeln!(
-                                    err,
-                                    "inventory: manifest bootstrap adopted (already present, {entry_count} entries)"
-                                );
-                            }
-                        }
+                        let apply =
+                            crate::inventory::apply_ensure_outcome(&mut inventory_base, outcome)
+                                .expect("success outcomes always apply");
+                        print_ensure_apply(err, apply);
                     }
                     // F0/F2: a lost conditional race aborts the push BEFORE
                     // any transfer - otherwise the final commit's H1 could
