@@ -556,37 +556,31 @@ pub fn run_with_io(
                                 &inventory_base,
                                 Some(&cache),
                             ) {
-                                Ok(crate::inventory::EnsureOutcome::Written {
-                                    etag,
-                                    entry_count,
-                                }) => {
-                                    inventory_base.source =
-                                        crate::inventory::InventorySource::Manifest {
-                                            remote_etag: etag.clone(),
-                                        };
-                                    inventory_base.manifest_etag = etag;
-                                    let _ = writeln!(
-                                        err,
-                                        "inventory: manifest bootstrap written ({entry_count} entries)"
-                                    );
-                                }
-                                Ok(crate::inventory::EnsureOutcome::Adopted {
-                                    etag,
-                                    entry_count,
-                                }) => {
-                                    inventory_base.source =
-                                        crate::inventory::InventorySource::Manifest {
-                                            remote_etag: etag.clone(),
-                                        };
-                                    inventory_base.manifest_etag = etag;
-                                    let _ = writeln!(
-                                        err,
-                                        "inventory: manifest bootstrap adopted (already present, {entry_count} entries)"
-                                    );
-                                }
-                                // Status: write is the op, so any failure
-                                // (PreconditionFailed OR Err) exits 1, and
-                                // never prints the continue-warm warning.
+                                // W301 (PR50-r1 H1/F3): status shares the same
+                                // refresh helper as push (no final commit on
+                                // status, but the base stays consistent).
+                                Ok(
+                                    outcome @ (crate::inventory::EnsureOutcome::Written { .. }
+                                    | crate::inventory::EnsureOutcome::Adopted { .. }),
+                                ) => match crate::inventory::apply_ensure_outcome(
+                                    &mut inventory_base,
+                                    outcome,
+                                )
+                                .expect("success outcomes always apply")
+                                {
+                                    crate::inventory::EnsureApply::Written { entry_count } => {
+                                        let _ = writeln!(
+                                            err,
+                                            "inventory: manifest bootstrap written ({entry_count} entries)"
+                                        );
+                                    }
+                                    crate::inventory::EnsureApply::Adopted { entry_count } => {
+                                        let _ = writeln!(
+                                            err,
+                                            "inventory: manifest bootstrap adopted (already present, {entry_count} entries)"
+                                        );
+                                    }
+                                },
                                 Ok(crate::inventory::EnsureOutcome::PreconditionFailed) => {
                                     let _ = writeln!(
                                         err,
@@ -864,25 +858,29 @@ fn dispatch_plan(
                 let cache = crate::inventory::CachePaths::new(vault);
                 match crate::inventory::ensure_remote_manifest(store, &inventory_base, Some(&cache))
                 {
-                    Ok(crate::inventory::EnsureOutcome::Written { etag, entry_count }) => {
-                        inventory_base.source = crate::inventory::InventorySource::Manifest {
-                            remote_etag: etag.clone(),
-                        };
-                        inventory_base.manifest_etag = etag;
-                        let _ = writeln!(
-                            err,
-                            "inventory: manifest bootstrap written ({entry_count} entries)"
-                        );
-                    }
-                    Ok(crate::inventory::EnsureOutcome::Adopted { etag, entry_count }) => {
-                        inventory_base.source = crate::inventory::InventorySource::Manifest {
-                            remote_etag: etag.clone(),
-                        };
-                        inventory_base.manifest_etag = etag;
-                        let _ = writeln!(
-                            err,
-                            "inventory: manifest bootstrap adopted (already present, {entry_count} entries)"
-                        );
+                    // W301 (PR50-r1 H1/F3): Written/Adopted share ONE refresh
+                    // helper. Adopted installs the complete winner file set,
+                    // so the final commit preserves concurrent keys (H1).
+                    Ok(
+                        outcome @ (crate::inventory::EnsureOutcome::Written { .. }
+                        | crate::inventory::EnsureOutcome::Adopted { .. }),
+                    ) => {
+                        match crate::inventory::apply_ensure_outcome(&mut inventory_base, outcome)
+                            .expect("success outcomes always apply")
+                        {
+                            crate::inventory::EnsureApply::Written { entry_count } => {
+                                let _ = writeln!(
+                                    err,
+                                    "inventory: manifest bootstrap written ({entry_count} entries)"
+                                );
+                            }
+                            crate::inventory::EnsureApply::Adopted { entry_count } => {
+                                let _ = writeln!(
+                                    err,
+                                    "inventory: manifest bootstrap adopted (already present, {entry_count} entries)"
+                                );
+                            }
+                        }
                     }
                     // F0/F2: a lost conditional race aborts the push BEFORE
                     // any transfer - otherwise the final commit's H1 could

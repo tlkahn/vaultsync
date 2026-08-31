@@ -841,9 +841,13 @@ pub(crate) enum ColdPlan {
     /// Present + etag: If-Match the live etag, with this final file set.
     Overwrite { files: Vec<Entity>, etag: String },
     /// Present + etag + VALID body: adopt without writing (B1 only; commit
-    /// with successes never returns this). No cache fill on Adopt.
+    /// with successes never returns this). No cache fill on Adopt. Carries
+    /// the parsed winner file set + entry count so a warm refresh installs a
+    /// COMPLETE base (PR50-r1 H1, review 5476323432). `etag` is `String`
+    /// because this branch is present+etag only (N1).
     Adopt {
-        etag: Option<String>,
+        etag: String,
+        files: Vec<Entity>,
         entry_count: usize,
     },
 }
@@ -905,10 +909,16 @@ pub(crate) fn resolve_cold_put_plan(
                     match crate::manifest::parse_manifest_bytes(&writer.buf) {
                         Ok(their) => match successes_opt {
                             // B1: a concurrent-valid manifest is adopted.
-                            None => Ok(ColdPlan::Adopt {
-                                etag: Some(live_etag),
-                                entry_count: their.entries.len(),
-                            }),
+                            None => {
+                                let files =
+                                    crate::manifest::manifest_to_file_entities(&their)
+                                        .expect("parsed manifest maps cleanly");
+                                Ok(ColdPlan::Adopt {
+                                    etag: live_etag,
+                                    files,
+                                    entry_count: their.entries.len(),
+                                })
+                            }
                             // Commit: fold successes onto THEIR entries so
                             // their untouched keys survive (F1 / W291).
                             Some(successes) => {
@@ -1017,6 +1027,10 @@ pub enum EnsureOutcome {
     },
     Adopted {
         etag: Option<String>,
+        /// Parsed winner FILE set, carried so a warm refresh installs a
+        /// complete base (PR50-r1 H1). `len() == entry_count` after
+        /// `manifest_to_file_entities` (asserted in debug/tests).
+        files: Vec<Entity>,
         entry_count: usize,
     },
     PreconditionFailed,
@@ -1049,7 +1063,16 @@ pub fn ensure_remote_manifest(
     let generator = format!("vaultsync {}", crate::version());
     match resolve_cold_put_plan(store, &base.file_entities, None)? {
         // Concurrent-valid manifest already present: adopt, never write.
-        ColdPlan::Adopt { etag, entry_count } => Ok(EnsureOutcome::Adopted { etag, entry_count }),
+        // The parsed file set rides along for a complete warm refresh (H1).
+        ColdPlan::Adopt {
+            etag,
+            files,
+            entry_count,
+        } => Ok(EnsureOutcome::Adopted {
+            etag: Some(etag),
+            files,
+            entry_count,
+        }),
         ColdPlan::Create { files } => write_bootstrap(
             store,
             &files,
@@ -1074,6 +1097,51 @@ pub fn ensure_remote_manifest(
             WriteCond::IfMatch(etag),
             cache,
         ),
+    }
+}
+
+/// What a successful B1 refresh applied to an inventory base (PR50-r1, W301):
+/// the caller prints the locked stderr line; the library never writes stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnsureApply {
+    Written { entry_count: usize },
+    Adopted { entry_count: usize },
+}
+
+/// Install a successful B1 outcome into an inventory base (PR50-r1 H1/F3,
+/// review 5476323432): `Written` warms etag/source only (`file_entities`
+/// already match the body WE wrote), `Adopted` ALSO replaces `file_entities`
+/// with the parsed winner snapshot so the final commit's warm fold preserves
+/// their untouched keys instead of clobbering them (H1). Takes `outcome` by
+/// value so `Adopted`'s files are moved, not cloned. Returns `None` for
+/// `PreconditionFailed` - that is a non-apply the caller decides policy for.
+pub(crate) fn apply_ensure_outcome(
+    base: &mut InventoryBase,
+    outcome: EnsureOutcome,
+) -> Option<EnsureApply> {
+    match outcome {
+        EnsureOutcome::Written { etag, entry_count } => {
+            base.source = InventorySource::Manifest {
+                remote_etag: etag.clone(),
+            };
+            base.manifest_etag = etag;
+            Some(EnsureApply::Written { entry_count })
+        }
+        EnsureOutcome::Adopted {
+            etag,
+            files,
+            entry_count,
+        } => {
+            // H1: install the COMPLETE adopted snapshot, not the stale cold
+            // list view.
+            base.file_entities = files;
+            base.source = InventorySource::Manifest {
+                remote_etag: etag.clone(),
+            };
+            base.manifest_etag = etag;
+            Some(EnsureApply::Adopted { entry_count })
+        }
+        EnsureOutcome::PreconditionFailed => None,
     }
 }
 
@@ -2588,12 +2656,22 @@ mod tests {
         // Cold base is STALE (has a, lacks b).
         let base = cold_base(vec![crate::entity::file("a.md", 5, Some(5))]);
         let out = ensure_remote_manifest(&store, &base, None).unwrap();
-        let (etag, count) = match out {
-            EnsureOutcome::Adopted { etag, entry_count } => (etag, entry_count),
+        let (etag, files, count) = match out {
+            EnsureOutcome::Adopted {
+                etag,
+                files,
+                entry_count,
+            } => (etag, files, entry_count),
             other => panic!("expected Adopted, got {other:?}"),
         };
         assert_eq!(etag, live_etag);
         assert_eq!(count, 1);
+        let adopted_keys: Vec<&str> = files.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            adopted_keys,
+            vec!["b.md"],
+            "adopt carries the winner file set"
+        );
         assert_eq!(store.manifest_puts(), 0, "adopt must not put");
         // Live body unchanged: still only b.md.
         let mut buf = Vec::new();
@@ -2601,6 +2679,64 @@ mod tests {
         let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
         let keys: Vec<&str> = m.entries.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(keys, vec!["b.md"]);
+    }
+
+    #[test]
+    fn commit_after_adopted_refresh_keeps_their_untouched_keys() {
+        // W299/W300 (PR50-r1 H1, review 5476323432): after B1 ADOPTS a
+        // concurrent-valid manifest, the warm refresh must install the
+        // ADOPTED file set so the final commit's warm fold preserves the
+        // winner's untouched keys (c.md) instead of clobbering them with the
+        // stale cold list snapshot. RED: today the Adopted outcome carries no
+        // file set and refresh only warms etag/source, so apply([a],
+        // [Upload(a')]) writes {a.md} and c.md is lost.
+        let store = MemoryStore::new();
+        // Live manifest authored by a concurrent winner: {a.md, c.md}. c.md
+        // exists ONLY in the manifest (never surfaces in list+head).
+        let their_body = manifest_body(&[("a.md", 1, None), ("c.md", 2, None)]);
+        let blen = their_body.len() as u64;
+        let mut c = std::io::Cursor::new(their_body);
+        let their_etag = store
+            .put_from(crate::local::MANIFEST_KEY, &mut c, blen, None)
+            .unwrap()
+            .etag;
+        // Cold base is STALE: list+head saw only a.md (c.md is manifest-only).
+        let base = cold_base(vec![crate::entity::file("a.md", 5, Some(5))]);
+        // B1 adopts the concurrent-valid manifest (W268); the outcome must
+        // carry the parsed winner file set for a complete warm refresh.
+        let out = ensure_remote_manifest(&store, &base, None).unwrap();
+        let (etag, adopted_files, entry_count) = match out {
+            EnsureOutcome::Adopted {
+                etag,
+                files,
+                entry_count,
+            } => (etag, files, entry_count),
+            other => panic!("expected Adopted, got {other:?}"),
+        };
+        assert_eq!(etag, their_etag);
+        assert_eq!(entry_count, 2);
+        // Production warm refresh post-W300: install the ADOPTED snapshot
+        // (files + source + etag). Today's etag-only refresh leaves
+        // file_entities stale == [a.md], which is the H1 bug.
+        let mut base = cold_base(adopted_files);
+        base.source = InventorySource::Manifest {
+            remote_etag: etag.clone(),
+        };
+        base.manifest_etag = etag;
+        // Push uploads a newer a.md; c.md is untouched by this run.
+        let upload = crate::entity::file("a.md", 6, Some(6));
+        let out = commit_manifest(&store, &base, &[CommitMutation::Upload(upload)], None).unwrap();
+        let (_, count) = match out {
+            CommitOutcome::Written { etag, entry_count } => (etag, entry_count),
+            other => panic!("expected Written, got {other:?}"),
+        };
+        assert_eq!(count, 2);
+        // The winner's untouched c.md must SURVIVE the final commit.
+        let mut buf = Vec::new();
+        store.get_to(crate::local::MANIFEST_KEY, &mut buf).unwrap();
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        let keys: Vec<&str> = m.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["a.md", "c.md"]);
     }
 
     #[test]
@@ -2721,5 +2857,67 @@ mod tests {
             !cache.body.exists(),
             "no cache body on Adopted (D-cache: no fill on adopt)"
         );
+    }
+
+    #[test]
+    fn apply_ensure_outcome_adopted_replaces_file_entities() {
+        // W301 (PR50-r1 H1/F3, review 5476323432): after an Adopted refresh,
+        // the base's file set is REPLACED by the winner snapshot (complete),
+        // not left stale, and source/etag warm. Characterization pin.
+        let mut base = cold_base(vec![crate::entity::file("a.md", 1, None)]);
+        let outcome = EnsureOutcome::Adopted {
+            etag: Some("etag-x".to_string()),
+            files: vec![
+                crate::entity::file("a.md", 1, None),
+                crate::entity::file("c.md", 2, None),
+            ],
+            entry_count: 2,
+        };
+        let apply = apply_ensure_outcome(&mut base, outcome).unwrap();
+        assert_eq!(apply, EnsureApply::Adopted { entry_count: 2 });
+        let keys: Vec<&str> = base.file_entities.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["a.md", "c.md"], "adopted snapshot installed");
+        assert_eq!(base.manifest_etag.as_deref(), Some("etag-x"));
+        assert_eq!(
+            base.source,
+            InventorySource::Manifest {
+                remote_etag: Some("etag-x".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn apply_ensure_outcome_written_preserves_file_entities() {
+        // W301 (PR50-r1 H1/F3): after a Written refresh the base set is
+        // UNCHANGED (it already equals the body we wrote); only source/etag
+        // warm. Characterization pin.
+        let mut base = cold_base(vec![
+            crate::entity::file("a.md", 1, None),
+            crate::entity::file("b.md", 2, None),
+        ]);
+        let outcome = EnsureOutcome::Written {
+            etag: Some("etag-y".to_string()),
+            entry_count: 2,
+        };
+        let apply = apply_ensure_outcome(&mut base, outcome).unwrap();
+        assert_eq!(apply, EnsureApply::Written { entry_count: 2 });
+        let keys: Vec<&str> = base.file_entities.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["a.md", "b.md"],
+            "written keeps existing file set"
+        );
+        assert_eq!(base.manifest_etag.as_deref(), Some("etag-y"));
+    }
+
+    #[test]
+    fn apply_ensure_outcome_precondition_failed_is_none() {
+        // W301 (PR50-r1 H1/F3): PreconditionFailed is a non-apply - the
+        // helper returns None and leaves the cold base untouched (callers
+        // decide policy: push aborts, status exits 1).
+        let mut base = cold_base(vec![crate::entity::file("a.md", 1, None)]);
+        assert!(apply_ensure_outcome(&mut base, EnsureOutcome::PreconditionFailed).is_none());
+        assert_eq!(base.source, InventorySource::LiveListHead);
+        assert!(base.manifest_etag.is_none());
     }
 }
