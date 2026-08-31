@@ -1091,6 +1091,38 @@ pub(crate) fn is_reserved_vaultsync_key_name(name: &str) -> bool {
     (name.starts_with('.') && name.contains(".vaultsync-tmp-")) || is_check_probe_name(name)
 }
 
+/// The vault-relative key of the remote inventory manifest (issue 45,
+/// D-key). Exact string; the single source of truth for readers, writers,
+/// and repair.
+pub const MANIFEST_KEY: &str = ".vaultsync/manifest/v1.json";
+
+/// Whether a vault-relative key is under the control-plane prefix: its FIRST
+/// path segment is exactly `.vaultsync` (file or folder form). Issue 45
+/// (D-reserved) extends the reserved namespace with any such key - local
+/// walk prune, remote partition, and the S3 pre-head partition all use this
+/// one predicate so the policies cannot drift. `notes/.vaultsync/x` is NOT
+/// control-plane (first segment `notes`); the probe/tmp names
+/// (`.vaultsync-check-*`, `.*.vaultsync-tmp-*`) are reserved by the existing
+/// final-segment rule (`is_reserved_vaultsync_key_name`), not by this rule.
+pub(crate) fn is_vaultsync_control_plane_key(key: &str) -> bool {
+    key.split('/').next() == Some(".vaultsync")
+}
+
+/// Whether a vault-relative remote key is reserved: control-plane first
+/// segment (`.vaultsync/**`, issue 45 D-reserved) OR the existing
+/// final-segment probe/tmp rule (W63/A-L3). The final-segment check strips
+/// one trailing `/` first (W109/L4 folder-form handling: a folder key's
+/// reserved segment sits behind the trailing slash).
+pub(crate) fn is_reserved_remote_key(key: &str) -> bool {
+    is_vaultsync_control_plane_key(key)
+        || key
+            .strip_suffix('/')
+            .unwrap_or(key)
+            .rsplit('/')
+            .next()
+            .is_some_and(is_reserved_vaultsync_key_name)
+}
+
 /// The directories `create_dir_all(parent)` will create (W66/A-L2): the chain
 /// from `parent` up to but excluding the deepest pre-existing ancestor, in
 /// deepest-first order (children before parents) so a later bottom-up
@@ -1230,6 +1262,17 @@ fn walk(
         // an invalid name must not abort the walk (P1r7-special-node-key).
         if ft.is_dir() {
             let key = format!("{}/", path_to_key(rel)?);
+            // W220 (issue 45): the control-plane directory `.vaultsync/`
+            // (first path segment exactly `.vaultsync`) is never walked or
+            // uploaded - the local cache lives there. Reserved-namespace
+            // stays FIRST and independent (D-filter-order): counted in
+            // `skipped_temp_files` (the reserved bucket), never as an ignore
+            // drop, and never recursed into. Nested `notes/.vaultsync/` is a
+            // normal user folder (first segment `notes`).
+            if crate::local::is_vaultsync_control_plane_key(&key) {
+                report.skipped_temp_files += 1;
+                continue;
+            }
             // D-prune (issue #32): a directory whose vault-relative key
             // matches an ignore pattern is pruned - no folder entity, no
             // recursion into it (descendants are never enumerated, so
@@ -1254,10 +1297,16 @@ fn walk(
                 report.skipped_temp_files += 1;
             } else {
                 let key = path_to_key(rel)?;
-                // Issue #32: a file whose vault-relative key matches an
-                // ignore pattern is skipped and counted (D-report: each
-                // ignored file counts 1).
-                if opts.ignore.matches(&key) {
+                // W220 (issue 45): a control-plane FILE whose key's first
+                // segment is `.vaultsync` (e.g. a stray `.vaultsync` file at
+                // the vault root) is skipped too - same rule as the
+                // directory prune, so the control plane never uploads.
+                if crate::local::is_vaultsync_control_plane_key(&key) {
+                    report.skipped_temp_files += 1;
+                } else if opts.ignore.matches(&key) {
+                    // Issue #32: a file whose vault-relative key matches an
+                    // ignore pattern is skipped and counted (D-report: each
+                    // ignored file counts 1).
                     report.skipped_ignored += 1;
                 } else if let Some(e) = file_entity(&path, &key)? {
                     out.push(e);
@@ -2765,6 +2814,93 @@ mod tests {
         let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(keys, vec!["note.md"], "check leftover listed: {keys:?}");
         assert_eq!(rep.skipped_temp_files, 1);
+    }
+
+    #[test]
+    fn walk_prunes_control_plane_directory() {
+        // W220 (issue 45): the control-plane directory `.vaultsync/` (first
+        // path segment exactly `.vaultsync`) is never walked or uploaded -
+        // the local cache lives there. Its contents (a cached manifest) must
+        // not be listed, and the prune is counted in the reserved bucket
+        // (`skipped_temp_files`), not as ignore drops. A nested
+        // `notes/.vaultsync/` user folder is NOT control-plane and stays
+        // listed (first-segment-only rule).
+        let dir = TempDir::new("vaultsync-test");
+        std::fs::create_dir_all(dir.join(".vaultsync/cache")).unwrap();
+        std::fs::write(dir.join(".vaultsync/cache/manifest-v1.json"), "{}").unwrap();
+        std::fs::write(dir.join(".vaultsync/other.txt"), "tool-state").unwrap();
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join("notes/a.md"), "real").unwrap();
+        std::fs::create_dir_all(dir.join("notes/.vaultsync")).unwrap();
+        std::fs::write(dir.join("notes/.vaultsync/x"), "user-file").unwrap();
+        let fs = LocalFs::new(dir.path());
+        let (ents, rep) = fs.list_report().unwrap();
+        let keys: Vec<&str> = ents.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "notes/",
+                "notes/.vaultsync/",
+                "notes/.vaultsync/x",
+                "notes/a.md"
+            ],
+            "control-plane files listed: {keys:?}"
+        );
+        assert!(
+            rep.skipped_temp_files >= 1,
+            "control-plane prune must count in the reserved bucket: {rep:?}"
+        );
+        assert_eq!(rep.skipped_ignored, 0, "not an ignore: {rep:?}");
+    }
+
+    #[test]
+    fn control_plane_key_first_segment_pins() {
+        // W219 (issue 45): the control-plane namespace is exactly the first
+        // path segment `.vaultsync` (file OR folder form). Anything deeper
+        // (`notes/.vaultsync/x`) is a normal user path; the check/probe
+        // names stay reserved via the EXISTING final-segment rule only.
+        let cases: &[(&str, bool)] = &[
+            (".vaultsync/manifest/v1.json", true),
+            (".vaultsync/cache/x", true),
+            (".vaultsync/", true),
+            (".vaultsync", true),
+            ("notes/.vaultsync/x", false),
+            (".vaultsync-check-1-2-3", false),
+            ("notes/a.md", false),
+        ];
+        for (key, want) in cases {
+            assert_eq!(
+                is_vaultsync_control_plane_key(key),
+                *want,
+                "control-plane classification for {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_remote_key_combines_control_plane_and_final_segment() {
+        // W219 (issue 45): the remote reserved predicate is the control-plane
+        // first-segment rule OR the existing final-segment rule (probe/tmp
+        // names, W63/A-L3). `.vaultsync-check-1-2-3` must stay reserved via
+        // the final-segment rule even though its first segment is not
+        // `.vaultsync` (the W109 folder-form handling is preserved too).
+        for key in [
+            ".vaultsync/manifest/v1.json",
+            ".vaultsync/cache/x",
+            ".vaultsync/",
+            ".vaultsync",
+            ".vaultsync-check-1-2-3",
+            ".vaultsync-check-1/",
+            ".a.md.vaultsync-tmp-1-2",
+        ] {
+            assert!(
+                is_reserved_remote_key(key),
+                "{key:?} must be reserved (control-plane or final-segment)"
+            );
+        }
+        for key in ["notes/.vaultsync/x", "notes/a.md", ".vaultsync-notes.md"] {
+            assert!(!is_reserved_remote_key(key), "{key:?} must NOT be reserved");
+        }
     }
 
     #[test]

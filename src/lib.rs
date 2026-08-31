@@ -9,7 +9,9 @@ pub mod error;
 pub mod exec;
 pub mod ignore;
 pub use ignore::IgnoreSet;
+pub mod inventory;
 pub mod local;
+pub mod manifest;
 pub mod plan;
 pub(crate) mod pool;
 pub mod progress;
@@ -35,6 +37,10 @@ pub struct PlanReport {
     pub plan: Plan,
     /// Advisory warnings about the inputs, printed by the CLI layer.
     pub warnings: Vec<String>,
+    /// The inventory base the CLI needs for a manifest commit after a
+    /// mutating run (issue 45, D-plan-seam): source, full pre-ignore remote
+    /// file set, and the manifest etag when the source was warm.
+    pub inventory_base: crate::inventory::InventoryBase,
 }
 
 /// Build a [`Plan`] from a local walk + a store listing.
@@ -64,36 +70,28 @@ pub fn build_plan(
     mode: Mode,
     opts: &PlanOpts,
     ignore: &IgnoreSet,
+    inventory: &crate::inventory::InventoryOpts,
 ) -> Result<PlanReport, Error> {
     let (local_entities, walk_report) = local.list_report()?;
-    // H1 (W99): the store listing carries its own warnings (e.g. dropped
-    // non-empty `*/` keys) in `Listing.warnings`; `build_plan` aggregates
-    // them with its own into `PlanReport.warnings` for the CLI to print -
-    // library code must not write to process stderr.
-    let listing = store.list("")?;
-    let mut warnings = listing.warnings;
-    let remote_entities = listing.entities;
-    // R4-M2: drop a remote empty key (the exact-prefix folder marker stripped
-    // to `""`) before validation. W34 removes it at the S3 backend source, but
-    // other backends could still surface one; an empty key is never a planned
-    // action. Every *other* invalid key stays fail-closed (R5-L1).
-    let remote_entities: Vec<_> = remote_entities
-        .into_iter()
-        .filter(|e| !e.key.is_empty())
-        .collect();
-    // W79/r9 L1: the reserved-namespace filter (W63/A-L3, R4-L4/W42 + W54/
-    // A-L2) is factored into a pure, unit-testable partition so the dropped
-    // keys can be counted and surfaced instead of vanishing silently. A
-    // crashed `check` (SIGKILL between probe put and delete) can leave a
-    // `.vaultsync-check-*` object remotely, and a tmp-sibling key
-    // (`.name.vaultsync-tmp-*`) can reach the store out-of-band; neither must
-    // ever plan a Download (which would materialize a reserved dotfile
-    // locally). Users must not create such keys (object-store.md reserved
-    // namespace), and now every run that encounters a leftover says so.
-    let (remote_entities, reserved_dropped) = partition_reserved_remote_keys(remote_entities);
-    if !reserved_dropped.is_empty() {
-        warnings.push(reserved_drops_warning(&reserved_dropped));
-    }
+    // W235 (issue 45): the remote file set comes from the inventory facade
+    // (warm manifest or live list+head), which also owns the reserved
+    // partition and the store-listing warnings. H1 (W99): `build_plan`
+    // aggregates the facade's warnings with its own into
+    // `PlanReport.warnings` for the CLI to print - library code must not
+    // write to process stderr. The base (source + files + etag) rides along
+    // for the commit path (D-plan-seam).
+    let remote = crate::inventory::load_remote_inventory(
+        store,
+        inventory.mode,
+        inventory
+            .vault_root
+            .as_deref()
+            .and_then(cache_paths)
+            .as_ref(),
+    )?;
+    let mut warnings = remote.warnings;
+    let remote_entities = remote.entities;
+    let inventory_base = remote.base;
     // Issue #33: the `IgnoreSet` filter (remote half of D-both-sides) runs
     // after the reserved partition - so a reserved leftover is never counted
     // as an ignore drop - and before `ensure_valid_key` / `plan()`, so an
@@ -150,7 +148,18 @@ pub fn build_plan(
         }
         p.stats = compute_stats(&p.actions);
     }
-    Ok(PlanReport { plan: p, warnings })
+    Ok(PlanReport {
+        plan: p,
+        warnings,
+        inventory_base,
+    })
+}
+
+/// Map an optional vault root to the S7 local-cache paths, or `None` when
+/// no vault root is threaded (cache disabled). The cache lives under
+/// `<vault_root>/.vaultsync/cache/` (issue 45, D-cache, W246).
+fn cache_paths(vault_root: &std::path::Path) -> Option<crate::inventory::CachePaths> {
+    Some(crate::inventory::CachePaths::new(vault_root))
 }
 
 /// Split remote entities into `(kept, dropped)` by the reserved vaultsync
@@ -166,19 +175,13 @@ pub(crate) fn partition_reserved_remote_keys(entities: Vec<Entity>) -> (Vec<Enti
     let mut kept = Vec::new();
     let mut dropped = Vec::new();
     for e in entities {
-        // W109/L4: a folder-form key's reserved segment sits behind the
-        // trailing `/` (`rsplit('/').next()` on `.vaultsync-check-1/` yields
-        // the empty string); strip one trailing `/` first, same shape as
-        // `fold_key`, so the filter's stated final-segment policy also holds
-        // for folder-shaped keys.
-        let reserved = e
-            .key
-            .strip_suffix('/')
-            .unwrap_or(&e.key)
-            .rsplit('/')
-            .next()
-            .is_some_and(crate::local::is_reserved_vaultsync_key_name);
-        if reserved {
+        // W109/L4 + W219 (issue 45): the shared `is_reserved_remote_key`
+        // covers BOTH the existing final-segment probe/tmp rule (with the
+        // folder-form trailing-`/` strip) and the new control-plane
+        // first-segment rule (`.vaultsync/**`) - one predicate so the local
+        // walk, the remote partition, and the S3 pre-head partition cannot
+        // drift.
+        if crate::local::is_reserved_remote_key(&e.key) {
             dropped.push(e);
         } else {
             kept.push(e);
@@ -273,7 +276,15 @@ pub fn status_with_store(
     ignore: &IgnoreSet,
 ) -> Result<Plan, Error> {
     let local = LocalFs::new(vault);
-    build_plan(&local, store, Mode::Status, opts, ignore).map(|report| report.plan)
+    build_plan(
+        &local,
+        store,
+        Mode::Status,
+        opts,
+        ignore,
+        &crate::inventory::InventoryOpts::list_head(),
+    )
+    .map(|report| report.plan)
 }
 
 /// Connectivity probe: write a tiny probe object, read it back, delete it.
@@ -597,6 +608,83 @@ pub(crate) mod testutil {
             self.inner.delete(key)
         }
     }
+
+    /// Store whose `list` always fails (W242): injects a store error into
+    /// repair's cold listing so the CLI fail-loud path is testable offline.
+    pub(crate) struct FailListStore {
+        pub(crate) inner: crate::store::mock::MemoryStore,
+    }
+    impl crate::store::ObjectStore for FailListStore {
+        fn list(&self, _prefix: &str) -> Result<crate::store::Listing, crate::error::Error> {
+            Err(crate::error::Error::Unavailable(
+                "injected list failure".to_string(),
+            ))
+        }
+        fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.head(key)
+        }
+        fn get_to(
+            &self,
+            key: &str,
+            w: &mut dyn std::io::Write,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime_ms: Option<u64>,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.put_from(key, r, size, mtime_ms)
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// Store whose `get_to` always fails with Unavailable (W245): injects a
+    /// non-NotFound remote fetch failure so the cache-non-authority pin is
+    /// testable offline.
+    pub(crate) struct FailGetStore {
+        pub(crate) inner: crate::store::mock::MemoryStore,
+    }
+    impl crate::store::ObjectStore for FailGetStore {
+        fn list(&self, prefix: &str) -> Result<crate::store::Listing, crate::error::Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.head(key)
+        }
+        fn get_to(
+            &self,
+            _key: &str,
+            _w: &mut dyn std::io::Write,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            Err(crate::error::Error::Unavailable("store down".to_string()))
+        }
+        fn get_to_with(
+            &self,
+            _key: &str,
+            _w: &mut dyn std::io::Write,
+            _opts: crate::store::GetOpts,
+        ) -> Result<crate::store::GetOutcome, crate::error::Error> {
+            Err(crate::error::Error::Unavailable("store down".to_string()))
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime_ms: Option<u64>,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.put_from(key, r, size, mtime_ms)
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
+            self.inner.delete(key)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -664,6 +752,39 @@ mod tests {
         assert_eq!(
             dropped_keys,
             vec![".vaultsync-check-1/", "a/.name.vaultsync-tmp-1-2/"],
+            "dropped wrong: {dropped_keys:?}"
+        );
+    }
+
+    #[test]
+    fn partition_reserved_drops_control_plane_keys() {
+        // W219 (issue 45): the partition must drop `.vaultsync/**` control-
+        // plane keys (file AND folder form, first segment exactly
+        // `.vaultsync`) in addition to the existing final-segment probe/tmp
+        // rule. `notes/.vaultsync/x` is NOT control-plane (first segment
+        // `notes`) and stays kept.
+        let all = vec![
+            crate::entity::file(".vaultsync/manifest/v1.json", 1, Some(1)),
+            crate::entity::file(".vaultsync/cache/manifest-v1.json", 2, Some(2)),
+            crate::entity::folder(".vaultsync/cache"),
+            crate::entity::file("notes/.vaultsync/x", 3, Some(3)),
+            crate::entity::file("notes/a.md", 4, Some(4)),
+        ];
+        let (kept, dropped) = partition_reserved_remote_keys(all);
+        let kept_keys: Vec<&str> = kept.iter().map(|e| e.key.as_str()).collect();
+        let dropped_keys: Vec<&str> = dropped.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            kept_keys,
+            vec!["notes/.vaultsync/x", "notes/a.md"],
+            "kept wrong: {kept_keys:?}"
+        );
+        assert_eq!(
+            dropped_keys,
+            vec![
+                ".vaultsync/manifest/v1.json",
+                ".vaultsync/cache/manifest-v1.json",
+                ".vaultsync/cache/"
+            ],
             "dropped wrong: {dropped_keys:?}"
         );
     }
@@ -787,6 +908,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -803,6 +925,85 @@ mod tests {
     }
 
     #[test]
+    fn warm_and_cold_plans_are_identical_on_same_tree() {
+        // W235 (issue 45, acceptance): the same tree planned warm (manifest)
+        // vs cold (live list+head) must yield IDENTICAL action multisets -
+        // the manifest copies mtime/size faithfully, folder synthesis is
+        // shared, and ignore applies the same way after the facade. The
+        // inventory base reports the source (Manifest vs LiveListHead) so the
+        // commit path knows its etag base.
+        let dir = TempDir::new("vaultsync-lib-test");
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join("a.md"), "aaa").unwrap();
+        std::fs::write(dir.join("notes/b.md"), "bbb").unwrap();
+        let local = LocalFs::new(dir.path());
+        let (local_entities, _) = local.list_report().unwrap();
+        let files: Vec<Entity> = local_entities
+            .iter()
+            .filter(|e| !e.is_folder())
+            .cloned()
+            .collect();
+
+        // Cold store: the actual bodies (list+head path).
+        let cold = MemoryStore::new();
+        for f in &files {
+            let body = std::fs::read(dir.join(&f.key)).unwrap();
+            let mut c = std::io::Cursor::new(body);
+            cold.put_from(&f.key, &mut c, f.size, f.mtime_ms).unwrap();
+        }
+        let cold_report = build_plan(
+            &local,
+            &cold,
+            Mode::Status,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap();
+
+        // Warm store: the manifest object only (warm path, no list).
+        let warm = MemoryStore::new();
+        let m = crate::manifest::file_entities_to_manifest(&files, 0, None, None).unwrap();
+        let body = crate::manifest::serialize_manifest(&m).unwrap();
+        let body_len = body.len() as u64;
+        let mut c = std::io::Cursor::new(body);
+        warm.put_from(crate::local::MANIFEST_KEY, &mut c, body_len, None)
+            .unwrap();
+        let warm_report = build_plan(
+            &local,
+            &warm,
+            Mode::Status,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::default(),
+        )
+        .unwrap();
+
+        let acts = |r: &PlanReport| -> Vec<(String, crate::plan::ActionKind)> {
+            r.plan
+                .actions
+                .iter()
+                .map(|a| (a.key.clone(), a.kind))
+                .collect()
+        };
+        assert_eq!(
+            acts(&warm_report),
+            acts(&cold_report),
+            "warm and cold plans must agree"
+        );
+        assert_eq!(
+            warm_report.inventory_base.source,
+            crate::inventory::InventorySource::Manifest {
+                remote_etag: warm.head(crate::local::MANIFEST_KEY).unwrap().etag
+            }
+        );
+        assert_eq!(
+            cold_report.inventory_base.source,
+            crate::inventory::InventorySource::LiveListHead
+        );
+    }
+
+    #[test]
     fn build_plan_filters_remote_ignored() {
         // W197 (issue checkbox): an ignored remote key is absent from the
         // plan - no row of any kind, not even a Skip - while a non-ignored
@@ -816,9 +1017,16 @@ mod tests {
             ],
         };
         let ignore = ignore_set(&[".obsidian/workspace.json"]);
-        let p = build_plan(&local, &store, Mode::Pull, &PlanOpts::default(), &ignore)
-            .unwrap()
-            .plan;
+        let p = build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &PlanOpts::default(),
+            &ignore,
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         assert!(
             !p.actions
                 .iter()
@@ -852,9 +1060,16 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let p = build_plan(&local, &store, Mode::Push, &opts, &ignore)
-            .unwrap()
-            .plan;
+        let p = build_plan(
+            &local,
+            &store,
+            Mode::Push,
+            &opts,
+            &ignore,
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         assert!(
             !p.actions.iter().any(|a| {
                 a.kind == ActionKind::DeleteRemote && a.key == ".obsidian/workspace.json"
@@ -903,7 +1118,15 @@ mod tests {
             ],
         };
         let ignore = ignore_set(&[".git/", ".vaultsync-check-1-2-3"]);
-        let report = build_plan(&local, &store, Mode::Pull, &PlanOpts::default(), &ignore).unwrap();
+        let report = build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &PlanOpts::default(),
+            &ignore,
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap();
         assert!(
             !report
                 .plan
@@ -962,7 +1185,15 @@ mod tests {
             ],
         };
         let ignore = ignore_set(&[".git/"]);
-        let report = build_plan(&local, &store, Mode::Pull, &PlanOpts::default(), &ignore).unwrap();
+        let report = build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &PlanOpts::default(),
+            &ignore,
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap();
         assert!(
             !report
                 .plan
@@ -1004,7 +1235,15 @@ mod tests {
             ],
         };
         let ignore = ignore_set(&[".git/"]);
-        let report = build_plan(&local, &store, Mode::Pull, &PlanOpts::default(), &ignore).unwrap();
+        let report = build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &PlanOpts::default(),
+            &ignore,
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap();
         assert!(
             !report
                 .plan
@@ -1044,7 +1283,15 @@ mod tests {
             ],
         };
         let ignore = ignore_set(&[".DS_Store"]);
-        let report = build_plan(&local, &store, Mode::Pull, &PlanOpts::default(), &ignore).unwrap();
+        let report = build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &PlanOpts::default(),
+            &ignore,
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap();
         assert!(
             !report
                 .plan
@@ -1088,7 +1335,14 @@ mod tests {
             ],
         };
         let ignore = ignore_set(&["evil.md"]);
-        let report = build_plan(&local, &store, Mode::Pull, &PlanOpts::default(), &ignore);
+        let report = build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &PlanOpts::default(),
+            &ignore,
+            &crate::inventory::InventoryOpts::list_head(),
+        );
         assert!(
             report.is_ok(),
             "ignored invalid remote key must not fail closed: {:?}",
@@ -1129,7 +1383,15 @@ mod tests {
             ],
         };
         let ignore = ignore_set(&[".git/", ".trash/"]);
-        let report = build_plan(&local, &store, Mode::Pull, &PlanOpts::default(), &ignore).unwrap();
+        let report = build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &PlanOpts::default(),
+            &ignore,
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap();
         let ignore_warn: Vec<&String> = report
             .warnings
             .iter()
@@ -1164,7 +1426,15 @@ mod tests {
             listed: vec![crate::entity::file("notes/a.md", 25, Some(100))],
         };
         let ignore = ignore_set(&[".trash/"]);
-        let report = build_plan(&local, &store, Mode::Pull, &PlanOpts::default(), &ignore).unwrap();
+        let report = build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &PlanOpts::default(),
+            &ignore,
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap();
         assert!(
             report
                 .warnings
@@ -1195,6 +1465,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -1232,6 +1503,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap();
         assert!(
@@ -1289,6 +1561,7 @@ mod tests {
             Mode::Status,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap();
         // reserved key never planned.
@@ -1331,6 +1604,95 @@ mod tests {
     }
 
     #[test]
+    fn list_filters_control_plane_keys_before_head_enrichment() {
+        use crate::testutil::S3LikeListStore;
+        // W221 (issue 45): the control-plane namespace (`.vaultsync/**`,
+        // first segment exactly `.vaultsync`) is partitioned out of the S3
+        // listing BEFORE any head is issued - same W118 wiring, extended
+        // predicate. A remote `.vaultsync/manifest/v1.json` (or a
+        // `.vaultsync/cache/` folder view) must never be headed, must appear
+        // in no plan row, and must be named by the shared W79 warning.
+        let dir = TempDir::new("vaultsync-lib-test");
+        let store = S3LikeListStore::new();
+        let manifest_body = b"{\"schema\":\"vaultsync.manifest.v1\"}";
+        store
+            .inner()
+            .put_from(
+                crate::local::MANIFEST_KEY,
+                &mut std::io::Cursor::new(manifest_body.to_vec()),
+                manifest_body.len() as u64,
+                Some(1_600_000_000_000),
+            )
+            .unwrap();
+        store
+            .inner()
+            .put_from(
+                ".vaultsync/cache/manifest-v1.json",
+                &mut std::io::Cursor::new(b"{}".to_vec()),
+                2,
+                Some(1_600_000_000_000),
+            )
+            .unwrap();
+        store
+            .inner()
+            .put_from(
+                "notes/a.md",
+                &mut std::io::Cursor::new(b"aaa".to_vec()),
+                3,
+                Some(1_600_000_000_000),
+            )
+            .unwrap();
+        let local = LocalFs::new(dir.path());
+        let report = build_plan(
+            &local,
+            &store,
+            Mode::Status,
+            &PlanOpts::default(),
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap();
+        // control-plane keys never planned.
+        assert!(
+            !report
+                .plan
+                .actions
+                .iter()
+                .any(|a| a.key.starts_with(".vaultsync/")),
+            "control-plane key planned: {:?}",
+            report.plan.actions
+        );
+        // store-side warning present exactly once with the W79 text, naming
+        // the manifest key.
+        let matching: Vec<&String> = report
+            .warnings
+            .iter()
+            .filter(|w| w.contains("reserved vaultsync namespace"))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "expected exactly one warning: {:?}",
+            report.warnings
+        );
+        assert!(
+            matching[0].contains(".vaultsync/manifest/v1.json"),
+            "warning must name the manifest key: {}",
+            matching[0]
+        );
+        // head log: healthy key served, control-plane keys never.
+        let head_log = store.head_log();
+        assert!(
+            head_log.iter().any(|k| k == "notes/a.md"),
+            "healthy key not headed: {head_log:?}"
+        );
+        assert!(
+            !head_log.iter().any(|k| k.starts_with(".vaultsync/")),
+            "control-plane key was headed (should be pre-filtered): {head_log:?}"
+        );
+    }
+
+    #[test]
     fn reserved_key_head_failure_does_not_fail_listing() {
         use crate::testutil::S3LikeListStore;
         // W118/R2-2 fail-closed scope creep: a transient head error (throttle)
@@ -1365,6 +1727,7 @@ mod tests {
             Mode::Status,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap();
         assert!(
@@ -1391,6 +1754,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -1427,6 +1791,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -1462,6 +1827,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -1496,6 +1862,7 @@ mod tests {
             Mode::Push,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -1540,6 +1907,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -1569,9 +1937,16 @@ mod tests {
             delete: true,
             ..Default::default()
         };
-        let p = build_plan(&local, &store, Mode::Pull, &opts, &IgnoreSet::empty())
-            .unwrap()
-            .plan;
+        let p = build_plan(
+            &local,
+            &store,
+            Mode::Pull,
+            &opts,
+            &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
+        )
+        .unwrap()
+        .plan;
         let link = p.actions.iter().find(|a| a.key == "link.md").unwrap();
         assert_eq!(link.kind, ActionKind::Skip, "{:?}", link);
         assert_eq!(link.reason, "followed_symlink");
@@ -1594,6 +1969,7 @@ mod tests {
             Mode::Status,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -1629,6 +2005,7 @@ mod tests {
             Mode::Status,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -1656,6 +2033,7 @@ mod tests {
                 Mode::Status,
                 &PlanOpts::default(),
                 &IgnoreSet::empty(),
+                &crate::inventory::InventoryOpts::list_head(),
             )
             .unwrap_err();
             assert!(matches!(err, Error::InvalidKey(_)), "key {bad:?}: {err}");
@@ -1680,6 +2058,7 @@ mod tests {
             Mode::Status,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -1862,6 +2241,7 @@ mod tests {
             Mode::Status,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -1907,6 +2287,7 @@ mod tests {
             Mode::Status,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -1947,6 +2328,7 @@ mod tests {
             Mode::Status,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -1987,6 +2369,7 @@ mod tests {
             Mode::Push,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -2021,6 +2404,7 @@ mod tests {
             Mode::Push,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -2184,6 +2568,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -2282,6 +2667,7 @@ mod tests {
             Mode::Push,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -2319,6 +2705,7 @@ mod tests {
             Mode::Status,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -2358,6 +2745,7 @@ mod tests {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;
@@ -2377,6 +2765,7 @@ mod tests {
             Mode::Status,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &crate::inventory::InventoryOpts::list_head(),
         )
         .unwrap()
         .plan;

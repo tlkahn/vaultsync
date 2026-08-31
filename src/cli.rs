@@ -64,6 +64,14 @@ pub enum Command {
         verbose: u8,
         json: bool,
     },
+    Repair {
+        vault: PathBuf,
+        json: bool,
+        config: Option<PathBuf>,
+        verbose: u8,
+        dry_run: bool,
+        force: bool,
+    },
     Version,
     Help,
 }
@@ -113,6 +121,19 @@ impl Command {
             config: None,
             verbose: 0,
             json: false,
+        }
+    }
+    /// Repair with defaults (dry-run off, force off). The vault defaults to
+    /// the same sentinel as clap (`VAULT_UNSET`), matching how a no-flag
+    /// invocation resolves through `resolve_vault_from_config`.
+    pub fn repair() -> Command {
+        Command::Repair {
+            vault: PathBuf::from(VAULT_UNSET),
+            json: false,
+            config: None,
+            verbose: 0,
+            dry_run: false,
+            force: false,
         }
     }
 }
@@ -175,6 +196,17 @@ struct TransferArgs {
     force_remote: bool,
 }
 
+#[derive(Args, Debug, Clone, PartialEq)]
+struct RepairArgs {
+    /// Rebuild the manifest body and report the entry count, but write
+    /// nothing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Overwrite the manifest unconditionally (no If-Match precondition).
+    #[arg(long)]
+    force: bool,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Show diff between local vault and remote prefix
@@ -185,6 +217,8 @@ enum Commands {
     Pull(TransferArgs),
     /// Connectivity probe against the configured store
     Check,
+    /// Rebuild the remote inventory manifest from a live list+head
+    Repair(RepairArgs),
     /// Print version
     Version,
     /// Show help
@@ -230,6 +264,14 @@ impl Cli {
                 config,
                 verbose,
                 json: self.json,
+            },
+            Some(Commands::Repair(a)) => Command::Repair {
+                vault: self.vault,
+                json: self.json,
+                config,
+                verbose,
+                dry_run: a.dry_run,
+                force: a.force,
             },
             Some(Commands::Version) => Command::Version,
             Some(Commands::Help) => Command::Help,
@@ -305,6 +347,9 @@ pub struct DispatchCtx {
     pub concurrency: u32,
     pub progress_mode: ProgressMode,
     pub ignore: crate::IgnoreSet,
+    /// Resolved `[inventory].mode` (issue 45): threaded into every
+    /// `build_plan` call (warm manifest vs live list+head).
+    pub inventory_mode: crate::config::InventoryMode,
 }
 
 /// Dispatch a command against a store, writing to `out`/`err`. Returns exit code.
@@ -370,6 +415,63 @@ pub fn run_with_io(
                 }
             }
         }
+        Command::Repair {
+            vault,
+            json,
+            config: _c,
+            verbose: _v,
+            dry_run,
+            force,
+        } => {
+            // W242 (issue 45, D-repair): rebuild the manifest from a live
+            // list+head. No plan table; short summary lines on stdout. Exit
+            // 0 on success (including dry-run), 1 on store errors. `--json`
+            // is not a Repair flag (schema stability is Phase 3; W252 makes
+            // it loud like status/push/pull/check).
+            if json {
+                return reject_json(err);
+            }
+            let opts = crate::inventory::RepairOpts { force, dry_run };
+            // M1/F1 (W251): repair refreshes the local mirror like push - the
+            // rebuilt manifest's meta records the fresh remote etag.
+            let cache = crate::inventory::CachePaths::new(&vault);
+            match crate::inventory::repair_manifest(store, &opts, Some(&cache)) {
+                Ok(report) => {
+                    for w in &report.warnings {
+                        let _ = writeln!(err, "warning: {w}");
+                    }
+                    let _ = writeln!(
+                        out,
+                        "repair: listed {} objects via list+head",
+                        report.listed
+                    );
+                    if report.dry_run {
+                        let _ = writeln!(
+                            out,
+                            "repair: dry-run ({} entries would be written)",
+                            report.listed
+                        );
+                    } else {
+                        let etag_suffix = match &report.etag {
+                            Some(e) => format!(" etag={e}"),
+                            None => String::new(),
+                        };
+                        let _ = writeln!(
+                            out,
+                            "repair: wrote {} ({} entries{})",
+                            crate::local::MANIFEST_KEY,
+                            report.listed,
+                            etag_suffix
+                        );
+                    }
+                    0
+                }
+                Err(e) => {
+                    let _ = writeln!(err, "error: {e}");
+                    1
+                }
+            }
+        }
         Command::Status {
             vault,
             json,
@@ -386,7 +488,17 @@ pub fn run_with_io(
             };
             let local = crate::local::LocalFs::with_follow(&vault, follow_symlinks)
                 .with_ignore(ctx.ignore.clone());
-            match crate::build_plan(&local, store, Mode::Status, &opts, &ctx.ignore) {
+            match crate::build_plan(
+                &local,
+                store,
+                Mode::Status,
+                &opts,
+                &ctx.ignore,
+                &crate::inventory::InventoryOpts {
+                    mode: ctx.inventory_mode,
+                    vault_root: Some(vault.clone()),
+                },
+            ) {
                 Ok(report) => {
                     // H1 (W99): build_plan + store-listing warnings surface
                     // here, at the CLI layer - library code never writes to
@@ -394,6 +506,8 @@ pub fn run_with_io(
                     for w in &report.warnings {
                         let _ = writeln!(err, "warning: {w}");
                     }
+                    // W236 (issue 45): one always-on inventory source line.
+                    print_inventory_line(&report, err);
                     print_walk_warnings(&local, follow_symlinks, err);
                     let plan = &report.plan;
                     let _ = write!(out, "{}", crate::format_plan_human_verbose(plan, verbose));
@@ -432,6 +546,7 @@ pub fn run_with_io(
                 concurrency: ctx.concurrency,
                 progress: ctx.progress_mode,
                 ignore: ctx.ignore.clone(),
+                inventory_mode: ctx.inventory_mode,
             };
             dispatch_plan(&vault, store, Mode::Push, &opts, &flags, out, err)
         }
@@ -462,8 +577,28 @@ pub fn run_with_io(
                 concurrency: ctx.concurrency,
                 progress: ctx.progress_mode,
                 ignore: ctx.ignore.clone(),
+                inventory_mode: ctx.inventory_mode,
             };
             dispatch_plan(&vault, store, Mode::Pull, &opts, &flags, out, err)
+        }
+    }
+}
+
+/// Print the W236 inventory source milestone line to stderr (always-on, like
+/// the ignore warnings, so it is testable and script-visible): locked strings
+/// `inventory: manifest (N entries)` (warm) vs `inventory: list+head (cold)`.
+/// One line per plan build; #42 may later wrap the cold path with progress.
+fn print_inventory_line(report: &crate::PlanReport, err: &mut dyn Write) {
+    match &report.inventory_base.source {
+        crate::inventory::InventorySource::Manifest { .. } => {
+            let _ = writeln!(
+                err,
+                "inventory: manifest ({} entries)",
+                report.inventory_base.file_entities.len()
+            );
+        }
+        crate::inventory::InventorySource::LiveListHead => {
+            let _ = writeln!(err, "inventory: list+head (cold)");
         }
     }
 }
@@ -523,6 +658,9 @@ struct PlanFlags {
     concurrency: u32,
     progress: ProgressMode,
     ignore: crate::IgnoreSet,
+    /// Resolved `[inventory].mode` (issue 45, W235) threaded into
+    /// `dispatch_plan`'s `build_plan` call.
+    inventory_mode: crate::config::InventoryMode,
 }
 
 /// Build the I27 progress renderer for a resolved mode (I27 cycle 8 refactor:
@@ -567,13 +705,26 @@ fn dispatch_plan(
     // the seam).
     let resolved =
         crate::progress::resolve_progress_mode(flags.progress, std::io::stderr().is_terminal());
-    match crate::build_plan(&local, store, mode, opts, &flags.ignore) {
+    match crate::build_plan(
+        &local,
+        store,
+        mode,
+        opts,
+        &flags.ignore,
+        &crate::inventory::InventoryOpts {
+            mode: flags.inventory_mode,
+            vault_root: Some(vault.clone()),
+        },
+    ) {
         Ok(report) => {
             // H1 (W99): build_plan + store-listing warnings surface here, at
             // the CLI layer - library code never writes to stderr.
             for w in &report.warnings {
                 let _ = writeln!(err, "warning: {w}");
             }
+            // W236 (issue 45): one always-on inventory source line per plan
+            // build (push/pull too, not just status).
+            print_inventory_line(&report, err);
             print_walk_warnings(&local, flags.follow_symlinks, err);
             let plan = &report.plan;
             let _ = write!(
@@ -588,7 +739,8 @@ fn dispatch_plan(
                 // (1 = sequential). I27: the executor's progress events feed
                 // the resolved renderer (bar on TTY/Auto or Always; no-op
                 // otherwise); stdout never sees progress bytes (I27-shape).
-                let report = {
+                let inventory_base = report.inventory_base;
+                let exec_report = {
                     let renderer = build_progress_renderer(resolved, err);
                     crate::exec::execute_plan_with_progress(
                         &local,
@@ -600,13 +752,50 @@ fn dispatch_plan(
                         renderer.as_ref(),
                     )
                 };
-                for w in &report.warnings {
+                for w in &exec_report.warnings {
                     let _ = writeln!(err, "warning: {w}");
                 }
-                for f in &report.failed {
+                for f in &exec_report.failed {
                     let _ = writeln!(err, "error: {}\n  {}", f.key, f.message);
                 }
-                if !report.failed.is_empty() {
+                // W240 (issue 45, D-commit-when): after a push with at least
+                // one successful remote mutation, commit the manifest LAST
+                // (bodies first, manifest last - D-commit-order). Pull and
+                // status never commit; a dry run mutated nothing so it never
+                // commits; zero mutations skip the write (SkippedNoMutations).
+                if mode == Mode::Push && !exec_report.mutations.is_empty() {
+                    // M1/F1 (W251, reviews 5472028291 + 5472033449): the
+                    // production push commit refreshes the S7 local mirror
+                    // (W246 contract live; `commit_manifest` fills the cache
+                    // on Written).
+                    let cache = crate::inventory::CachePaths::new(vault);
+                    match crate::inventory::commit_manifest(
+                        store,
+                        &inventory_base,
+                        &exec_report.mutations,
+                        Some(&cache),
+                    ) {
+                        Ok(crate::inventory::CommitOutcome::Written { .. })
+                        | Ok(crate::inventory::CommitOutcome::SkippedNoMutations) => {}
+                        Ok(crate::inventory::CommitOutcome::PreconditionFailed) => {
+                            // Q2: a lost conditional race is a warning, not an
+                            // error - the transfers succeeded (bodies are
+                            // live); another writer's manifest won. Suggest
+                            // repair. Exit code stays 0 when transfers are ok.
+                            let _ = writeln!(
+                                err,
+                                "warning: manifest not committed (lost race or changed under us); run vaultsync repair if status looks wrong"
+                            );
+                        }
+                        Err(e) => {
+                            // Transfers already done; bodies may be ahead of
+                            // the manifest. Surface loudly, keep the data
+                            // exit code (repair story).
+                            let _ = writeln!(err, "warning: manifest commit failed: {e}");
+                        }
+                    }
+                }
+                if !exec_report.failed.is_empty() {
                     1
                 } else if plan
                     .actions
@@ -639,7 +828,8 @@ fn cmd_config_path(cmd: &Command) -> Option<&Path> {
         Command::Status { config, .. }
         | Command::Push { config, .. }
         | Command::Pull { config, .. }
-        | Command::Check { config, .. } => config.as_deref(),
+        | Command::Check { config, .. }
+        | Command::Repair { config, .. } => config.as_deref(),
         Command::Version | Command::Help => None,
     }
 }
@@ -707,6 +897,21 @@ fn resolve_vault_from_config(cmd: Command, settings: &crate::config::Settings) -
             verbose,
             follow_symlinks,
         },
+        Command::Repair {
+            vault,
+            json,
+            config,
+            verbose,
+            dry_run,
+            force,
+        } if vault == Path::new(VAULT_UNSET) => Command::Repair {
+            vault: want,
+            json,
+            config,
+            verbose,
+            dry_run,
+            force,
+        },
         other => other,
     }
 }
@@ -716,7 +921,10 @@ fn resolve_vault_from_config(cmd: Command, settings: &crate::config::Settings) -
 fn requires_real_store(cmd: &Command) -> bool {
     matches!(
         cmd,
-        Command::Push { .. } | Command::Pull { .. } | Command::Check { .. }
+        Command::Push { .. }
+            | Command::Pull { .. }
+            | Command::Check { .. }
+            | Command::Repair { .. }
     )
 }
 
@@ -726,6 +934,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::Push { .. } => "push",
         Command::Pull { .. } => "pull",
         Command::Check { .. } => "check",
+        Command::Repair { .. } => "repair",
         _ => "this command",
     }
 }
@@ -806,6 +1015,7 @@ fn run_with_settings_store(
             concurrency: settings.concurrency,
             progress_mode,
             ignore,
+            inventory_mode: settings.inventory_mode,
         },
         out,
         err,
@@ -852,6 +1062,7 @@ pub fn run_from_env() -> i32 {
             concurrency: 1,
             progress_mode: ProgressMode::Auto,
             ignore: crate::IgnoreSet::empty(),
+            inventory_mode: crate::config::InventoryMode::Auto,
         };
         return run_with_io(cmd, &MemoryStore::new(), &ctx, &mut out, &mut err);
     }
@@ -915,6 +1126,7 @@ mod tests {
             retry: crate::config::RetrySettings::default(),
             ignore_patterns: Vec::new(),
             resolved_ignore_patterns: Vec::new(),
+            inventory_mode: crate::config::InventoryMode::Auto,
         };
         // explicit --vault wins over the config root
         let cli_explicit = Command::status(PathBuf::from("/cli/vault"));
@@ -1294,6 +1506,8 @@ mod tests {
                 // progress-silent; only progress tests opt into Always.
                 progress_mode: ProgressMode::Off,
                 ignore: crate::IgnoreSet::empty(),
+                // W235: list_head keeps this helper exactly today's behavior.
+                inventory_mode: crate::config::InventoryMode::ListHead,
             },
             &mut out,
             &mut err,
@@ -1325,6 +1539,7 @@ mod tests {
                 concurrency: 1,
                 progress_mode: ProgressMode::Off,
                 ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::ListHead,
             },
             &mut out,
             &mut err,
@@ -1355,6 +1570,7 @@ mod tests {
                 concurrency: 1,
                 progress_mode: mode,
                 ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::ListHead,
             },
             &mut out,
             &mut err,
@@ -1580,6 +1796,81 @@ mod tests {
     }
 
     #[test]
+    fn status_prints_inventory_source_line() {
+        // W236 (issue 45): every plan build prints one always-on stderr
+        // milestone line naming the inventory source (locked strings):
+        // `inventory: manifest (N entries)` warm vs `inventory: list+head
+        // (cold)`. Always-on (like ignore warnings) so it is testable and
+        // script-visible; #42 may later add progress around the cold path.
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "hi").unwrap();
+        let local = crate::local::LocalFs::new(dir.path());
+        let (local_entities, _) = local.list_report().unwrap();
+        let files: Vec<_> = local_entities
+            .iter()
+            .filter(|e| !e.is_folder())
+            .cloned()
+            .collect();
+
+        // Warm: a store holding only the manifest (mode Auto).
+        let warm = MemoryStore::new();
+        let m = crate::manifest::file_entities_to_manifest(&files, 0, None, None).unwrap();
+        let body = crate::manifest::serialize_manifest(&m).unwrap();
+        let body_len = body.len() as u64;
+        let mut c = std::io::Cursor::new(body);
+        warm.put_from(crate::local::MANIFEST_KEY, &mut c, body_len, None)
+            .unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::status(dir.path().into()),
+            &warm,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::Auto,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0);
+        assert!(
+            String::from_utf8(err.clone())
+                .unwrap()
+                .contains("inventory: manifest (1 entries)"),
+            "err: {}",
+            String::from_utf8_lossy(&err)
+        );
+
+        // Cold: mode list_head on the same local tree (no manifest needed).
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::status(dir.path().into()),
+            &MemoryStore::new(),
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::ListHead,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 2, "local-only rows make status dirty");
+        assert!(
+            String::from_utf8(err.clone())
+                .unwrap()
+                .contains("inventory: list+head (cold)"),
+            "err: {}",
+            String::from_utf8_lossy(&err)
+        );
+    }
+
+    #[test]
     fn run_status_json_rejected_not_implemented() {
         // --json parses (Slice 1) but dispatch rejects it (Phase 3 schema).
         let dir = TempDir::new("vaultsync-cli-test");
@@ -1593,6 +1884,520 @@ mod tests {
         let (code, _, err) = run(cmd, &MemoryStore::new());
         assert_eq!(code, 1);
         assert!(err.contains("--json"), "err: {err}");
+    }
+
+    #[test]
+    fn push_commits_manifest_with_uploaded_entries() {
+        // W240 (issue 45, D-commit-when/order): a push that uploads writes
+        // the manifest LAST - bodies first - with the uploaded files as
+        // entries. A second push that is clean (zero mutations) skips the
+        // commit (manifest unchanged).
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "hi").unwrap();
+        let store = MemoryStore::new();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::push(dir.path().into(), false),
+            &store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::Auto,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0, "err: {}", String::from_utf8_lossy(&err));
+        // Body uploaded and manifest written with one entry.
+        let mut buf = Vec::new();
+        let ent = store
+            .get_to(crate::local::MANIFEST_KEY, &mut buf)
+            .expect("manifest written");
+        assert!(ent.etag.is_some());
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        assert_eq!(m.entry_count, 1);
+        assert_eq!(m.entries[0].key, "a.md");
+        assert_eq!(m.entries[0].size, 2);
+        let etag1 = ent.etag;
+        // Second clean push: zero mutations -> no commit (etag unchanged).
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::push(dir.path().into(), false),
+            &store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::Auto,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0);
+        let h = store.head(crate::local::MANIFEST_KEY).unwrap();
+        assert_eq!(h.etag, etag1, "clean push must skip the commit");
+    }
+
+    #[test]
+    fn push_delete_removes_key_from_manifest() {
+        // W240 (issue 45): `push --delete` folds successful DeleteRemote
+        // keys out of the committed manifest.
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "hi").unwrap();
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"x".to_vec());
+        store.put_from("gone.md", &mut c, 1, Some(1)).unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::push(dir.path().into(), true),
+            &store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::Auto,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0, "err: {}", String::from_utf8_lossy(&err));
+        assert!(
+            matches!(
+                store.head("gone.md").unwrap_err(),
+                crate::error::Error::NotFound(_)
+            ),
+            "remote extra must be deleted"
+        );
+        let mut buf = Vec::new();
+        store.get_to(crate::local::MANIFEST_KEY, &mut buf).unwrap();
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        let keys: Vec<&str> = m.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["a.md"],
+            "deleted key must be absent from manifest"
+        );
+    }
+
+    #[test]
+    fn push_auto_replaces_corrupt_remote_manifest() {
+        // W249/H1 (review 5472028291): under InventoryMode::Auto a corrupt
+        // remote manifest makes planning fall back to list+head (cold base,
+        // manifest_etag: None). The push must still commit - H1 heads at
+        // commit time and If-Match overwrites the corrupt object instead of
+        // create-only If-None-Match: * failing with PreconditionFailed and a
+        // stuck "manifest not committed" warning.
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "hi").unwrap();
+        let store = MemoryStore::new();
+        // Seed MANIFEST_KEY with garbage.
+        let mut c = std::io::Cursor::new(b"not a manifest".to_vec());
+        store
+            .put_from(crate::local::MANIFEST_KEY, &mut c, 14, None)
+            .unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::push(dir.path().into(), false),
+            &store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::Auto,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0, "err: {}", String::from_utf8_lossy(&err));
+        let err_s = String::from_utf8_lossy(&err);
+        assert!(
+            !err_s.contains("not committed"),
+            "no create-only stuck state: {err_s}"
+        );
+        // The overwritten remote manifest parses and lists a.md.
+        let mut buf = Vec::new();
+        store.get_to(crate::local::MANIFEST_KEY, &mut buf).unwrap();
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        assert_eq!(m.entry_count, 1);
+        assert_eq!(m.entries[0].key, "a.md");
+    }
+
+    #[test]
+    fn push_refreshes_local_manifest_cache() {
+        // W251 (M1/F1, reviews 5472028291 + 5472033449): production push
+        // wires the S7 local cache so the mirror (W246 contract) is live -
+        // the committed manifest's meta file records the remote etag and the
+        // body file holds the committed body. RED today: the push arm passes
+        // cache: None, so no cache files appear.
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "hi").unwrap();
+        let store = MemoryStore::new();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::push(dir.path().into(), false),
+            &store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::Auto,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0, "err: {}", String::from_utf8_lossy(&err));
+        let cache = crate::inventory::CachePaths::new(dir.path());
+        let meta: crate::inventory::CacheMeta = serde_json::from_slice(
+            &std::fs::read(&cache.meta)
+                .unwrap_or_else(|_| panic!("cache meta missing at {}", cache.meta.display())),
+        )
+        .unwrap();
+        let remote = store.head(crate::local::MANIFEST_KEY).unwrap();
+        assert_eq!(
+            meta.remote_etag, remote.etag,
+            "cache meta etag must equal the committed remote etag"
+        );
+        let body = std::fs::read(&cache.body)
+            .unwrap_or_else(|_| panic!("cache body missing at {}", cache.body.display()));
+        let m = crate::manifest::parse_manifest_bytes(&body).unwrap();
+        assert_eq!(m.entry_count, 1);
+        assert_eq!(m.entries[0].key, "a.md");
+    }
+
+    #[test]
+    fn pull_does_not_write_manifest() {
+        // W240 / Q6 (issue 45): pull never commits the manifest - the body
+        // arrives but the manifest etag/body stay untouched.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"hi".to_vec());
+        store
+            .put_from("a.md", &mut c, 2, Some(1_600_000_000_000))
+            .unwrap();
+        let body = br#"{"schema":"vaultsync.manifest.v1","created_ms":0,"entry_count":1,"entries":[{"key":"a.md","size":2,"mtime_ms":1600000000000}]}"#;
+        let mut c = std::io::Cursor::new(body.to_vec());
+        let put = store
+            .put_from(crate::local::MANIFEST_KEY, &mut c, body.len() as u64, None)
+            .unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::pull(dir.path().into(), false),
+            &store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::Auto,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0, "err: {}", String::from_utf8_lossy(&err));
+        assert!(dir.join("a.md").exists(), "body pulled");
+        let h = store.head(crate::local::MANIFEST_KEY).unwrap();
+        assert_eq!(h.etag, put.etag, "pull must not rewrite the manifest");
+    }
+
+    #[test]
+    fn push_race_warning_exit_0_with_warning() {
+        // W240 / Q2 (issue 45): when the manifest commit loses its
+        // conditional race, the CLI prints the locked warning (substring
+        // `manifest not committed`), suggests repair, and exits 0 when the
+        // transfers succeeded (bodies are live; data ok).
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "hi").unwrap();
+        let store = RaceCommitStore {
+            inner: MemoryStore::new(),
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::push(dir.path().into(), false),
+            &store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::Auto,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0, "race warning must not fail a successful push");
+        let err = String::from_utf8(err).unwrap();
+        assert!(
+            err.contains("manifest not committed"),
+            "locked warning substring missing: {err}"
+        );
+        assert!(err.contains("repair"), "suggests repair: {err}");
+        // Body is live; manifest was NOT written (no clobber).
+        let body = store.inner.list("").unwrap();
+        assert!(
+            body.entities
+                .iter()
+                .any(|e| e.key == "a.md" && !e.is_folder()),
+            "uploaded body must be live: {:?}",
+            body.entities
+        );
+        assert!(
+            !body
+                .entities
+                .iter()
+                .any(|e| e.key == crate::local::MANIFEST_KEY),
+            "manifest must not be written on a lost race"
+        );
+    }
+
+    #[test]
+    fn repair_parses_and_runs_with_summary() {
+        // W242 (issue 45, D-repair): `vaultsync repair` parses with
+        // `--dry-run` / `--force`, and the run prints the locked summary
+        // substrings: `repair: listed N objects via list+head` and
+        // `repair: wrote .vaultsync/manifest/v1.json (N entries`. Exit 0 on
+        // success; dry-run writes nothing.
+        match parse_args(&["vaultsync".into(), "repair".into()]).unwrap() {
+            Command::Repair {
+                dry_run: false,
+                force: false,
+                ..
+            } => {}
+            other => panic!("expected plain repair, got {other:?}"),
+        }
+        match parse_args(&["vaultsync".into(), "repair".into(), "--dry-run".into()]).unwrap() {
+            Command::Repair { dry_run: true, .. } => {}
+            other => panic!("expected --dry-run, got {other:?}"),
+        }
+        match parse_args(&["vaultsync".into(), "repair".into(), "--force".into()]).unwrap() {
+            Command::Repair { force: true, .. } => {}
+            other => panic!("expected --force, got {other:?}"),
+        }
+
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"hi".to_vec());
+        store
+            .put_from("a.md", &mut c, 2, Some(1_600_000_000_000))
+            .unwrap();
+        // Explicit vault dir: with the W251 cache wiring, a real `repair`
+        // refreshes `<vault>/.vaultsync/cache/` - a `.` vault would pollute
+        // the test CWD.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::Repair {
+                vault: dir.path().into(),
+                json: false,
+                config: None,
+                verbose: 0,
+                dry_run: false,
+                force: false,
+            },
+            &store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::ListHead,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0, "err: {}", String::from_utf8_lossy(&err));
+        let out = String::from_utf8(out).unwrap();
+        let err = String::from_utf8(err).unwrap();
+        assert!(
+            out.contains("repair: listed 1 objects via list+head"),
+            "out: {out}"
+        );
+        assert!(
+            out.contains("repair: wrote .vaultsync/manifest/v1.json (1 entries"),
+            "out: {out}"
+        );
+        assert!(!err.contains("error"), "no error expected: {err}");
+        // Manifest written and valid.
+        let mut buf = Vec::new();
+        store.get_to(crate::local::MANIFEST_KEY, &mut buf).unwrap();
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        assert_eq!(m.entry_count, 1);
+    }
+
+    #[test]
+    fn repair_dry_run_prints_count_and_writes_nothing() {
+        // W242 (issue 45): `repair --dry-run` prints the entry count but
+        // never writes the manifest object.
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"hi".to_vec());
+        store
+            .put_from("a.md", &mut c, 2, Some(1_600_000_000_000))
+            .unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::Repair {
+                vault: PathBuf::from(VAULT_UNSET),
+                json: false,
+                config: None,
+                verbose: 0,
+                dry_run: true,
+                force: false,
+            },
+            &store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::ListHead,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0);
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("repair: listed 1 objects via list+head"),
+            "out: {out}"
+        );
+        assert!(out.contains("dry-run"), "dry-run must be named: {out}");
+        assert!(matches!(
+            store.head(crate::local::MANIFEST_KEY).unwrap_err(),
+            crate::error::Error::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn repair_refreshes_local_manifest_cache() {
+        // W251 (M1/F1, reviews 5472028291 + 5472033449): repair (like push)
+        // wires the S7 local cache - the rebuilt manifest's meta records the
+        // fresh remote etag and the body file holds the rebuilt body. RED
+        // today: the repair arm passes cache: None.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"hi".to_vec());
+        store
+            .put_from("a.md", &mut c, 2, Some(1_600_000_000_000))
+            .unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::Repair {
+                vault: dir.path().into(),
+                json: false,
+                config: None,
+                verbose: 0,
+                dry_run: false,
+                force: false,
+            },
+            &store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::ListHead,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0, "err: {}", String::from_utf8_lossy(&err));
+        let cache = crate::inventory::CachePaths::new(dir.path());
+        let meta: crate::inventory::CacheMeta = serde_json::from_slice(
+            &std::fs::read(&cache.meta)
+                .unwrap_or_else(|_| panic!("cache meta missing at {}", cache.meta.display())),
+        )
+        .unwrap();
+        let remote = store.head(crate::local::MANIFEST_KEY).unwrap();
+        assert_eq!(
+            meta.remote_etag, remote.etag,
+            "cache meta etag must equal the rebuilt remote etag"
+        );
+        let body = std::fs::read(&cache.body)
+            .unwrap_or_else(|_| panic!("cache body missing at {}", cache.body.display()));
+        let m = crate::manifest::parse_manifest_bytes(&body).unwrap();
+        assert_eq!(m.entry_count, 1);
+    }
+
+    #[test]
+    fn repair_fails_loudly_on_store_error() {
+        // W242 (issue 45): a store error during repair exits 1 with the
+        // error text (list failure propagates).
+        let store = crate::testutil::FailListStore {
+            inner: MemoryStore::new(),
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::repair(),
+            &store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::ListHead,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 1);
+        assert!(
+            String::from_utf8(err.clone()).unwrap().contains("error"),
+            "err: {}",
+            String::from_utf8_lossy(&err)
+        );
+    }
+
+    #[test]
+    fn repair_json_is_rejected() {
+        // W252 (F2, review 5472033449): `repair --json` is loud, not silent -
+        // the flag parses (Phase 3 schema stability) but dispatch rejects it
+        // with the locked substring like status/push/pull/check.
+        match parse_args(&["vaultsync".into(), "repair".into(), "--json".into()]).unwrap() {
+            Command::Repair { json: true, .. } => {}
+            other => panic!("expected --json carried on Repair, got {other:?}"),
+        }
+        let store = MemoryStore::new();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            Command::Repair {
+                vault: PathBuf::from(VAULT_UNSET),
+                json: true,
+                config: None,
+                verbose: 0,
+                dry_run: false,
+                force: false,
+            },
+            &store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: crate::config::InventoryMode::ListHead,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 1);
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.contains("--json"), "err: {err}");
+        assert!(err.contains("not implemented"), "err: {err}");
     }
 
     /// A store whose `put_from` always fails, to inject a transfer failure.
@@ -1623,6 +2428,55 @@ mod tests {
             Err(crate::error::Error::Other(format!(
                 "injected put failure for {key}"
             )))
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// Store whose CONDITIONAL put always loses the race (W240): plain puts
+    /// (file bodies) succeed, but any `put_from_with` with a precondition
+    /// answers PreconditionFailed - simulating another writer committing the
+    /// manifest between our plan and our commit.
+    struct RaceCommitStore {
+        inner: MemoryStore,
+    }
+    impl ObjectStore for RaceCommitStore {
+        fn list(&self, prefix: &str) -> Result<crate::store::Listing, crate::error::Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.head(key)
+        }
+        fn get_to(
+            &self,
+            key: &str,
+            w: &mut dyn std::io::Write,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime_ms: Option<u64>,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.put_from(key, r, size, mtime_ms)
+        }
+        fn put_from_with(
+            &self,
+            key: &str,
+            _r: &mut dyn std::io::Read,
+            _size: u64,
+            opts: crate::store::PutOpts,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            if opts.if_match_etag.is_some() || opts.if_none_match_star {
+                return Err(crate::error::Error::PreconditionFailed(format!(
+                    "lost race on {key}"
+                )));
+            }
+            self.inner.put_from(key, _r, _size, opts.mtime_ms)
         }
         fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
             self.inner.delete(key)

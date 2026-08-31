@@ -635,6 +635,7 @@ fn s3_integ_e2e_push_pull() {
             Mode::Push,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &vaultsync::inventory::InventoryOpts::list_head(),
         )
         .map_err(|e| format!("{e}"))?
         .plan;
@@ -652,6 +653,7 @@ fn s3_integ_e2e_push_pull() {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &vaultsync::inventory::InventoryOpts::list_head(),
         )
         .map_err(|e| format!("{e}"))?
         .plan;
@@ -699,6 +701,7 @@ fn s3_integ_status_converges_after_push() {
             Mode::Push,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &vaultsync::inventory::InventoryOpts::list_head(),
         )
         .map_err(|e| format!("{e}"))?
         .plan;
@@ -731,6 +734,7 @@ fn s3_integ_status_converges_after_push() {
             Mode::Status,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &vaultsync::inventory::InventoryOpts::list_head(),
         )
         .map_err(|e| format!("{e}"))?
         .plan;
@@ -807,6 +811,7 @@ fn s3_integ_pull_then_status_converges() {
             Mode::Push,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &vaultsync::inventory::InventoryOpts::list_head(),
         )
         .map_err(|e| format!("{e}"))?
         .plan;
@@ -824,6 +829,7 @@ fn s3_integ_pull_then_status_converges() {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &vaultsync::inventory::InventoryOpts::list_head(),
         )
         .map_err(|e| format!("{e}"))?
         .plan;
@@ -844,6 +850,7 @@ fn s3_integ_pull_then_status_converges() {
             Mode::Status,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &vaultsync::inventory::InventoryOpts::list_head(),
         )
         .map_err(|e| format!("{e}"))?
         .plan;
@@ -875,6 +882,7 @@ fn s3_integ_parallel_pull_correct() {
             Mode::Pull,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &vaultsync::inventory::InventoryOpts::list_head(),
         )
         .map_err(|e| format!("{e}"))?
         .plan;
@@ -919,6 +927,7 @@ fn s3_integ_parallel_push_correct() {
             Mode::Push,
             &PlanOpts::default(),
             &IgnoreSet::empty(),
+            &vaultsync::inventory::InventoryOpts::list_head(),
         )
         .map_err(|e| format!("{e}"))?
         .plan;

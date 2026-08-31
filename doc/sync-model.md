@@ -22,6 +22,15 @@ Local tree                         Remote tree
 | `push` | no | yes (local newer or remote missing) | no | no |
 | `push --delete` | no | yes | no | yes |
 
+**Remote inventory source (issue 45).** Plan build reads the remote file set
+from the inventory facade (`src/inventory.rs`): a valid remote manifest
+`.vaultsync/manifest/v1.json` when present (warm: no per-object heads), else
+live list+head (I15). The manifest stores the full remote file set minus
+reserved keys (not ignore-filtered); folder views are synthesized with the
+same algorithm as list. The manifest is written only after a successful
+push (bodies first, manifest last, conditional put) and by `repair`; `pull`
+and `status` never write it. Full detail: [inventory-manifest.md](./inventory-manifest.md).
+
 v1 does **not** ship a `sync` bidirectional command. If users want both directions without deletes:
 
 ```text

@@ -26,6 +26,42 @@ pub struct Listing {
     pub warnings: Vec<String>,
 }
 
+/// Options for a conditional put (issue 45, D-trait-default). Absent fields
+/// mean "no condition", exactly like the plain `put_from` call.
+#[derive(Debug, Clone, Default)]
+pub struct PutOpts {
+    /// Client-visible mtime in ms since epoch, stored as user metadata.
+    pub mtime_ms: Option<u64>,
+    /// When `Some`, put succeeds only if the object's current ETag equals
+    /// this value (If-Match). Used by the manifest commit to detect a lost
+    /// race against another writer.
+    pub if_match_etag: Option<String>,
+    /// When true, put succeeds only if the key does not already exist
+    /// (If-None-Match: *). Used for the manifest create path.
+    pub if_none_match_star: bool,
+}
+
+/// Options for a conditional get (issue 45, D-trait-default).
+#[derive(Debug, Clone, Default)]
+pub struct GetOpts {
+    /// When `Some`, a matching current ETag answers
+    /// [`GetOutcome::NotModified`] (HTTP 304) with head-like metadata and no
+    /// body; a mismatch answers [`GetOutcome::Body`].
+    pub if_none_match_etag: Option<String>,
+}
+
+/// Outcome of a conditional get (issue 45, D-get-outcome): 304 is a value,
+/// not a hard error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GetOutcome {
+    /// The body was streamed to the writer; `Entity` carries its metadata.
+    Body(Entity),
+    /// Conditional GET satisfied (HTTP 304). The object was not fetched;
+    /// `Entity` carries head-like metadata when the backend provides it
+    /// (size/mtime may be best-effort).
+    NotModified(Entity),
+}
+
 /// An object store holding a set of vault-relative keys.
 ///
 /// Implementations must be usable through `&self` (interior mutability) so the
@@ -91,6 +127,46 @@ pub trait ObjectStore: Send + Sync {
     /// (the mock and `LocalFs::delete_file` do). Callers must treat both as
     /// reaching the goal state; the executor normalizes `NotFound` to success.
     fn delete(&self, key: &str) -> Result<(), Error>;
+
+    /// Conditional put (issue 45, D-trait-default): like [`put_from`] with
+    /// [`PutOpts`] precondition support. The default body keeps every
+    /// existing impl compiling: no precondition set -> delegate to
+    /// [`put_from`]; any precondition -> a loud unsupported error. Providers
+    /// with real conditionals (mock, S3) override this.
+    fn put_from_with(
+        &self,
+        key: &str,
+        r: &mut dyn Read,
+        size: u64,
+        opts: PutOpts,
+    ) -> Result<Entity, Error> {
+        if opts.if_match_etag.is_some() || opts.if_none_match_star {
+            return Err(Error::Other(format!(
+                "conditional put not supported for key {key}"
+            )));
+        }
+        self.put_from(key, r, size, opts.mtime_ms)
+    }
+
+    /// Conditional get (issue 45, D-trait-default): like [`get_to`] with
+    /// [`GetOpts`] If-None-Match support; a matching etag answers
+    /// [`GetOutcome::NotModified`] without streaming the body. The default
+    /// body keeps every existing impl compiling: no precondition -> delegate
+    /// to [`get_to`]; a precondition -> a loud unsupported error. Providers
+    /// with real conditionals (mock, S3) override this.
+    fn get_to_with(
+        &self,
+        key: &str,
+        w: &mut dyn Write,
+        opts: GetOpts,
+    ) -> Result<GetOutcome, Error> {
+        if opts.if_none_match_etag.is_some() {
+            return Err(Error::Other(format!(
+                "conditional get not supported for key {key}"
+            )));
+        }
+        self.get_to(key, w).map(GetOutcome::Body)
+    }
 }
 
 /// Enrich a listing's object entities with per-object `head()` results so
@@ -277,6 +353,114 @@ mod tests {
         // Sync`. RED today (trait lacks the supertraits).
         fn assert_ss<T: ?Sized + Send + Sync>() {}
         assert_ss::<dyn ObjectStore>();
+    }
+
+    /// Stub wrapping MemoryStore WITHOUT overriding `put_from_with` /
+    /// `get_to_with`, so the trait's DEFAULT bodies are exercised (W222).
+    /// Every existing impl has this shape: the 5 required methods only.
+    struct DefaultWithStore(MemoryStore);
+    impl ObjectStore for DefaultWithStore {
+        fn list(&self, prefix: &str) -> Result<Listing, Error> {
+            self.0.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<Entity, Error> {
+            self.0.head(key)
+        }
+        fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            self.0.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime_ms: Option<u64>,
+        ) -> Result<Entity, Error> {
+            self.0.put_from(key, r, size, mtime_ms)
+        }
+        fn delete(&self, key: &str) -> Result<(), Error> {
+            self.0.delete(key)
+        }
+    }
+
+    #[test]
+    fn put_from_with_default_methods_delegate_or_reject() {
+        // W222 (issue 45): the trait extension's default bodies keep every
+        // existing impl compiling. No precondition -> delegate to
+        // `put_from`/`get_to`; any precondition -> a loud unsupported error.
+        // `DefaultWithStore` does not override `_with`, so this test
+        // exercises the DEFAULTS (MemoryStore overrides them since W223).
+        let store = DefaultWithStore(MemoryStore::new());
+        let mut c = std::io::Cursor::new(b"x".to_vec());
+        let e = store
+            .put_from_with("a.md", &mut c, 1, PutOpts::default())
+            .unwrap();
+        assert_eq!(e.key, "a.md");
+        assert_eq!(e.size, 1);
+
+        let mut c = std::io::Cursor::new(b"y".to_vec());
+        let err = store
+            .put_from_with(
+                "b.md",
+                &mut c,
+                1,
+                PutOpts {
+                    if_match_etag: Some("\"etag\"".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("conditional put not supported"),
+            "unexpected: {err}"
+        );
+
+        let mut c = std::io::Cursor::new(b"z".to_vec());
+        let err = store
+            .put_from_with(
+                "c.md",
+                &mut c,
+                1,
+                PutOpts {
+                    if_none_match_star: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("conditional put not supported"),
+            "unexpected: {err}"
+        );
+
+        let mut buf = Vec::new();
+        let out = store
+            .get_to_with("a.md", &mut buf, GetOpts::default())
+            .unwrap();
+        assert!(matches!(out, GetOutcome::Body(e) if e.key == "a.md"));
+        assert_eq!(buf, b"x");
+
+        let mut buf = Vec::new();
+        let err = store
+            .get_to_with(
+                "a.md",
+                &mut buf,
+                GetOpts {
+                    if_none_match_etag: Some("\"etag\"".to_string()),
+                },
+            )
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("conditional get not supported"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn precondition_failed_error_displays() {
+        // W222 (issue 45, D-error): the real `PreconditionFailed` variant
+        // keeps mock race tests matching cleanly (never stuffed into Other).
+        let err = Error::PreconditionFailed("\"abc\"".to_string());
+        assert_eq!(format!("{err}"), "precondition failed: \"abc\"");
     }
 
     #[test]

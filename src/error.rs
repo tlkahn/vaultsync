@@ -11,6 +11,10 @@ pub enum Error {
     InvalidKey(String),
     /// The provider rejected the credentials / denied access (403/401).
     Unauthorized(String),
+    /// A conditional request failed its precondition (HTTP 412): the remote
+    /// object changed or appeared under us (issue 45, D-error). Carries the
+    /// key or a short message.
+    PreconditionFailed(String),
     /// The request timed out (transient).
     Timeout(String),
     /// The provider is unavailable / throttling (5xx, service down).
@@ -27,6 +31,7 @@ impl fmt::Display for Error {
             Error::NotFound(key) => write!(f, "not found: {key}"),
             Error::InvalidKey(key) => write!(f, "invalid key: {key}"),
             Error::Unauthorized(msg) => write!(f, "credentials or permissions rejected: {msg}"),
+            Error::PreconditionFailed(msg) => write!(f, "precondition failed: {msg}"),
             Error::Timeout(msg) => write!(f, "request timed out: {msg}"),
             Error::Unavailable(msg) => write!(f, "store unavailable: {msg}"),
             Error::Io(e) => write!(f, "io error: {e}"),

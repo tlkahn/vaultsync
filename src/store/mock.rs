@@ -54,15 +54,10 @@ impl Default for MemoryStore {
     }
 }
 
-/// Ancestor folder keys (each trailing-`/` prefix) of a key.
+/// Ancestor folder keys (each trailing-`/` prefix) of a key. Shared
+/// implementation (W230): see [`crate::manifest::parent_folders`].
 fn parent_folders(key: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for (i, b) in key.bytes().enumerate() {
-        if b == b'/' {
-            out.push(key[..=i].to_string());
-        }
-    }
-    out
+    crate::manifest::parent_folders(key)
 }
 
 /// Read exactly `n` bytes from `r` into a fresh `Vec`, or fail with
@@ -82,8 +77,9 @@ fn read_exact_n(r: &mut dyn Read, n: u64) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// FNV-1a 64-bit hash over a byte slice (std-only, no crates).
-fn fnv1a(bytes: &[u8]) -> u64 {
+/// FNV-1a 64-bit hash over a byte slice (std-only, no crates). Also used by
+/// the inventory cache body fingerprint (W259/N3).
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in bytes {
         h ^= *b as u64;
@@ -176,6 +172,78 @@ impl ObjectStore for MemoryStore {
         };
         self.objects.lock().unwrap().insert(key.to_string(), obj);
         Ok(entity)
+    }
+
+    fn put_from_with(
+        &self,
+        key: &str,
+        r: &mut dyn Read,
+        size: u64,
+        opts: crate::store::PutOpts,
+    ) -> Result<Entity, Error> {
+        // W223 (issue 45): real If-None-Match: * and If-Match against the
+        // in-memory etag so mock race tests lock the manifest commit
+        // semantics offline. The precondition is checked against the CURRENT
+        // stored object before any body read; the mock is single-threaded in
+        // practice (tests + status), so check-then-insert needs no extra
+        // locking - the race-free variant is what the S3 backend provides via
+        // its conditional headers.
+        crate::entity::ensure_valid_key(key)?;
+        if key.ends_with('/') {
+            return Err(Error::InvalidKey(format!(
+                "put_from does not accept folder keys: {key:?}"
+            )));
+        }
+        {
+            let guard = self.objects.lock().unwrap();
+            if opts.if_none_match_star && guard.contains_key(key) {
+                return Err(Error::PreconditionFailed(format!(
+                    "key already exists: {key}"
+                )));
+            }
+            if let Some(want) = &opts.if_match_etag {
+                let current = guard.get(key);
+                let ok = matches!(current, Some(obj) if &obj.etag == want);
+                if !ok {
+                    return Err(Error::PreconditionFailed(format!(
+                        "etag mismatch for {key}"
+                    )));
+                }
+            }
+        }
+        let bytes = read_exact_n(r, size)?;
+        let etag = format!("{:016x}", fnv1a(&bytes));
+        let obj = MockObject {
+            bytes,
+            mtime_ms: opts.mtime_ms,
+            etag: etag.clone(),
+        };
+        let entity = Entity {
+            key: key.to_string(),
+            size: obj.bytes.len() as u64,
+            mtime_ms: opts.mtime_ms,
+            etag: Some(etag),
+        };
+        self.objects.lock().unwrap().insert(key.to_string(), obj);
+        Ok(entity)
+    }
+
+    fn get_to_with(
+        &self,
+        key: &str,
+        w: &mut dyn Write,
+        opts: crate::store::GetOpts,
+    ) -> Result<crate::store::GetOutcome, Error> {
+        // W224 (issue 45): If-None-Match against the in-memory etag - a
+        // matching etag answers NotModified with head-like metadata and the
+        // writer is untouched (304 semantics, no body stream).
+        if let Some(want) = &opts.if_none_match_etag {
+            let entity = self.head(key)?;
+            if entity.etag.as_deref() == Some(want.as_str()) {
+                return Ok(crate::store::GetOutcome::NotModified(entity));
+            }
+        }
+        self.get_to(key, w).map(crate::store::GetOutcome::Body)
     }
 
     fn delete(&self, key: &str) -> Result<(), Error> {
@@ -479,6 +547,176 @@ mod tests {
             store.delete("notes/").unwrap_err(),
             Error::NotFound(_)
         ));
+    }
+
+    #[test]
+    fn mock_conditional_put_create_and_race() {
+        use crate::store::{GetOpts, GetOutcome, PutOpts};
+        // W223 (issue 45): MemoryStore implements real If-None-Match: * and
+        // If-Match conditionals so mock race tests lock the manifest commit
+        // semantics offline. `if_none_match_star` creates on an absent key,
+        // fails with `PreconditionFailed` (never clobbering) when the key
+        // already exists; `if_match_etag` succeeds on a matching etag and
+        // fails without changing the body on a mismatch.
+        let store = new_store();
+        // create: absent key + If-None-Match * => Ok.
+        let mut c = std::io::Cursor::new(b"first".to_vec());
+        let created = store
+            .put_from_with(
+                "m.json",
+                &mut c,
+                5,
+                PutOpts {
+                    if_none_match_star: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let etag = created.etag.clone().expect("etag");
+        // second create: key exists => PreconditionFailed, body unchanged.
+        let mut c = std::io::Cursor::new(b"clobber".to_vec());
+        let err = store
+            .put_from_with(
+                "m.json",
+                &mut c,
+                7,
+                PutOpts {
+                    if_none_match_star: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::PreconditionFailed(_)), "got {err:?}");
+        assert_eq!(get_str(&store, "m.json").unwrap(), "first");
+        // If-Match with the correct etag => Ok.
+        let mut c = std::io::Cursor::new(b"second".to_vec());
+        let ok = store
+            .put_from_with(
+                "m.json",
+                &mut c,
+                6,
+                PutOpts {
+                    if_match_etag: Some(etag.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // Body replaced; the content-derived etag therefore changed.
+        assert!(ok.etag.is_some());
+        assert_ne!(ok.etag.as_deref(), Some(etag.as_str()));
+        // If-Match with a stale/wrong etag => PreconditionFailed, body
+        // unchanged (no clobber).
+        let mut c = std::io::Cursor::new(b"clobber".to_vec());
+        let err = store
+            .put_from_with(
+                "m.json",
+                &mut c,
+                7,
+                PutOpts {
+                    if_match_etag: Some("\"stale\"".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::PreconditionFailed(_)), "got {err:?}");
+        assert_eq!(get_str(&store, "m.json").unwrap(), "second");
+        // Conditional put still validates keys and rejects folder keys.
+        let mut c = std::io::Cursor::new(b"x".to_vec());
+        let err = store
+            .put_from_with(
+                "../bad",
+                &mut c,
+                1,
+                PutOpts {
+                    if_none_match_star: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidKey(_)), "got {err:?}");
+        // 304 shape available for later W224 tests (GetOutcome import sanity).
+        let mut buf = Vec::new();
+        let out = store
+            .get_to_with(
+                "m.json",
+                &mut buf,
+                GetOpts {
+                    if_none_match_etag: Some("\"nope\"".to_string()),
+                },
+            )
+            .unwrap();
+        assert!(matches!(out, GetOutcome::Body(_)));
+    }
+
+    #[test]
+    fn mock_conditional_get_304_not_modified() {
+        use crate::store::{GetOpts, GetOutcome, PutOpts};
+        // W224 (issue 45): If-None-Match with the CURRENT etag answers
+        // NotModified - the writer is untouched (0 bytes written), and the
+        // outcome carries head-like metadata. A mismatched etag streams the
+        // body (Body). The 304 path must never hit the writer's `write`.
+        let store = new_store();
+        let mut c = std::io::Cursor::new(b"body".to_vec());
+        let e = store
+            .put_from_with(
+                "m.json",
+                &mut c,
+                4,
+                PutOpts {
+                    mtime_ms: Some(123),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let etag = e.etag.clone().unwrap();
+
+        // Matching etag: NotModified, writer untouched.
+        let mut buf = Vec::new();
+        let out = store
+            .get_to_with(
+                "m.json",
+                &mut buf,
+                GetOpts {
+                    if_none_match_etag: Some(etag.clone()),
+                },
+            )
+            .unwrap();
+        match out {
+            GetOutcome::NotModified(m) => {
+                assert_eq!(m.key, "m.json");
+                assert_eq!(m.size, 4);
+                assert_eq!(m.mtime_ms, Some(123));
+            }
+            other => panic!("expected NotModified, got {other:?}"),
+        }
+        assert!(buf.is_empty(), "304 must not write to the writer: {buf:?}");
+
+        // Mismatched etag: Body streamed.
+        let mut buf = Vec::new();
+        let out = store
+            .get_to_with(
+                "m.json",
+                &mut buf,
+                GetOpts {
+                    if_none_match_etag: Some("\"stale\"".to_string()),
+                },
+            )
+            .unwrap();
+        assert!(matches!(out, GetOutcome::Body(_)));
+        assert_eq!(buf, b"body");
+
+        // Missing key: NotFound propagates (no silent 304).
+        let mut buf = Vec::new();
+        let err = store
+            .get_to_with(
+                "nope",
+                &mut buf,
+                GetOpts {
+                    if_none_match_etag: Some(etag.clone()),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
     }
 
     #[test]
