@@ -894,6 +894,16 @@ pub(crate) fn resolve_cold_put_plan(
                 .as_deref()
                 .expect("present+etag branch")
                 .to_string();
+            // F1 (PR50-r1, review 5476323432): a present object whose HEAD
+            // size already exceeds the soft cap is unusable - heal via If-Match
+            // WITHOUT GETting the (potentially huge) body. Cheap and loud on
+            // the head size alone (same outcome family as the tripped writer).
+            if ent.size > crate::manifest::MANIFEST_MAX_BYTES {
+                return Ok(ColdPlan::Overwrite {
+                    files: apply_base(base_files),
+                    etag: live_etag,
+                });
+            }
             // H1-V validate probe: GET the small JSON with the same capped
             // writer the warm fetch uses, then parse with load rules.
             let mut writer = CappedWriter::new(crate::manifest::MANIFEST_MAX_BYTES);
@@ -2541,6 +2551,68 @@ mod tests {
         }
     }
 
+    /// W303 mini store: MANIFEST_KEY head answers an oversized present object
+    /// (etag Some, size above the soft cap); `get_to` on it is COUNTED so a
+    /// test can prove the H1-V validate path never streams an over-cap body.
+    struct OversizeHeadStore {
+        inner: MemoryStore,
+        gets: std::sync::atomic::AtomicUsize,
+    }
+    impl OversizeHeadStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                gets: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn gets(&self) -> usize {
+            self.gets.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+    impl ObjectStore for OversizeHeadStore {
+        fn list(&self, prefix: &str) -> Result<crate::store::Listing, Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<Entity, Error> {
+            if key == crate::local::MANIFEST_KEY {
+                return Ok(Entity {
+                    key: crate::local::MANIFEST_KEY.to_string(),
+                    size: crate::manifest::MANIFEST_MAX_BYTES + 1,
+                    mtime_ms: None,
+                    etag: Some("oversize-etag".to_string()),
+                });
+            }
+            self.inner.head(key)
+        }
+        fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            if key == crate::local::MANIFEST_KEY {
+                self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime_ms: Option<u64>,
+        ) -> Result<Entity, Error> {
+            self.inner.put_from(key, r, size, mtime_ms)
+        }
+        fn put_from_with(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            opts: crate::store::PutOpts,
+        ) -> Result<Entity, Error> {
+            self.inner.put_from_with(key, r, size, opts)
+        }
+        fn delete(&self, key: &str) -> Result<(), Error> {
+            self.inner.delete(key)
+        }
+    }
+
     #[test]
     fn ensure_written_empty_create() {
         // W264 (issue 48, S3): a cold EMPTY base publishes a 0-entry
@@ -2737,6 +2809,28 @@ mod tests {
         let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
         let keys: Vec<&str> = m.entries.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(keys, vec!["a.md", "c.md"]);
+    }
+
+    #[test]
+    fn resolve_or_ensure_oversize_present_skips_body_get() {
+        // W303 (PR50-r1 F1, review 5476323432): a present object whose HEAD
+        // size already exceeds the soft cap is unusable - the H1-V resolve
+        // must plan an Overwrite heal via If-Match WITHOUT GETting the
+        // (potentially huge) body. RED: today the present+etag branch always
+        // GETs (get counter > 0) and then fails on the vanished manifest.
+        let store = OversizeHeadStore::new();
+        let base_files = vec![crate::entity::file("a.md", 3, Some(1))];
+        let plan = resolve_cold_put_plan(&store, &base_files, None).unwrap();
+        assert_eq!(store.gets(), 0, "must not stream an over-cap body");
+        match plan {
+            ColdPlan::Overwrite { files, etag } => {
+                // Heal with the base file set, If-Match the live etag.
+                assert_eq!(etag, "oversize-etag");
+                let keys: Vec<&str> = files.iter().map(|e| e.key.as_str()).collect();
+                assert_eq!(keys, vec!["a.md"]);
+            }
+            other => panic!("expected Overwrite heal, got {other:?}"),
+        }
     }
 
     #[test]
