@@ -26,6 +26,7 @@ Show diff between local vault and remote prefix.
 
 ```text
 vaultsync status
+vaultsync status --write-manifest   # issue 48: explicitly publish a cold manifest
 vaultsync status --json   # Phase 3: parses, but dispatch rejects it as not implemented
 ```
 
@@ -34,6 +35,16 @@ Exit codes:
 - `0` - no pending actions (clean)
 - `1` - error
 - `2` - dirty (actions or conflicts would occur) so scripts can gate on cleanliness
+
+`--write-manifest` (issue 48) is an explicit opt-in - the default `status` is
+read-side-effect free for the remote (Q3). With the flag, under `mode=auto` a
+COLD status (missing or corrupt manifest) publishes one via B1
+(`ensure_remote_manifest`) and prints the bootstrap line; a warm status prints
+a skip line and writes nothing. Mode is checked before warm (a `mode=manifest`
+or `mode=list_head` flag run prints `skipped (mode=...)` even when a valid
+manifest is present); `[inventory].bootstrap = "never"` does NOT gate the
+flag (an explicit write is always allowed). Any bootstrap failure under the
+flag exits `1` (write is the requested op).
 
 ### `vaultsync pull`
 
@@ -56,6 +67,9 @@ vaultsync push --delete          # remove remote extras
 vaultsync push --force-local
 vaultsync push --dry-run         # plan only, no mutations (push/pull only, not a global flag)
 ```
+
+A fresh `push` may also run the **inventory bootstrap** (issue 48, B1)- see
+[Push-time inventory bootstrap](#push-time-inventory-bootstrap-issue-48) below.
 
 ### Progress output (push/pull)
 
@@ -166,6 +180,7 @@ mtime_tolerance_ms = 1000
 
 [inventory]              # live (issue 45): warm manifest vs live list+head
 # mode = "auto"         # auto | manifest | list_head; default when absent
+# bootstrap = "push-ensure"   # issue 48: push-ensure | never; default when absent
 ```
 
 > `[transfer.retry]` defaults are filled **per field**, so validation runs
@@ -181,6 +196,24 @@ mtime_tolerance_ms = 1000
 > local cache mirror lives at `<vault_root>/.vaultsync/cache/` (never
 > walked, never uploaded; owner-only on Unix). Unknown mode strings are
 > loud errors naming the allowed set.
+>
+> `bootstrap` (issue 48, IQ6) is the push-time inventory bootstrap policy:
+> `push-ensure` (default) lets a fresh `push` running under `mode=auto` on a
+> COLD inventory publish a baseline `.vaultsync/manifest/v1.json` BEFORE any
+> transfer (so later plans are warm even if transfers fail or are zero);
+> `never` disables that automatic push-time write. The knob ONLY gates push;
+> the explicit `status --write-manifest` flag always wins (IQ-status-flag-vs-
+> bootstrap), and `repair` is unchanged. `bootstrap = "never"` is the escape
+> hatch for operators who do not want `push` touching the control plane with
+> zero transfers (IQ-zero-xfer). Unknown values are loud errors naming
+> `inventory.bootstrap` and the allowed set.
+>
+> Mode-first note (F4): under `mode=manifest` / `mode=list_head` the
+> push-time bootstrap is always skipped, and `status --write-manifest` prints
+> `skipped (mode=...)`. Strict `mode=manifest` still hard-errors at load on a
+> missing/corrupt manifest (F6); the `--write-manifest` flag does NOT bypass
+> that strict load - use `vaultsync repair` to rebuild when planning is in
+> strict mode.
 
 > `[ignore]` is **live** (issue #34): the resolved pattern list is compiled
 > once at dispatch and applied on **both** sides - the local walk prunes
@@ -408,6 +441,54 @@ If-None-Match: * when absent. So a push after a corrupt manifest heals it;
 conditional PUT cannot do this - push warns (`manifest commit failed`),
 bodies stay live, and the control plane never advances; cold `auto` planning
 still works (see `object-store.md`).
+
+**Push-time inventory bootstrap (issue 48, B1 / C-PA).** Under `mode=auto`
++ `[inventory].bootstrap = "push-ensure"` (the default), a `push` that plans
+from a COLD inventory (`inventory: list+head (cold)`) publishes a baseline
+manifest BEFORE any transfer, so a later plan is warm even when this run's
+transfers fail or nothing is planned. Bootstrap runs between the inventory
+source line and the executed plan; the local cache mirror is filled on a
+write. One always-on stderr line on each bootstrap:
+
+```text
+inventory: manifest bootstrap written (18390 entries)     # we published
+inventory: manifest bootstrap adopted (already present, 18390 entries)  # a concurrent valid manifest won; no write
+inventory: manifest bootstrap skipped (already warm)      # status --write-manifest on a warm auto store
+inventory: manifest bootstrap skipped (mode=list_head)    # status --write-manifest under a non-auto mode (mode-first)
+```
+
+B1 **never** re-lists and never claims in-flight uploads: it publishes the
+pre-transfer remote snapshot, or **adopts** a concurrent-valid manifest
+without writing (H1-V validate-before-overwrite - it is never a blind
+clobber of another writer's valid manifest; a present-but-corrupt object is
+healed via If-Match). `push --dry-run` never bootstraps, `bootstrap = "never"`
+skips push B1, `mode=list_head` skips it, and a WARM push (any valid
+manifest) never bootstraps. `pull` never bootstraps (Q6).
+
+**B1 failure policy (push, F2 split).** A lost conditional race at bootstrap
+`PreconditionFailed` (another writer owned the manifest) ABORTS the push:
+exit `1`, no transfers - this prevents the final manifest commit from
+cascade-clobbering the winner with a stale cold base (F0):
+
+```text
+error: manifest bootstrap failed (lost race); another writer owns the manifest; aborting before transfers
+```
+
+A TRANSIENT bootstrap error instead warns and continues cold (availability is
+preserved; transfers may still run):
+
+```text
+warning: manifest bootstrap failed: <err>; continuing without bootstrap
+```
+
+`status --write-manifest` fails CLOSED on any bootstrap failure (exit `1`,
+never the continue-warning), because the write is the requested operation.
+
+**`--json` (D-json).** `status --write-manifest --json` is still rejected
+today (`--json` is Phase 3, rejected at dispatch before the flag runs; no
+manifest write happens). Future contract: when JSON lands the combo is
+allowed and all bootstrap/skip lines stay on stderr so the JSON stdout stays
+clean.
 
 ### JSON (`--json`)
 

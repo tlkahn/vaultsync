@@ -70,7 +70,7 @@ pub fn load_remote_inventory(
                 // warning (Q3: the read path stays side-effect free).
                 let mut inv = live_list_head(store)?;
                 inv.warnings.push(
-                    "inventory manifest missing; falling back to list+head (next push will create one)"
+                    "inventory manifest missing; falling back to list+head (next push may ensure a manifest via bootstrap or commit, or run vaultsync repair)"
                         .to_string(),
                 );
                 Ok(inv)
@@ -630,6 +630,85 @@ pub(crate) fn apply_commit_mutations(
     map.into_values().collect()
 }
 
+/// Conditional shape for the shared single-attempt manifest put (issue 48,
+/// W263 / D-write-helper / F8). The lowest shared layer: one conditional put,
+/// no retry, no HEAD, no H1-V GET, no dry-run interpretation - those live in
+/// the callers that wrap this helper (repair keeps its retry/force/dry-run;
+/// commit and B1 keep their H1-V resolve).
+#[derive(Debug, Clone)]
+pub(crate) enum WriteCond {
+    /// If-Match: succeed only if the current object etag equals this.
+    IfMatch(String),
+    /// If-None-Match: *: succeed only if the key does not already exist.
+    IfNoneMatchStar,
+    /// Unconditional put (N5 etag-less backends / repair --force).
+    Force,
+}
+
+/// Outcome of [`write_manifest_body`]: a written object (with its etag) or a
+/// lost conditional race. `PreconditionFailed` is a value, not an error -
+/// callers decide policy (commit Q2 warns; B1 push aborts; B1 status exits).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WriteBodyOutcome {
+    Written { etag: Option<String> },
+    PreconditionFailed,
+}
+
+/// Shared lowest-layer manifest writer (issue 48, W263 / D-write-helper / F8):
+/// serde is assumed done by the caller - this owns ONLY the single conditional
+/// put (via `cond`) plus the optional cache fill on success, so repair, commit,
+/// and B1 cannot diverge on conditional-put/cache-fill plumbing.
+///
+/// Deliberately narrow: NO retry loop, NO HEAD, NO H1-V GET, NO dry-run. The
+/// plan's W263 pin: moving a retry loop INTO this helper would make the
+/// bare-helper path retry, which the repair-lost-race retry pin forbids - the
+/// helper answers at most one put.
+pub(crate) fn write_manifest_body(
+    store: &dyn ObjectStore,
+    body: &[u8],
+    cond: WriteCond,
+    cache: Option<&CachePaths>,
+) -> Result<WriteBodyOutcome, Error> {
+    let body_len = body.len() as u64;
+    // W304 (PR50-r1 F2, review 5476323432): `Cursor::new(&[u8])` reads in
+    // place - no forced `body.to_vec()` clone. All in-tree stores consume the
+    // reader synchronously within this call.
+    let mut cursor = std::io::Cursor::new(body);
+    let opts = match cond {
+        WriteCond::IfMatch(etag) => crate::store::PutOpts {
+            if_match_etag: Some(etag),
+            ..Default::default()
+        },
+        WriteCond::IfNoneMatchStar => crate::store::PutOpts {
+            if_none_match_star: true,
+            ..Default::default()
+        },
+        WriteCond::Force => crate::store::PutOpts::default(),
+    };
+    match store.put_from_with(crate::local::MANIFEST_KEY, &mut cursor, body_len, opts) {
+        Ok(entity) => {
+            // W246 contract: a successful write refreshes the local mirror.
+            if let Some(cache) = cache {
+                fill_cache(cache, body, entity.etag.clone());
+            }
+            Ok(WriteBodyOutcome::Written { etag: entity.etag })
+        }
+        Err(Error::PreconditionFailed(_)) => Ok(WriteBodyOutcome::PreconditionFailed),
+        Err(e) => Err(e),
+    }
+}
+
+/// Map an optional live object etag to a write condition (issue 48, W263):
+/// a known etag => If-Match; an etag-less present object (N5 backend) =>
+/// unconditional Force put (If-None-Match: * would fail forever on a present
+/// object; If-Match needs an etag). Used by repair's present branch to
+/// preserve its pre-extract semantics through the shared helper.
+fn cond_from_etag(etag: Option<String>) -> WriteCond {
+    match etag {
+        Some(e) => WriteCond::IfMatch(e),
+        None => WriteCond::Force,
+    }
+}
 /// Repair options (issue 45, D-repair / section 10). Cold list+head head
 /// concurrency is a store-construction concern, not re-bound here (M3/F3,
 /// reviews 5472028291 + 5472033449).
@@ -684,9 +763,6 @@ pub fn repair_manifest(
         None,
     )?;
     let body = crate::manifest::serialize_manifest(&manifest)?;
-    // W246: keep a clone for the cache refresh (the write paths move `body`
-    // into their cursors).
-    let cache_body = body.clone();
     if opts.dry_run {
         return Ok(RepairReport {
             listed: files.len(),
@@ -696,74 +772,61 @@ pub fn repair_manifest(
             warnings: inv.warnings,
         });
     }
-    let body_len = body.len() as u64;
-    // N2 (review 5472033449): the written etag comes from each PUT result -
-    // no trailing head RTT, and a head that fails after a successful write
-    // can no longer degrade the report.
-    let written_etag: Option<String>;
-    if opts.force {
-        let mut cursor = std::io::Cursor::new(body);
-        let entity = store.put_from_with(
-            crate::local::MANIFEST_KEY,
-            &mut cursor,
-            body_len,
-            crate::store::PutOpts::default(),
-        )?;
-        written_etag = entity.etag;
+    // W263 (issue 48, D-write-helper / F8): repair routes its bytes through
+    // the shared single-attempt `write_manifest_body`, but KEEPS its own
+    // retry/force/dry-run policy in this wrapper. The helper has no loop;
+    // the lost-race retry-once lives HERE (the plan's W263 pin).
+    let written_etag: Option<String> = if opts.force {
+        // N2 (review 5472033449): force mode never needs a pre-put head; the
+        // put result carries the etag (no trailing head).
+        match write_manifest_body(store, &body, WriteCond::Force, cache)? {
+            WriteBodyOutcome::Written { etag } => etag,
+            // N2 (PR50-r1, review 5476323432): a store that answers
+            // PreconditionFailed on an unconditional put is surfaced as Err -
+            // never `unreachable!`.
+            WriteBodyOutcome::PreconditionFailed => {
+                return Err(Error::PreconditionFailed(format!(
+                    "unexpected precondition failure on force put of {}",
+                    crate::local::MANIFEST_KEY
+                )));
+            }
+        }
     } else {
         match store.head(crate::local::MANIFEST_KEY) {
             Ok(cur) => {
-                let etag = cur.etag;
-                let mut cursor = std::io::Cursor::new(body.clone());
-                match store.put_from_with(
-                    crate::local::MANIFEST_KEY,
-                    &mut cursor,
-                    body_len,
-                    crate::store::PutOpts {
-                        if_match_etag: etag,
-                        ..Default::default()
-                    },
-                ) {
-                    Ok(entity) => written_etag = entity.etag,
-                    // Lost the race: retry ONCE against a fresh head.
-                    Err(Error::PreconditionFailed(_)) => {
+                match write_manifest_body(store, &body, cond_from_etag(cur.etag), cache)? {
+                    WriteBodyOutcome::Written { etag } => etag,
+                    // Lost the race: retry ONCE against a fresh head. The
+                    // retry is repair's policy, not the helper's (W263).
+                    WriteBodyOutcome::PreconditionFailed => {
                         let cur = store.head(crate::local::MANIFEST_KEY)?;
-                        let mut cursor = std::io::Cursor::new(body);
-                        let entity = store.put_from_with(
-                            crate::local::MANIFEST_KEY,
-                            &mut cursor,
-                            body_len,
-                            crate::store::PutOpts {
-                                if_match_etag: cur.etag,
-                                ..Default::default()
-                            },
-                        )?;
-                        written_etag = entity.etag;
+                        match write_manifest_body(store, &body, cond_from_etag(cur.etag), cache)? {
+                            WriteBodyOutcome::Written { etag } => etag,
+                            WriteBodyOutcome::PreconditionFailed => {
+                                return Err(Error::PreconditionFailed(format!(
+                                    "lost race twice on {} (repair retried once)",
+                                    crate::local::MANIFEST_KEY
+                                )));
+                            }
+                        }
                     }
-                    Err(e) => return Err(e),
                 }
             }
             // No manifest yet: create (If-None-Match: *).
             Err(Error::NotFound(_)) => {
-                let mut cursor = std::io::Cursor::new(body);
-                let entity = store.put_from_with(
-                    crate::local::MANIFEST_KEY,
-                    &mut cursor,
-                    body_len,
-                    crate::store::PutOpts {
-                        if_none_match_star: true,
-                        ..Default::default()
-                    },
-                )?;
-                written_etag = entity.etag;
+                match write_manifest_body(store, &body, WriteCond::IfNoneMatchStar, cache)? {
+                    WriteBodyOutcome::Written { etag } => etag,
+                    WriteBodyOutcome::PreconditionFailed => {
+                        return Err(Error::PreconditionFailed(format!(
+                            "lost race creating {} via repair",
+                            crate::local::MANIFEST_KEY
+                        )));
+                    }
+                }
             }
             Err(e) => return Err(e),
         }
-    }
-    // W246: repair refreshes the local cache mirror (best-effort).
-    if let Some(cache) = cache {
-        fill_cache(cache, &cache_body, written_etag.clone());
-    }
+    };
     Ok(RepairReport {
         listed: files.len(),
         written: true,
@@ -771,6 +834,162 @@ pub fn repair_manifest(
         etag: written_etag,
         warnings: inv.warnings,
     })
+}
+
+/// The resolved write plan for a COLD manifest commit/ensure (issue 48,
+/// S2 W293 / H1-V D-h1v / D-cond): decide create vs overwrite vs adopt by
+/// first HEADing the live object, and on a present+etag object VALIDATE it
+/// (GET + parse with load rules) before ever If-Match overwriting it -
+/// never a blind H1 clobber of a concurrent-valid manifest.
+#[derive(Debug, Clone)]
+pub(crate) enum ColdPlan {
+    /// Absent: create with If-None-Match: *.
+    Create { files: Vec<Entity> },
+    /// Present with no etag (N5 etag-less backend): unconditional put.
+    ForcePut { files: Vec<Entity> },
+    /// Present + etag: If-Match the live etag, with this final file set.
+    Overwrite { files: Vec<Entity>, etag: String },
+    /// Present + etag + VALID body: adopt without writing (B1 only; commit
+    /// with successes never returns this). No cache fill on Adopt. Carries
+    /// the parsed winner file set + entry count so a warm refresh installs a
+    /// COMPLETE base (PR50-r1 H1, review 5476323432). `etag` is `String`
+    /// because this branch is present+etag only (N1).
+    Adopt {
+        etag: String,
+        files: Vec<Entity>,
+        entry_count: usize,
+    },
+}
+
+/// Shared cold H1-V resolve (issue 48, W295 / D-h1v / D-write-helper): takes
+/// the base file set plus optional successful mutations and returns what to
+/// do with the LIVE object at MANIFEST_KEY.
+///
+/// - `successes_opt: None` (B1): write paths use `base_files` verbatim; a
+///   concurrent-valid manifest is ADOPTED (no put, no clobber).
+/// - `successes_opt: Some(successes)` (commit): absent/etag-less/invalid fold
+///   `apply(base_files, successes)`; a concurrent-valid manifest folds
+///   `apply(their.file_entities, successes)` so the winner's untouched keys
+///   survive and our successes win on touched keys (F1 / W291).
+///
+/// A GET/parse failure on the validate probe is an Err (fail closed): the
+/// caller decides policy (B1 push warns-and-continues; commit warns as today;
+/// B1 status exits 1).
+pub(crate) fn resolve_cold_put_plan(
+    store: &dyn ObjectStore,
+    base_files: &[Entity],
+    successes_opt: Option<&[CommitMutation]>,
+) -> Result<ColdPlan, Error> {
+    // The base fold: for commit, apply base+successes; for B1, keep base
+    // (successes is None there so this is an identity copy).
+    let apply_base = |base: &[Entity]| -> Vec<Entity> {
+        match successes_opt {
+            Some(s) => apply_commit_mutations(base, s),
+            None => base.to_vec(),
+        }
+    };
+    match store.head(crate::local::MANIFEST_KEY) {
+        Err(Error::NotFound(_)) => Ok(ColdPlan::Create {
+            files: apply_base(base_files),
+        }),
+        // Present etag-less (N5): no If-Match to protect with; degrade to an
+        // unconditional put (residual multi-writer hole, documented).
+        Ok(ent) if ent.etag.is_none() => Ok(ColdPlan::ForcePut {
+            files: apply_base(base_files),
+        }),
+        Ok(ent) => {
+            let live_etag = ent
+                .etag
+                .as_deref()
+                .expect("present+etag branch")
+                .to_string();
+            // F1 (PR50-r1, review 5476323432): a present object whose HEAD
+            // size already exceeds the soft cap is unusable - heal via If-Match
+            // WITHOUT GETting the (potentially huge) body. Cheap and loud on
+            // the head size alone (same outcome family as the tripped writer).
+            if ent.size > crate::manifest::MANIFEST_MAX_BYTES {
+                return Ok(ColdPlan::Overwrite {
+                    files: apply_base(base_files),
+                    etag: live_etag,
+                });
+            }
+            // H1-V validate probe: GET the small JSON with the same capped
+            // writer the warm fetch uses, then parse with load rules.
+            let mut writer = CappedWriter::new(crate::manifest::MANIFEST_MAX_BYTES);
+            match store.get_to(crate::local::MANIFEST_KEY, &mut writer) {
+                Ok(ent) => {
+                    if writer.tripped {
+                        // Present but above the soft cap: unusable -> heal.
+                        // Body is unusable, so If-Match the HEAD etag (the
+                        // live token for replacing the junk).
+                        return Ok(ColdPlan::Overwrite {
+                            files: apply_base(base_files),
+                            etag: live_etag,
+                        });
+                    }
+                    // M2 (PR50-r2, review 5476798257): prefer the GET
+                    // entity etag - the generation we actually validated -
+                    // when it is present (matches the warm load which trusts
+                    // the GET etag). A HEAD etag that DIFFERS from the GET
+                    // etag means the object changed between HEAD and GET
+                    // (another writer): fail closed, never Adopt/If-Match a
+                    // mixed pair (caller F2 policy). A GET etag-less backend
+                    // (N5 residual) falls back to the HEAD etag.
+                    let cond_etag = match (ent.etag.as_deref(), live_etag.as_str()) {
+                        (Some(g), h) if g != h => {
+                            return Err(Error::Other(format!(
+                                "manifest HEAD/GET etag mismatch during conditional resolve ({h} vs {g}); please retry"
+                            )));
+                        }
+                        (Some(g), _) => g.to_string(),
+                        (None, h) => h.to_string(),
+                    };
+                    match crate::manifest::parse_manifest_bytes(&writer.buf) {
+                        Ok(their) => match successes_opt {
+                            // B1: a concurrent-valid manifest is adopted.
+                            None => {
+                                let files =
+                                    crate::manifest::manifest_to_file_entities(&their)
+                                        .expect("parsed manifest maps cleanly");
+                                // N4: the carried files/count stay lock-step.
+                                debug_assert_eq!(files.len(), their.entries.len());
+                                Ok(ColdPlan::Adopt {
+                                    etag: cond_etag,
+                                    files,
+                                    entry_count: their.entries.len(),
+                                })
+                            }
+                            // Commit: fold successes onto THEIR entries so
+                            // their untouched keys survive (F1 / W291).
+                            Some(successes) => {
+                                let their_files =
+                                    crate::manifest::manifest_to_file_entities(&their)
+                                        .expect("parsed manifest maps cleanly");
+                                let files = apply_commit_mutations(&their_files, successes);
+                                Ok(ColdPlan::Overwrite {
+                                    files,
+                                    etag: cond_etag,
+                                })
+                            }
+                        },
+                        // Present but corrupt: heal via If-Match the etag of
+                        // the validated-per-HEAD generation.
+                        Err(_) => Ok(ColdPlan::Overwrite {
+                            files: apply_base(base_files),
+                            etag: cond_etag,
+                        }),
+                    }
+                }
+                // The object vanished between HEAD and GET (concurrent
+                // delete): fail closed - callers choose policy.
+                Err(Error::NotFound(_)) => Err(Error::Other(
+                    "manifest vanished between HEAD and GET during conditional resolve (another writer removed it); please retry".to_string(),
+                )),
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Commit a new manifest after a mutating push (W238, D-commit-cond):
@@ -796,7 +1015,27 @@ pub fn commit_manifest(
     if successes.is_empty() {
         return Ok(CommitOutcome::SkippedNoMutations);
     }
-    let files = apply_commit_mutations(&base.file_entities, successes);
+    // Decide the final file set + write condition. WARM base => If-Match on
+    // the base etag over apply(base, successes) (no HEAD, no H1-V - walready
+    // trusted the manifest we read). COLD base => H1-V resolve (W293):
+    // absent create, etag-less force, present+valid fold THEIR+successes,
+    // present+corrupt heal base+successes - never a blind clobber.
+    let (files, cond) = match &base.manifest_etag {
+        Some(e) => {
+            let files = apply_commit_mutations(&base.file_entities, successes);
+            (files, WriteCond::IfMatch(e.clone()))
+        }
+        None => match resolve_cold_put_plan(store, &base.file_entities, Some(successes))? {
+            ColdPlan::Create { files } => (files, WriteCond::IfNoneMatchStar),
+            ColdPlan::ForcePut { files } => (files, WriteCond::Force),
+            ColdPlan::Overwrite { files, etag } => (files, WriteCond::IfMatch(etag)),
+            ColdPlan::Adopt { .. } => {
+                return Err(Error::Other(
+                    "internal: commit cold resolve returned Adopt; please retry".to_string(),
+                ));
+            }
+        },
+    };
     let created_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -808,41 +1047,176 @@ pub fn commit_manifest(
         None,
     )?;
     let body = crate::manifest::serialize_manifest(&manifest)?;
-    let body_len = body.len() as u64;
-    let mut cursor = std::io::Cursor::new(body);
-    // H1 (W250): a cold base resolves its condition via a live head at
-    // commit time - present => If-Match on the live etag (overwrite),
-    // absent => If-None-Match: * create. A warm base keeps If-Match on the
-    // base etag (no extra head).
-    let (if_match_etag, if_none_match_star) = match &base.manifest_etag {
-        Some(e) => (Some(e.clone()), false),
-        None => match store.head(crate::local::MANIFEST_KEY) {
-            // Etag-less present object: unconditional put on the cold
-            // resolve path only (R46-h1-etagless); If-None-Match: * would
-            // fail forever on a present object.
-            Ok(ent) => (ent.etag, false),
-            Err(Error::NotFound(_)) => (None, true),
-            Err(e) => return Err(e),
-        },
-    };
-    let opts = crate::store::PutOpts {
-        mtime_ms: None,
-        if_match_etag,
-        if_none_match_star,
-    };
-    match store.put_from_with(crate::local::MANIFEST_KEY, &mut cursor, body_len, opts) {
-        Ok(entity) => {
-            // W246: a successful commit refreshes the local cache mirror.
-            if let Some(cache) = cache {
-                fill_cache(cache, &cursor.into_inner(), entity.etag.clone());
-            }
-            Ok(CommitOutcome::Written {
-                etag: entity.etag,
-                entry_count: manifest.entry_count,
-            })
+    match write_manifest_body(store, &body, cond, cache)? {
+        WriteBodyOutcome::Written { etag } => Ok(CommitOutcome::Written {
+            etag,
+            entry_count: manifest.entry_count,
+        }),
+        WriteBodyOutcome::PreconditionFailed => Ok(CommitOutcome::PreconditionFailed),
+    }
+}
+
+/// Outcome of a push/status-time inventory bootstrap (issue 48, IQ-api /
+/// D-ensure-outcome / IQ-refresh): what B1 did to the remote manifest.
+/// `Written` = we published a new snapshot and filled the local cache;
+/// `Adopted` = a concurrent-valid manifest already lived there (no put, no
+/// cache fill) so we refresh warm; `PreconditionFailed` = another writer won
+/// (never clobbered - the caller decides: push aborts, status exits 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnsureOutcome {
+    Written {
+        etag: Option<String>,
+        entry_count: usize,
+    },
+    Adopted {
+        /// Live manifest etag: this branch is present+etag-only, so the
+        /// adopted generation is a bare `String` (N1, PR50-r2) not an
+        /// `Option`.
+        etag: String,
+        /// Parsed winner FILE set, carried so a warm refresh installs a
+        /// complete base (PR50-r1 H1). `len() == entry_count` after
+        /// `manifest_to_file_entities` (debug_asserted, N4 PR50-r2).
+        files: Vec<Entity>,
+        entry_count: usize,
+    },
+    PreconditionFailed,
+}
+
+/// Wall-clock ms (diagnostic `created_ms` for written manifests).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Publish (or adopt) the remote manifest from a COLD inventory base (issue
+/// 48, B1 / IQ-api). The caller enforces policy - this runs only when B1 is
+/// eligible (push: auto + push-ensure + LiveListHead; status: the explicit
+/// `--write-manifest` flag + auto + cold). It never re-lists and never claims
+/// in-flight uploads: it publishes the pre-transfer snapshot
+/// (`base.file_entities`) via If-None-Match-create / H1-V heal, or ADOPTS a
+/// concurrent-valid live manifest without writing (D-h1v / F1).
+///
+/// Cache fill: on `Written` the local mirror is refreshed (D-cache); on
+/// `Adopted` no cache write is done in v1 (the next warm load fetches/304s).
+pub fn ensure_remote_manifest(
+    store: &dyn ObjectStore,
+    base: &InventoryBase,
+    cache: Option<&CachePaths>,
+) -> Result<EnsureOutcome, Error> {
+    let created_ms = now_ms();
+    let generator = format!("vaultsync {}", crate::version());
+    match resolve_cold_put_plan(store, &base.file_entities, None)? {
+        // Concurrent-valid manifest already present: adopt, never write.
+        // The parsed file set rides along for a complete warm refresh (H1).
+        ColdPlan::Adopt {
+            etag,
+            files,
+            entry_count,
+        } => Ok(EnsureOutcome::Adopted {
+            etag,
+            files,
+            entry_count,
+        }),
+        ColdPlan::Create { files } => write_bootstrap(
+            store,
+            &files,
+            created_ms,
+            &generator,
+            WriteCond::IfNoneMatchStar,
+            cache,
+        ),
+        ColdPlan::ForcePut { files } => write_bootstrap(
+            store,
+            &files,
+            created_ms,
+            &generator,
+            WriteCond::Force,
+            cache,
+        ),
+        ColdPlan::Overwrite { files, etag } => write_bootstrap(
+            store,
+            &files,
+            created_ms,
+            &generator,
+            WriteCond::IfMatch(etag),
+            cache,
+        ),
+    }
+}
+
+/// What a successful B1 refresh applied to an inventory base (PR50-r1, W301):
+/// the caller prints the locked stderr line; the library never writes stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnsureApply {
+    Written { entry_count: usize },
+    Adopted { entry_count: usize },
+}
+
+/// Install a successful B1 outcome into an inventory base (PR50-r1 H1/F3,
+/// review 5476323432): `Written` warms etag/source only (`file_entities`
+/// already match the body WE wrote), `Adopted` ALSO replaces `file_entities`
+/// with the parsed winner snapshot so the final commit's warm fold preserves
+/// their untouched keys instead of clobbering them (H1). Takes `outcome` by
+/// value so `Adopted`'s files are moved, not cloned. Returns `None` for
+/// `PreconditionFailed` - that is a non-apply the caller decides policy for.
+pub(crate) fn apply_ensure_outcome(
+    base: &mut InventoryBase,
+    outcome: EnsureOutcome,
+) -> Option<EnsureApply> {
+    match outcome {
+        EnsureOutcome::Written { etag, entry_count } => {
+            base.source = InventorySource::Manifest {
+                remote_etag: etag.clone(),
+            };
+            base.manifest_etag = etag;
+            Some(EnsureApply::Written { entry_count })
         }
-        Err(Error::PreconditionFailed(_)) => Ok(CommitOutcome::PreconditionFailed),
-        Err(e) => Err(e),
+        EnsureOutcome::Adopted {
+            etag,
+            files,
+            entry_count,
+        } => {
+            // H1: install the COMPLETE adopted snapshot, not the stale cold
+            // list view. N4: the carried files/count must stay in lock-step.
+            debug_assert_eq!(files.len(), entry_count);
+            base.file_entities = files;
+            base.source = InventorySource::Manifest {
+                remote_etag: Some(etag.clone()),
+            };
+            base.manifest_etag = Some(etag);
+            Some(EnsureApply::Adopted { entry_count })
+        }
+        EnsureOutcome::PreconditionFailed => None,
+    }
+}
+
+/// Shared B1 write arm (issue 48, S3): serialize `files` from the cold base
+/// (pre-ignore, post-reserved - D-body) and publish via the shared single
+/// attempt helper, mapping the outcome to `EnsureOutcome`. `entry_count` is
+/// the real file count (D-b1-ok-msg / A23).
+fn write_bootstrap(
+    store: &dyn ObjectStore,
+    files: &[Entity],
+    created_ms: u64,
+    generator: &str,
+    cond: WriteCond,
+    cache: Option<&CachePaths>,
+) -> Result<EnsureOutcome, Error> {
+    let manifest = crate::manifest::file_entities_to_manifest(
+        files,
+        created_ms,
+        Some(generator.into()),
+        None,
+    )?;
+    let body = crate::manifest::serialize_manifest(&manifest)?;
+    match write_manifest_body(store, &body, cond, cache)? {
+        WriteBodyOutcome::Written { etag } => Ok(EnsureOutcome::Written {
+            etag,
+            entry_count: files.len(),
+        }),
+        WriteBodyOutcome::PreconditionFailed => Ok(EnsureOutcome::PreconditionFailed),
     }
 }
 
@@ -987,11 +1361,13 @@ mod tests {
 
     #[test]
     fn auto_missing_manifest_warning_names_absent() {
-        // W255 (F4/L6, reviews 5472028291 + 5472033449): the auto fallback
-        // warning must let an operator tell ABSENT from CORRUPT - the
-        // missing case names absence (and that the next push will create),
-        // and must NOT claim "corrupt". RED today: the single shared
-        // "missing or corrupt" string.
+        // W255 (F4/L6, reviews 5472028291 + 5472033449) + W319 (PR50-r2
+        // L2, review 5476798257): the auto fallback warning must let an
+        // operator tell ABSENT from CORRUPT - the missing case names
+        // absence and that a future push may ENSURE a manifest (bootstrap
+        // or commit) or repair can create it, and must NOT claim "corrupt"
+        // or promise "will create one". The unconditional old promise is
+        // wrong post-48: bootstrap=never may write nothing on zero mutation.
         let store = MemoryStore::new();
         let inv = load_remote_inventory(&store, InventoryMode::Auto, None).unwrap();
         assert_eq!(inv.base.source, InventorySource::LiveListHead);
@@ -1006,6 +1382,14 @@ mod tests {
             "missing must not be called invalid: {warn}"
         );
         assert!(warn.contains("push"), "warnings: {warn}");
+        assert!(
+            warn.contains("ensure") || warn.contains("bootstrap"),
+            "must mention post-48 ensure/bootstrap: {warn}"
+        );
+        assert!(
+            !warn.contains("will create one"),
+            "must not promise an unconditional create: {warn}"
+        );
     }
 
     #[test]
@@ -1304,13 +1688,66 @@ mod tests {
     }
 
     #[test]
+    fn commit_manifest_cold_keeps_concurrent_valid_keys() {
+        // W291 (issue 48, F1 / D-h1v): a COLD commit must NOT clobber a
+        // concurrent-valid manifest via a blind H1 If-Match overwrite. The
+        // live object is valid, so the commit folds successes onto THEIR
+        // entries (their untouched keys survive) and If-Matchs their etag.
+        // A stale `base ∪ successes` fold (a.md only) would clobber b.md -
+        // this RED pins the H1-V fold.
+        let store = MemoryStore::new();
+        // Their valid manifest: only b.md.
+        let their_body = manifest_body(&[("b.md", 1, None)]);
+        let blen = their_body.len() as u64;
+        let mut c = std::io::Cursor::new(their_body);
+        let their_put = store
+            .put_from(crate::local::MANIFEST_KEY, &mut c, blen, None)
+            .unwrap();
+        let their_etag = their_put.etag.clone();
+        // Cold base is STALE: has a.md, lacks b.md.
+        let cold = InventoryBase {
+            source: InventorySource::LiveListHead,
+            file_entities: vec![crate::entity::file("a.md", 5, Some(5))],
+            manifest_etag: None,
+        };
+        let out = commit_manifest(
+            &store,
+            &cold,
+            &[CommitMutation::Upload(crate::entity::file(
+                "a.md",
+                5,
+                Some(5),
+            ))],
+            None,
+        )
+        .unwrap();
+        match out {
+            CommitOutcome::Written { etag, entry_count } => {
+                assert!(etag.is_some());
+                assert_eq!(entry_count, 2);
+            }
+            other => panic!("expected Written, got {other:?}"),
+        }
+        // Live body has BOTH a.md (our success) and b.md (their, untouched).
+        let mut buf = Vec::new();
+        let put = store.get_to(crate::local::MANIFEST_KEY, &mut buf).unwrap();
+        assert_ne!(put.etag, their_etag, "we wrote a new manifest object");
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        let keys: Vec<&str> = m.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["a.md", "b.md"], "their key must survive");
+    }
+
+    #[test]
     fn commit_manifest_cold_base_overwrites_existing_corrupt_body() {
-        // W249 (H1, review 5472028291): a COLD base (`manifest_etag: None`)
-        // must resolve the commit condition against the LIVE object: a
-        // present-but-corrupt body is overwritten via If-Match on the live
-        // etag, not rejected by create-only If-None-Match: *. Today
-        // (pre-fix) this answers PreconditionFailed and push can never heal
-        // the corrupt object.
+        // W249 (H1, review 5472028291) + W292 (issue 48, H1-V invalid
+        // branch): a COLD base (`manifest_etag: None`) must resolve the
+        // commit condition against the LIVE object: a present-but-corrupt
+        // body is healed via If-Match on the live etag, not rejected by
+        // create-only If-None-Match: *. Under H1-V (W293), a corrupt body
+        // (GET+parse fails) falls to the invalid branch => Overwrite with
+        // apply(base, successes) - this test pins exactly that. Today
+        // (pre-fix) this answered PreconditionFailed and push could never
+        // heal the corrupt object.
         let store = MemoryStore::new();
         // Seed MANIFEST_KEY with garbage that is not a valid manifest.
         let mut c = std::io::Cursor::new(b"this is not a manifest".to_vec());
@@ -1724,6 +2161,69 @@ mod tests {
     }
 
     #[test]
+    fn repair_force_put_precondition_failed_returns_err_no_panic() {
+        // W305/N2 (PR50-r1, review 5476323432): a force repair against a
+        // store that answers PreconditionFailed on the unconditional put must
+        // return `Err(Error::PreconditionFailed(_))`, never panic on the old
+        // `unreachable!`.
+        struct AlwaysFailStore {
+            inner: MemoryStore,
+        }
+        impl ObjectStore for AlwaysFailStore {
+            fn list(&self, prefix: &str) -> Result<crate::store::Listing, Error> {
+                self.inner.list(prefix)
+            }
+            fn head(&self, key: &str) -> Result<Entity, Error> {
+                self.inner.head(key)
+            }
+            fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+                self.inner.get_to(key, w)
+            }
+            fn put_from(
+                &self,
+                key: &str,
+                r: &mut dyn std::io::Read,
+                size: u64,
+                mtime_ms: Option<u64>,
+            ) -> Result<Entity, Error> {
+                self.inner.put_from(key, r, size, mtime_ms)
+            }
+            fn put_from_with(
+                &self,
+                _key: &str,
+                _r: &mut dyn std::io::Read,
+                _size: u64,
+                _opts: crate::store::PutOpts,
+            ) -> Result<Entity, Error> {
+                Err(Error::PreconditionFailed(
+                    "simulated unconditional-put precondition failure".to_string(),
+                ))
+            }
+            fn delete(&self, key: &str) -> Result<(), Error> {
+                self.inner.delete(key)
+            }
+        }
+        let store = AlwaysFailStore {
+            inner: MemoryStore::new(),
+        };
+        let mut c = std::io::Cursor::new(b"hi".to_vec());
+        store.put_from("a.md", &mut c, 2, Some(1)).unwrap();
+        let err = repair_manifest(
+            &store,
+            &RepairOpts {
+                force: true,
+                dry_run: false,
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::PreconditionFailed(_)),
+            "got {err:?} - must be Err, not panic"
+        );
+    }
+
+    #[test]
     fn cache_write_read_round_trip_and_owner_only() {
         // W243 (issue 45): the cache body + meta write atomically (temp +
         // rename) under `<vault_root>/.vaultsync/cache/`; the meta carries
@@ -2095,5 +2595,678 @@ mod tests {
         );
         let cached = read_cache_body(&cache).unwrap();
         assert_eq!(cached.1.entry_count, 2);
+    }
+
+    /// Thin store counting `put_from_with` calls per key (issue 48 W268 /
+    /// W290 put-counter pin: assert B1 did/did not put MANIFEST_KEY).
+    struct PutCounterStore {
+        inner: MemoryStore,
+        puts: std::sync::atomic::AtomicUsize,
+    }
+    impl PutCounterStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                puts: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn manifest_puts(&self) -> usize {
+            self.puts.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+    impl ObjectStore for PutCounterStore {
+        fn list(&self, prefix: &str) -> Result<crate::store::Listing, Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<Entity, Error> {
+            self.inner.head(key)
+        }
+        fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime_ms: Option<u64>,
+        ) -> Result<Entity, Error> {
+            if key == crate::local::MANIFEST_KEY {
+                self.puts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.inner.put_from(key, r, size, mtime_ms)
+        }
+        fn put_from_with(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            opts: crate::store::PutOpts,
+        ) -> Result<Entity, Error> {
+            if key == crate::local::MANIFEST_KEY {
+                self.puts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.inner.put_from_with(key, r, size, opts)
+        }
+        fn delete(&self, key: &str) -> Result<(), Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    fn cold_base(files: Vec<Entity>) -> InventoryBase {
+        InventoryBase {
+            source: InventorySource::LiveListHead,
+            file_entities: files,
+            manifest_etag: None,
+        }
+    }
+
+    /// W303 mini store: MANIFEST_KEY head answers an oversized present object
+    /// (etag Some, size above the soft cap); `get_to` on it is COUNTED so a
+    /// test can prove the H1-V validate path never streams an over-cap body.
+    struct OversizeHeadStore {
+        inner: MemoryStore,
+        gets: std::sync::atomic::AtomicUsize,
+    }
+    impl OversizeHeadStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                gets: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn gets(&self) -> usize {
+            self.gets.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+    impl ObjectStore for OversizeHeadStore {
+        fn list(&self, prefix: &str) -> Result<crate::store::Listing, Error> {
+            self.inner.list(prefix)
+        }
+        fn head(&self, key: &str) -> Result<Entity, Error> {
+            if key == crate::local::MANIFEST_KEY {
+                return Ok(Entity {
+                    key: crate::local::MANIFEST_KEY.to_string(),
+                    size: crate::manifest::MANIFEST_MAX_BYTES + 1,
+                    mtime_ms: None,
+                    etag: Some("oversize-etag".to_string()),
+                });
+            }
+            self.inner.head(key)
+        }
+        fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+            if key == crate::local::MANIFEST_KEY {
+                self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            mtime_ms: Option<u64>,
+        ) -> Result<Entity, Error> {
+            self.inner.put_from(key, r, size, mtime_ms)
+        }
+        fn put_from_with(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            size: u64,
+            opts: crate::store::PutOpts,
+        ) -> Result<Entity, Error> {
+            self.inner.put_from_with(key, r, size, opts)
+        }
+        fn delete(&self, key: &str) -> Result<(), Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    #[test]
+    fn ensure_written_empty_create() {
+        // W264 (issue 48, S3): a cold EMPTY base publishes a 0-entry
+        // manifest via If-None-Match: * (warm empty baseline, IQ-empty); the
+        // live body parses, entry_count == 0, and the outcome carries an
+        // etag (mock backends report one).
+        let store = PutCounterStore::new();
+        let base = cold_base(Vec::new());
+        let out = ensure_remote_manifest(&store, &base, None).unwrap();
+        let (etag, count) = match out {
+            EnsureOutcome::Written { etag, entry_count } => (etag, entry_count),
+            other => panic!("expected Written, got {other:?}"),
+        };
+        assert!(etag.is_some());
+        assert_eq!(count, 0);
+        let mut buf = Vec::new();
+        store.get_to(crate::local::MANIFEST_KEY, &mut buf).unwrap();
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        assert_eq!(m.entry_count, 0);
+        assert!(m.entries.is_empty());
+        assert_eq!(store.manifest_puts(), 1);
+    }
+
+    #[test]
+    fn ensure_written_non_empty_entry_count() {
+        // W294 (issue 48, F5 / A23): the Written line's N must equal the
+        // real file count of the base (non-empty).
+        let store = PutCounterStore::new();
+        let base = cold_base(vec![
+            crate::entity::file("a.md", 1, None),
+            crate::entity::file("b.md", 2, None),
+        ]);
+        let out = ensure_remote_manifest(&store, &base, None).unwrap();
+        let (etag, count) = match out {
+            EnsureOutcome::Written { etag, entry_count } => (etag, entry_count),
+            other => panic!("expected Written, got {other:?}"),
+        };
+        assert!(etag.is_some());
+        assert_eq!(count, 2);
+        let mut buf = Vec::new();
+        store.get_to(crate::local::MANIFEST_KEY, &mut buf).unwrap();
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        assert_eq!(m.entry_count, 2);
+        let keys: Vec<&str> = m.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["a.md", "b.md"]);
+    }
+
+    #[test]
+    fn ensure_heals_corrupt_present_and_next_load_warm() {
+        // W265 (issue 48, H1-V invalid branch): a present-but-corrupt body
+        // under a cold base is healed via If-Match overwrite with the base's
+        // file set; afterwards the load is WARM (a NoListStore no longer
+        // lists - the healed manifest is planning authority). W265 also
+        // mutation-checks: returning Adopted on a corrupt body would leave
+        // load failing.
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"not a manifest".to_vec());
+        store
+            .put_from(
+                crate::local::MANIFEST_KEY,
+                &mut c,
+                "not a manifest".len() as u64,
+                None,
+            )
+            .unwrap();
+        let base = cold_base(vec![crate::entity::file("a.md", 3, Some(1))]);
+        let out = ensure_remote_manifest(&store, &base, None).unwrap();
+        let (etag, count) = match out {
+            EnsureOutcome::Written { etag, entry_count } => (etag, entry_count),
+            other => panic!("expected Written, got {other:?}"),
+        };
+        assert!(etag.is_some());
+        assert_eq!(count, 1);
+        let mut buf = Vec::new();
+        store.get_to(crate::local::MANIFEST_KEY, &mut buf).unwrap();
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        assert_eq!(m.entry_count, 1);
+        assert_eq!(m.entries[0].key, "a.md");
+        // Next load is warm on a no-list store (healed manifest is authority).
+        let nolist = NoListStore {
+            inner: MemoryStore::new(),
+        };
+        // copy the healed body into the nolist's inner store
+        let mut c = std::io::Cursor::new(buf.clone());
+        nolist
+            .inner
+            .put_from(crate::local::MANIFEST_KEY, &mut c, buf.len() as u64, None)
+            .unwrap();
+        let inv = load_remote_inventory(&nolist, InventoryMode::Auto, None).unwrap();
+        assert!(
+            matches!(inv.base.source, InventorySource::Manifest { .. }),
+            "healed manifest must be warm authority, got {:?}",
+            inv.base.source
+        );
+    }
+
+    #[test]
+    fn ensure_adopts_concurrent_valid_with_zero_puts() {
+        // W268 (issue 48, F1 / D-h1v valid branch): a concurrent-valid live
+        // manifest is ADOPTED - no put (counter 0), the live body unchanged,
+        // and the outcome carries the live etag + live entry count. Mutation-
+        // check: if B1 still overwrote a valid present, puts would be 1 and
+        // b.md would be lost.
+        let store = PutCounterStore::new();
+        let their_body = manifest_body(&[("b.md", 1, None)]);
+        let blen = their_body.len() as u64;
+        let mut c = std::io::Cursor::new(their_body);
+        let live_etag = store
+            .inner
+            .put_from(crate::local::MANIFEST_KEY, &mut c, blen, None)
+            .unwrap()
+            .etag;
+        // Cold base is STALE (has a, lacks b).
+        let base = cold_base(vec![crate::entity::file("a.md", 5, Some(5))]);
+        let out = ensure_remote_manifest(&store, &base, None).unwrap();
+        let (etag, files, count) = match out {
+            EnsureOutcome::Adopted {
+                etag,
+                files,
+                entry_count,
+            } => (etag, files, entry_count),
+            other => panic!("expected Adopted, got {other:?}"),
+        };
+        assert_eq!(etag, live_etag.unwrap());
+        assert_eq!(count, 1);
+        let adopted_keys: Vec<&str> = files.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            adopted_keys,
+            vec!["b.md"],
+            "adopt carries the winner file set"
+        );
+        assert_eq!(store.manifest_puts(), 0, "adopt must not put");
+        // Live body unchanged: still only b.md.
+        let mut buf = Vec::new();
+        store.get_to(crate::local::MANIFEST_KEY, &mut buf).unwrap();
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        let keys: Vec<&str> = m.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["b.md"]);
+    }
+
+    #[test]
+    fn commit_after_adopted_refresh_keeps_their_untouched_keys() {
+        // W299/W300 (PR50-r1 H1, review 5476323432): after B1 ADOPTS a
+        // concurrent-valid manifest, the warm refresh must install the
+        // ADOPTED file set so the final commit's warm fold preserves the
+        // winner's untouched keys (c.md) instead of clobbering them with the
+        // stale cold list snapshot. RED: today the Adopted outcome carries no
+        // file set and refresh only warms etag/source, so apply([a],
+        // [Upload(a')]) writes {a.md} and c.md is lost.
+        let store = MemoryStore::new();
+        // Live manifest authored by a concurrent winner: {a.md, c.md}. c.md
+        // exists ONLY in the manifest (never surfaces in list+head).
+        let their_body = manifest_body(&[("a.md", 1, None), ("c.md", 2, None)]);
+        let blen = their_body.len() as u64;
+        let mut c = std::io::Cursor::new(their_body);
+        let their_etag = store
+            .put_from(crate::local::MANIFEST_KEY, &mut c, blen, None)
+            .unwrap()
+            .etag;
+        // Cold base is STALE: list+head saw only a.md (c.md is manifest-only).
+        let mut base = cold_base(vec![crate::entity::file("a.md", 5, Some(5))]);
+        // B1 adopts the concurrent-valid manifest (W268); the outcome must
+        // carry the parsed winner file set for a complete warm refresh.
+        let out = ensure_remote_manifest(&store, &base, None).unwrap();
+        let entry_count = match &out {
+            EnsureOutcome::Adopted { entry_count, .. } => *entry_count,
+            other => panic!("expected Adopted, got {other:?}"),
+        };
+        assert_eq!(entry_count, 2);
+        // W313 (M1): route the library pin through the PRODUCTION
+        // apply_ensure_outcome (by value, no hand-rolled source/etag/files
+        // install) so this pin cannot drift from the real warm refresh that
+        // installs the complete adopted snapshot.
+        let apply = apply_ensure_outcome(&mut base, out).unwrap();
+        assert_eq!(apply, EnsureApply::Adopted { entry_count: 2 });
+        assert_eq!(base.manifest_etag, their_etag);
+        // Push uploads a newer a.md; c.md is untouched by this run.
+        let upload = crate::entity::file("a.md", 6, Some(6));
+        let out = commit_manifest(&store, &base, &[CommitMutation::Upload(upload)], None).unwrap();
+        let (_, count) = match out {
+            CommitOutcome::Written { etag, entry_count } => (etag, entry_count),
+            other => panic!("expected Written, got {other:?}"),
+        };
+        assert_eq!(count, 2);
+        // The winner's untouched c.md must SURVIVE the final commit.
+        let mut buf = Vec::new();
+        store.get_to(crate::local::MANIFEST_KEY, &mut buf).unwrap();
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        let keys: Vec<&str> = m.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["a.md", "c.md"]);
+        // W313 (M1): the fold must ALSO assert our Upload won on the touched
+        // key - not just that the winner's untouched key survived. a.md's
+        // size/mtime come from the Upload entity (size 6, mtime 6), not the
+        // winner's stale size 1.
+        let a = m.entries.iter().find(|e| e.key == "a.md").unwrap();
+        assert_eq!(a.size, 6, "our Upload must win on the touched key (size)");
+        assert_eq!(
+            a.mtime_ms,
+            Some(6),
+            "our Upload must win on the touched key (mtime)"
+        );
+    }
+
+    #[test]
+    fn resolve_head_get_etag_mismatch_fails_closed() {
+        // W316 (PR50-r2 M2, review 5476798257): H1-V must condition on the
+        // GET entity etag when the validate probe returns one, and a HEAD
+        // etag that DIFFERS from the GET etag means the live object changed
+        // between HEAD and GET (another writer) - fail CLOSED (Err), never
+        // Adopt/If-Match a mixed pair. RED: today the code discards the GET
+        // etag and Adopts with the HEAD etag, so head="etag-head"/
+        // get="etag-get" returns Ok(Adopt) instead of Err.
+        struct MixedEtagStore {
+            inner: MemoryStore,
+        }
+        impl ObjectStore for MixedEtagStore {
+            fn list(&self, prefix: &str) -> Result<crate::store::Listing, Error> {
+                self.inner.list(prefix)
+            }
+            fn head(&self, key: &str) -> Result<crate::entity::Entity, Error> {
+                if key == crate::local::MANIFEST_KEY {
+                    return Ok(crate::entity::Entity {
+                        key: key.to_string(),
+                        size: 100,
+                        mtime_ms: None,
+                        etag: Some("etag-head".to_string()),
+                    });
+                }
+                self.inner.head(key)
+            }
+            fn get_to(
+                &self,
+                key: &str,
+                w: &mut dyn std::io::Write,
+            ) -> Result<crate::entity::Entity, Error> {
+                if key == crate::local::MANIFEST_KEY {
+                    let body = manifest_body(&[("a.md", 1, None)]);
+                    std::io::Write::write_all(w, &body).unwrap();
+                    return Ok(crate::entity::Entity {
+                        key: key.to_string(),
+                        size: body.len() as u64,
+                        mtime_ms: None,
+                        etag: Some("etag-get".to_string()),
+                    });
+                }
+                self.inner.get_to(key, w)
+            }
+            fn put_from(
+                &self,
+                key: &str,
+                r: &mut dyn std::io::Read,
+                size: u64,
+                mtime_ms: Option<u64>,
+            ) -> Result<crate::entity::Entity, Error> {
+                self.inner.put_from(key, r, size, mtime_ms)
+            }
+            fn delete(&self, key: &str) -> Result<(), Error> {
+                self.inner.delete(key)
+            }
+        }
+
+        let store = MixedEtagStore {
+            inner: MemoryStore::new(),
+        };
+        let base_files = vec![crate::entity::file("a.md", 1, None)];
+        let err = resolve_cold_put_plan(&store, &base_files, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("etag mismatch"),
+            "HEAD/GET etag mismatch must fail closed: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_uses_get_etag_when_present() {
+        // W317 (PR50-r2 M2): when the HEAD and GET etags agree, H1-V
+        // conditions on the GET entity etag (the generation we validated),
+        // not the stale HEAD token. Equal pair => Adopt carries the shared
+        // etag. characterization: GREEN on arrival (HEAD==GET here).
+        struct EqualEtagStore {
+            inner: MemoryStore,
+        }
+        impl ObjectStore for EqualEtagStore {
+            fn list(&self, prefix: &str) -> Result<crate::store::Listing, Error> {
+                self.inner.list(prefix)
+            }
+            fn head(&self, key: &str) -> Result<crate::entity::Entity, Error> {
+                if key == crate::local::MANIFEST_KEY {
+                    return Ok(crate::entity::Entity {
+                        key: key.to_string(),
+                        size: 100,
+                        mtime_ms: None,
+                        etag: Some("etag-x".to_string()),
+                    });
+                }
+                self.inner.head(key)
+            }
+            fn get_to(
+                &self,
+                key: &str,
+                w: &mut dyn std::io::Write,
+            ) -> Result<crate::entity::Entity, Error> {
+                if key == crate::local::MANIFEST_KEY {
+                    let body = manifest_body(&[("a.md", 1, None)]);
+                    std::io::Write::write_all(w, &body).unwrap();
+                    return Ok(crate::entity::Entity {
+                        key: key.to_string(),
+                        size: body.len() as u64,
+                        mtime_ms: None,
+                        etag: Some("etag-x".to_string()),
+                    });
+                }
+                self.inner.get_to(key, w)
+            }
+            fn put_from(
+                &self,
+                key: &str,
+                r: &mut dyn std::io::Read,
+                size: u64,
+                mtime_ms: Option<u64>,
+            ) -> Result<crate::entity::Entity, Error> {
+                self.inner.put_from(key, r, size, mtime_ms)
+            }
+            fn delete(&self, key: &str) -> Result<(), Error> {
+                self.inner.delete(key)
+            }
+        }
+
+        let store = EqualEtagStore {
+            inner: MemoryStore::new(),
+        };
+        let base_files = vec![crate::entity::file("a.md", 1, None)];
+        match resolve_cold_put_plan(&store, &base_files, None).unwrap() {
+            ColdPlan::Adopt {
+                etag, entry_count, ..
+            } => {
+                assert_eq!(etag, "etag-x");
+                assert_eq!(entry_count, 1);
+            }
+            other => panic!("expected Adopt with GET etag, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_or_ensure_oversize_present_skips_body_get() {
+        // W303 (PR50-r1 F1, review 5476323432): a present object whose HEAD
+        // size already exceeds the soft cap is unusable - the H1-V resolve
+        // must plan an Overwrite heal via If-Match WITHOUT GETting the
+        // (potentially huge) body. RED: today the present+etag branch always
+        // GETs (get counter > 0) and then fails on the vanished manifest.
+        let store = OversizeHeadStore::new();
+        let base_files = vec![crate::entity::file("a.md", 3, Some(1))];
+        let plan = resolve_cold_put_plan(&store, &base_files, None).unwrap();
+        assert_eq!(store.gets(), 0, "must not stream an over-cap body");
+        match plan {
+            ColdPlan::Overwrite { files, etag } => {
+                // Heal with the base file set, If-Match the live etag.
+                assert_eq!(etag, "oversize-etag");
+                let keys: Vec<&str> = files.iter().map(|e| e.key.as_str()).collect();
+                assert_eq!(keys, vec!["a.md"]);
+            }
+            other => panic!("expected Overwrite heal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensure_precondition_failed_is_race_as_data() {
+        // W266 (issue 48, F5 honesty note): a lost conditional race answers
+        // EnsureOutcome::PreconditionFailed (a value, not Err), clobbers
+        // nothing (pre-seeded body unchanged), and fills NO cache even when
+        // Some(cache) is passed. Single-store simulation, not two tasks
+        // (comment pin).
+        struct FailCondStore {
+            inner: MemoryStore,
+        }
+        impl ObjectStore for FailCondStore {
+            fn list(&self, prefix: &str) -> Result<crate::store::Listing, Error> {
+                self.inner.list(prefix)
+            }
+            fn head(&self, key: &str) -> Result<Entity, Error> {
+                // W266 simulated race: B1's HEAD sees ABSENT (so resolve
+                // chooses Create), while a concurrent writer's body ALREADY
+                // sits behind it - the later If-None-Match: * create must
+                // lose the race (return PreconditionFailed) and clobber
+                // nothing.
+                if key == crate::local::MANIFEST_KEY {
+                    return Err(Error::NotFound(key.to_string()));
+                }
+                self.inner.head(key)
+            }
+            fn get_to(&self, key: &str, w: &mut dyn std::io::Write) -> Result<Entity, Error> {
+                self.inner.get_to(key, w)
+            }
+            fn put_from(
+                &self,
+                key: &str,
+                r: &mut dyn std::io::Read,
+                size: u64,
+                mtime_ms: Option<u64>,
+            ) -> Result<Entity, Error> {
+                self.inner.put_from(key, r, size, mtime_ms)
+            }
+            fn put_from_with(
+                &self,
+                _key: &str,
+                _r: &mut dyn std::io::Read,
+                _size: u64,
+                opts: crate::store::PutOpts,
+            ) -> Result<Entity, Error> {
+                if opts.if_none_match_star || opts.if_match_etag.is_some() {
+                    return Err(Error::PreconditionFailed("lost race".to_string()));
+                }
+                self.inner.put_from(_key, _r, _size, opts.mtime_ms)
+            }
+            fn delete(&self, key: &str) -> Result<(), Error> {
+                self.inner.delete(key)
+            }
+        }
+        // W266 simulated race (not two ensure_remote_manifest tasks).
+        let dir = crate::testutil::TempDir::new("vaultsync-cache-test");
+        let cache = CachePaths::new(dir.path());
+        let store = FailCondStore {
+            inner: MemoryStore::new(),
+        };
+        // Pre-seed an existing manifest so the create path loses the
+        // If-None-Match: * race.
+        let seed = manifest_body(&[("x.md", 1, None)]);
+        let slen = seed.len() as u64;
+        let mut c = std::io::Cursor::new(seed);
+        store
+            .inner
+            .put_from(crate::local::MANIFEST_KEY, &mut c, slen, None)
+            .unwrap();
+        let base = cold_base(Vec::new());
+        let out = ensure_remote_manifest(&store, &base, Some(&cache)).unwrap();
+        assert_eq!(out, EnsureOutcome::PreconditionFailed);
+        // Pre-seeded body unchanged (no clobber).
+        let mut buf = Vec::new();
+        store.get_to(crate::local::MANIFEST_KEY, &mut buf).unwrap();
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        assert_eq!(m.entry_count, 1);
+        assert_eq!(m.entries[0].key, "x.md");
+        // No cache written on the lost race.
+        assert!(!cache.body.exists(), "no cache body on PreconditionFailed");
+    }
+
+    #[test]
+    fn ensure_fills_cache_on_written_not_adopted() {
+        // W267 (issue 48, D-cache): on `Written` the local mirror is filled;
+        // on `Adopted` no cache files are written (deferred in v1; the next
+        // warm load fetches/304s).
+        let dir = crate::testutil::TempDir::new("vaultsync-cache-test");
+        let cache = CachePaths::new(dir.path());
+        let store = MemoryStore::new();
+        // Written: warm empty base published + cache filled.
+        let base = cold_base(vec![crate::entity::file("a.md", 2, Some(1))]);
+        let out = ensure_remote_manifest(&store, &base, Some(&cache)).unwrap();
+        assert!(matches!(out, EnsureOutcome::Written { .. }));
+        assert!(cache.body.exists(), "cache body written on Written");
+        assert_eq!(
+            read_cache_meta(&cache).unwrap().remote_etag,
+            match out {
+                EnsureOutcome::Written { etag, .. } => etag,
+                _ => unreachable!(),
+            }
+        );
+        // Adopted: clear the cache dir, then ensure a concurrent-valid
+        // manifest is adopted - no NEW cache files appear.
+        std::fs::remove_file(&cache.body).unwrap();
+        std::fs::remove_file(&cache.meta).unwrap();
+        let their_body = manifest_body(&[("b.md", 1, None)]);
+        let blen = their_body.len() as u64;
+        let mut c = std::io::Cursor::new(their_body);
+        store
+            .put_from(crate::local::MANIFEST_KEY, &mut c, blen, None)
+            .unwrap();
+        let base2 = cold_base(vec![crate::entity::file("c.md", 3, Some(3))]);
+        let out = ensure_remote_manifest(&store, &base2, Some(&cache)).unwrap();
+        assert!(matches!(out, EnsureOutcome::Adopted { .. }));
+        assert!(
+            !cache.body.exists(),
+            "no cache body on Adopted (D-cache: no fill on adopt)"
+        );
+    }
+
+    #[test]
+    fn apply_ensure_outcome_adopted_replaces_file_entities() {
+        // W301 (PR50-r1 H1/F3, review 5476323432): after an Adopted refresh,
+        // the base's file set is REPLACED by the winner snapshot (complete),
+        // not left stale, and source/etag warm. Characterization pin.
+        let mut base = cold_base(vec![crate::entity::file("a.md", 1, None)]);
+        let outcome = EnsureOutcome::Adopted {
+            etag: "etag-x".to_string(),
+            files: vec![
+                crate::entity::file("a.md", 1, None),
+                crate::entity::file("c.md", 2, None),
+            ],
+            entry_count: 2,
+        };
+        let apply = apply_ensure_outcome(&mut base, outcome).unwrap();
+        assert_eq!(apply, EnsureApply::Adopted { entry_count: 2 });
+        let keys: Vec<&str> = base.file_entities.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["a.md", "c.md"], "adopted snapshot installed");
+        assert_eq!(base.manifest_etag.as_deref(), Some("etag-x"));
+        assert_eq!(
+            base.source,
+            InventorySource::Manifest {
+                remote_etag: Some("etag-x".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn apply_ensure_outcome_written_preserves_file_entities() {
+        // W301 (PR50-r1 H1/F3): after a Written refresh the base set is
+        // UNCHANGED (it already equals the body we wrote); only source/etag
+        // warm. Characterization pin.
+        let mut base = cold_base(vec![
+            crate::entity::file("a.md", 1, None),
+            crate::entity::file("b.md", 2, None),
+        ]);
+        let outcome = EnsureOutcome::Written {
+            etag: Some("etag-y".to_string()),
+            entry_count: 2,
+        };
+        let apply = apply_ensure_outcome(&mut base, outcome).unwrap();
+        assert_eq!(apply, EnsureApply::Written { entry_count: 2 });
+        let keys: Vec<&str> = base.file_entities.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["a.md", "b.md"],
+            "written keeps existing file set"
+        );
+        assert_eq!(base.manifest_etag.as_deref(), Some("etag-y"));
+    }
+
+    #[test]
+    fn apply_ensure_outcome_precondition_failed_is_none() {
+        // W301 (PR50-r1 H1/F3): PreconditionFailed is a non-apply - the
+        // helper returns None and leaves the cold base untouched (callers
+        // decide policy: push aborts, status exits 1).
+        let mut base = cold_base(vec![crate::entity::file("a.md", 1, None)]);
+        assert!(apply_ensure_outcome(&mut base, EnsureOutcome::PreconditionFailed).is_none());
+        assert_eq!(base.source, InventorySource::LiveListHead);
+        assert!(base.manifest_etag.is_none());
     }
 }

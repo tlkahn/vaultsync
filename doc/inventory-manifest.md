@@ -325,10 +325,12 @@ Even with a warm manifest, emit a short stderr milestone on TTY, e.g. `inventory
 
 | Command | Remote bodies change? | Commit manifest? |
 | --- | --- | --- |
-| `status` | no | no |
+| `status` | no | no (Q3) |
+| `status --write-manifest` (issue 48) | no | **yes**, explicit B1 opt-in on a cold auto store |
 | `pull` / `pull --delete` | no | no |
 | `push` (uploads only) | yes | **yes**, if any upload succeeded or planned remote set changed |
 | `push --delete` | yes | **yes**, after successful uploads **and** successful remote deletes for this run |
+| `push` cold bootstrap (issue 48) | no | **B1**: publishes a pre-transfer baseline (or adopts) |
 | `repair` | no body requirement | **yes** (always writes a fresh snapshot) |
 | `check` | probe only | no (probe key reserved; not inventory) |
 
@@ -378,23 +380,35 @@ put manifest body to `.vaultsync/manifest/v1.json`
   WARM base (base.manifest_etag is Some):
     with If-Match: base.manifest_etag
   COLD base (base.manifest_etag is None - LiveListHead, missing, or forced
-  mode): resolve the condition against the LIVE object at commit time:
+  mode): H1-V validate-before-overwrite against the LIVE object:
     head(MANIFEST_KEY)
-      present => If-Match on the live etag        (overwrite; heals corrupt
-                                                 bodies and list_head-era
-                                                 objects)
-      absent  => If-None-Match: *                  (create)
-      present but head has no etag (etag-less backend) => unconditional put
-        on the cold resolve path ONLY - multi-writer safety is lost there
-        (design note: manifest mode assumes an etag-capable backend)
+      absent => If-None-Match: *                  (create)
+      present with NO etag (etag-less backend) => unconditional put on the
+        cold resolve path ONLY - multi-writer safety is lost there (design
+        note: manifest mode assumes an etag-capable backend)
+      present with etag => GET + parse/validate the live body (H1-V, issue
+        48, F1/F1b): the conditional If-Match etag is the GET entity etag
+        when the validate probe returns one (the generation we validated,
+        matching the warm-load GET authority); a HEAD etag that DIFFERS from
+        the GET etag means another writer changed the object between HEAD
+        and GET - fail closed (Err; F2 policy decides abort/continue), never
+        If-Match a mixed pair. Oversize-pre-GET and tripped-writer heals
+        still If-Match the HEAD etag (no trustworthy GET body).
+        VALID body => fold successes onto THEIR entries
+          (apply(base.successes) onto their.file_entities) and If-Match
+          THEIR etag - their untouched keys survive this commit (never a
+          blind clobber of a concurrent-valid manifest)
+        corrupt body  => heal via If-Match on the live etag with
+          apply(base, successes)
 ```
 
 A cold base means "resolve the live condition at commit time", NOT "always
-If-None-Match: *": a present corrupt body or a manifest written under
-`list_head` planning must be overwritable by the next push. `list_head`
-forces cold PLANNING only - push still commits, so other devices on `auto`
-keep a fresh control plane. A WARM base keeps If-Match on the base etag with
-no extra head.
+If-None-Match: *" and NOT "always blind overwrite": a present corrupt body
+or a manifest written under `list_head` planning must be overwritable, but a
+concurrent-valid manifest must never be silently clobbered (H1-V, W291).
+`list_head` forces cold PLANNING only - push still commits, so other devices
+on `auto` keep a fresh control plane. A WARM base keeps If-Match on the base
+etag with no extra head.
 
 Outcomes:
 
@@ -422,8 +436,55 @@ On lost conditional race: another writer committed first; their manifest may or 
 
 ### 7.6 Empty vault / first push
 
-- No manifest + empty remote: push uploads files, then creates manifest with `If-None-Match: *`.
-- If create loses race: warning; repair.
+- No manifest + empty remote: a `push` on `auto` + `push-ensure` may B1 a **0-entry** baseline before transfers (warm empty baseline, IQ-empty); otherwise push uploads files, then the final commit creates the manifest with `If-None-Match: *`.
+- If create loses race: warning (final commit) / abort (B1, see 7.7); repair.
+
+### 7.7 Push-time inventory bootstrap (issue 48, B1 / C-PA)
+
+A fresh `push` (or explicit `status --write-manifest`) can publish the remote
+manifest from a COLD inventory instead of waiting for an upload to succeed.
+This removes the "cold-lists every run until a file changes" wall: after one
+cold inventory on an eligible push, later plans are warm even when transfers
+failed or none were planned.
+
+**B1 (`ensure_remote_manifest`)** publishes `base.file_entities` (the
+pre-transfer remote file set, pre-ignore, post-reserved - D-body) as a new
+manifest with the same conditional put rules as commit, OR **adopts** a
+concurrent-valid live manifest without writing (H1-V, F1). It never re-lists
+and never claims in-flight uploads: the final commit still applies successful
+mutations last (7.5).
+
+**Authority is unchanged (D-auth).** Planning still happens only from a valid
+remote manifest or a live list+head; the local cache (section 9) is a 304
+mirror and is never an authority. B1 simply makes the next plan warm sooner.
+
+**Cache (D-cache / D-n5).** On `Written` the local cache mirror is refreshed
+with the new body + etag; on `Adopted` no cache write is done in v1 (the next
+warm load fetches/304s). After a `Written { etag: None }` on an etag-less
+backend, the refreshed base is still a warm `Manifest { remote_etag: None }`
+(warm for the B1 predicate; the final commit may H1 again on that backend)
+- the residual multi-writer hole on etag-less backends is documented, not
+closed (N5).
+
+**Adopted refresh installs the winner snapshot (PR50-r1 H1).** After
+`Adopted`, the in-memory base's `file_entities` are replaced by the parsed
+adopted manifest's file set (not the stale cold list) and the source/etag
+warm - so before any transfer the base already holds the winner's complete
+snapshot, and the final commit folds our successes onto it without dropping
+their untouched keys (review 5476323432).
+
+**Failure policy (F2 split).** Push + `PreconditionFailed` (another writer
+won) aborts before any transfer - without B1 for a warm baseline,
+the final commitment could cascade-clobber the winner with a stale cold base
+(F0). Push + a transient `Err` warns and continues cold (availability).
+`status --write-manifest` fails closed (exit 1) on any bootstrap failure - the
+write is the requested op.
+
+**Stale-authority window (F7).** B1 advances the publish time of a snapshot
+that is already ~list-duration old; concurrent readers between B1 and the
+final commit plan from that (authoritative) manifest where they previously
+cold-listed truth. Inherent to the manifest design; the next commit / repair
+converges. Accepted.
 
 ---
 
