@@ -36,6 +36,8 @@ pub enum Command {
         config: Option<PathBuf>,
         verbose: u8,
         follow_symlinks: bool,
+        /// issue 48: explicitly publish/cold-bootstrap the manifest from status.
+        write_manifest: bool,
     },
     Push {
         vault: PathBuf,
@@ -85,6 +87,7 @@ impl Command {
             config: None,
             verbose: 0,
             follow_symlinks: false,
+            write_manifest: false,
         }
     }
     /// Push with a vault + delete; remaining flags at defaults.
@@ -207,10 +210,21 @@ struct RepairArgs {
     force: bool,
 }
 
+#[derive(Args, Debug, Clone, PartialEq)]
+struct StatusArgs {
+    /// issue 48 (IQ9 / D-trigger-status): explicitly write (or cold-
+    /// bootstrap) the remote manifest from status. Never implied by default
+    /// (Q3 holds); `bootstrap`/mode policy applies (mode checked before
+    /// warm; the knob is ignored - the flag always wins). Output lines go to
+    /// stderr so a future JSON stdout stays clean (D-json).
+    #[arg(long)]
+    write_manifest: bool,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Show diff between local vault and remote prefix
-    Status,
+    Status(StatusArgs),
     /// Upload local-newer and remote-missing paths
     Push(TransferArgs),
     /// Download remote-newer and local-missing paths
@@ -231,12 +245,13 @@ impl Cli {
         let verbose = self.verbose;
         match self.command {
             None => Command::Help,
-            Some(Commands::Status) => Command::Status {
+            Some(Commands::Status(a)) => Command::Status {
                 vault: self.vault,
                 json: self.json,
                 config,
                 verbose,
                 follow_symlinks: self.follow_symlinks,
+                write_manifest: a.write_manifest,
             },
             Some(Commands::Push(a)) => Command::Push {
                 vault: self.vault,
@@ -350,6 +365,9 @@ pub struct DispatchCtx {
     /// Resolved `[inventory].mode` (issue 45): threaded into every
     /// `build_plan` call (warm manifest vs live list+head).
     pub inventory_mode: crate::config::InventoryMode,
+    /// Resolved `[inventory].bootstrap` (issue 48, IQ6): push-time B1
+    /// gate (`push-ensure` default). `status --write-manifest` ignores it.
+    pub inventory_bootstrap: crate::config::InventoryBootstrap,
 }
 
 /// Dispatch a command against a store, writing to `out`/`err`. Returns exit code.
@@ -478,6 +496,7 @@ pub fn run_with_io(
             config: _c,
             verbose,
             follow_symlinks,
+            write_manifest,
         } => {
             if json {
                 return reject_json(err);
@@ -509,6 +528,79 @@ pub fn run_with_io(
                     // W236 (issue 45): one always-on inventory source line.
                     print_inventory_line(&report, err);
                     print_walk_warnings(&local, follow_symlinks, err);
+                    let mut inventory_base = report.inventory_base;
+                    // Issue 48 (S6, IQ9 / D-trigger-status): explicit
+                    // `--write-manifest` may publish (or adopt) the manifest
+                    // from status. Mode-first skip ordering (F4): non-Auto is
+                    // reported as a mode skip EVEN when warm; warm-under-Auto
+                    // is an already-warm skip. The bootstrap knob is ignored.
+                    if write_manifest {
+                        if ctx.inventory_mode != crate::config::InventoryMode::Auto {
+                            let _ = writeln!(
+                                err,
+                                "inventory: manifest bootstrap skipped (mode={})",
+                                inventory_mode_name(ctx.inventory_mode)
+                            );
+                        } else if matches!(
+                            inventory_base.source,
+                            crate::inventory::InventorySource::Manifest { .. }
+                        ) {
+                            let _ = writeln!(
+                                err,
+                                "inventory: manifest bootstrap skipped (already warm)"
+                            );
+                        } else {
+                            let cache = crate::inventory::CachePaths::new(&vault);
+                            match crate::inventory::ensure_remote_manifest(
+                                store,
+                                &inventory_base,
+                                Some(&cache),
+                            ) {
+                                Ok(crate::inventory::EnsureOutcome::Written {
+                                    etag,
+                                    entry_count,
+                                }) => {
+                                    inventory_base.source =
+                                        crate::inventory::InventorySource::Manifest {
+                                            remote_etag: etag.clone(),
+                                        };
+                                    inventory_base.manifest_etag = etag;
+                                    let _ = writeln!(
+                                        err,
+                                        "inventory: manifest bootstrap written ({entry_count} entries)"
+                                    );
+                                }
+                                Ok(crate::inventory::EnsureOutcome::Adopted {
+                                    etag,
+                                    entry_count,
+                                }) => {
+                                    inventory_base.source =
+                                        crate::inventory::InventorySource::Manifest {
+                                            remote_etag: etag.clone(),
+                                        };
+                                    inventory_base.manifest_etag = etag;
+                                    let _ = writeln!(
+                                        err,
+                                        "inventory: manifest bootstrap adopted (already present, {entry_count} entries)"
+                                    );
+                                }
+                                // Status: write is the op, so any failure
+                                // (PreconditionFailed OR Err) exits 1, and
+                                // never prints the continue-warm warning.
+                                Ok(crate::inventory::EnsureOutcome::PreconditionFailed) => {
+                                    let _ = writeln!(
+                                        err,
+                                        "error: manifest bootstrap failed (lost race); another writer owns the manifest"
+                                    );
+                                    return 1;
+                                }
+                                Err(e) => {
+                                    let _ = writeln!(err, "error: manifest bootstrap failed: {e}");
+                                    return 1;
+                                }
+                            }
+                        }
+                    }
                     let plan = &report.plan;
                     let _ = write!(out, "{}", crate::format_plan_human_verbose(plan, verbose));
                     if is_clean(plan) { 0 } else { 2 }
@@ -547,6 +639,7 @@ pub fn run_with_io(
                 progress: ctx.progress_mode,
                 ignore: ctx.ignore.clone(),
                 inventory_mode: ctx.inventory_mode,
+                inventory_bootstrap: ctx.inventory_bootstrap,
             };
             dispatch_plan(&vault, store, Mode::Push, &opts, &flags, out, err)
         }
@@ -578,6 +671,7 @@ pub fn run_with_io(
                 progress: ctx.progress_mode,
                 ignore: ctx.ignore.clone(),
                 inventory_mode: ctx.inventory_mode,
+                inventory_bootstrap: ctx.inventory_bootstrap,
             };
             dispatch_plan(&vault, store, Mode::Pull, &opts, &flags, out, err)
         }
@@ -600,6 +694,31 @@ fn print_inventory_line(report: &crate::PlanReport, err: &mut dyn Write) {
         crate::inventory::InventorySource::LiveListHead => {
             let _ = writeln!(err, "inventory: list+head (cold)");
         }
+    }
+}
+
+/// Issue 48 (S5 / D-trigger-push / IQ1+IQ2): may push-time B1 run? All must
+/// hold - not a dry run, inventory mode Auto, bootstrap push-ensure, and a
+/// COLD base (LiveListHead; a warm Manifest with ANY etag, including None
+/// after an etag-less B1, skips B1). Pure and unit-tested (W290 table).
+fn should_push_b1(
+    dry_run: bool,
+    mode: crate::config::InventoryMode,
+    bootstrap: crate::config::InventoryBootstrap,
+    source: &crate::inventory::InventorySource,
+) -> bool {
+    !dry_run
+        && mode == crate::config::InventoryMode::Auto
+        && bootstrap == crate::config::InventoryBootstrap::PushEnsure
+        && matches!(source, crate::inventory::InventorySource::LiveListHead)
+}
+
+/// Canonical `[inventory].mode` name for skip lines (issue 48, D-b1-skip-mode).
+fn inventory_mode_name(mode: crate::config::InventoryMode) -> &'static str {
+    match mode {
+        crate::config::InventoryMode::Auto => "auto",
+        crate::config::InventoryMode::Manifest => "manifest",
+        crate::config::InventoryMode::ListHead => "list_head",
     }
 }
 
@@ -661,6 +780,8 @@ struct PlanFlags {
     /// Resolved `[inventory].mode` (issue 45, W235) threaded into
     /// `dispatch_plan`'s `build_plan` call.
     inventory_mode: crate::config::InventoryMode,
+    /// Resolved `[inventory].bootstrap` (issue 48, IQ6): push-time B1 gate.
+    inventory_bootstrap: crate::config::InventoryBootstrap,
 }
 
 /// Build the I27 progress renderer for a resolved mode (I27 cycle 8 refactor:
@@ -726,6 +847,64 @@ fn dispatch_plan(
             // build (push/pull too, not just status).
             print_inventory_line(&report, err);
             print_walk_warnings(&local, flags.follow_symlinks, err);
+            let mut inventory_base = report.inventory_base;
+            // Issue 48 (S5, B1 / D-trigger-push): push-time bootstrap BEFORE
+            // transfers - a cold auto push-ensure push publishes (or adopts)
+            // the manifest so later plans are warm even if transfers fail /
+            // are zero. Dry-run / non-auto / bootstrap=never / warm skip.
+            // Pull never bootstraps (Q6): mode is pushed here.
+            if mode == Mode::Push
+                && should_push_b1(
+                    flags.dry_run,
+                    flags.inventory_mode,
+                    flags.inventory_bootstrap,
+                    &inventory_base.source,
+                )
+            {
+                let cache = crate::inventory::CachePaths::new(vault);
+                match crate::inventory::ensure_remote_manifest(store, &inventory_base, Some(&cache))
+                {
+                    Ok(crate::inventory::EnsureOutcome::Written { etag, entry_count }) => {
+                        inventory_base.source = crate::inventory::InventorySource::Manifest {
+                            remote_etag: etag.clone(),
+                        };
+                        inventory_base.manifest_etag = etag;
+                        let _ = writeln!(
+                            err,
+                            "inventory: manifest bootstrap written ({entry_count} entries)"
+                        );
+                    }
+                    Ok(crate::inventory::EnsureOutcome::Adopted { etag, entry_count }) => {
+                        inventory_base.source = crate::inventory::InventorySource::Manifest {
+                            remote_etag: etag.clone(),
+                        };
+                        inventory_base.manifest_etag = etag;
+                        let _ = writeln!(
+                            err,
+                            "inventory: manifest bootstrap adopted (already present, {entry_count} entries)"
+                        );
+                    }
+                    // F0/F2: a lost conditional race aborts the push BEFORE
+                    // any transfer - otherwise the final commit's H1 could
+                    // cascade-clobber the winner with a stale base.
+                    Ok(crate::inventory::EnsureOutcome::PreconditionFailed) => {
+                        let _ = writeln!(
+                            err,
+                            "error: manifest bootstrap failed (lost race); another writer owns the manifest; aborting before transfers"
+                        );
+                        return 1;
+                    }
+                    // F2 split: a transient Err warns and continues cold
+                    // (same spirit as the final-commit Err arm) - the push
+                    // may still transfer.
+                    Err(e) => {
+                        let _ = writeln!(
+                            err,
+                            "warning: manifest bootstrap failed: {e}; continuing without bootstrap"
+                        );
+                    }
+                }
+            }
             let plan = &report.plan;
             let _ = write!(
                 out,
@@ -739,7 +918,6 @@ fn dispatch_plan(
                 // (1 = sequential). I27: the executor's progress events feed
                 // the resolved renderer (bar on TTY/Auto or Always; no-op
                 // otherwise); stdout never sees progress bytes (I27-shape).
-                let inventory_base = report.inventory_base;
                 let exec_report = {
                     let renderer = build_progress_renderer(resolved, err);
                     crate::exec::execute_plan_with_progress(
@@ -848,12 +1026,14 @@ fn resolve_vault_from_config(cmd: Command, settings: &crate::config::Settings) -
             config,
             verbose,
             follow_symlinks,
+            write_manifest,
         } if vault == Path::new(VAULT_UNSET) => Command::Status {
             vault: want,
             json,
             config,
             verbose,
             follow_symlinks,
+            write_manifest,
         },
         Command::Push {
             vault,
@@ -1016,6 +1196,7 @@ fn run_with_settings_store(
             progress_mode,
             ignore,
             inventory_mode: settings.inventory_mode,
+            inventory_bootstrap: settings.inventory_bootstrap,
         },
         out,
         err,
@@ -1063,6 +1244,7 @@ pub fn run_from_env() -> i32 {
             progress_mode: ProgressMode::Auto,
             ignore: crate::IgnoreSet::empty(),
             inventory_mode: crate::config::InventoryMode::Auto,
+            inventory_bootstrap: crate::config::InventoryBootstrap::PushEnsure,
         };
         return run_with_io(cmd, &MemoryStore::new(), &ctx, &mut out, &mut err);
     }
@@ -1127,6 +1309,7 @@ mod tests {
             ignore_patterns: Vec::new(),
             resolved_ignore_patterns: Vec::new(),
             inventory_mode: crate::config::InventoryMode::Auto,
+            inventory_bootstrap: crate::config::InventoryBootstrap::PushEnsure,
         };
         // explicit --vault wins over the config root
         let cli_explicit = Command::status(PathBuf::from("/cli/vault"));
@@ -1508,6 +1691,7 @@ mod tests {
                 ignore: crate::IgnoreSet::empty(),
                 // W235: list_head keeps this helper exactly today's behavior.
                 inventory_mode: crate::config::InventoryMode::ListHead,
+                inventory_bootstrap: crate::config::InventoryBootstrap::PushEnsure,
             },
             &mut out,
             &mut err,
@@ -1540,6 +1724,7 @@ mod tests {
                 progress_mode: ProgressMode::Off,
                 ignore: crate::IgnoreSet::empty(),
                 inventory_mode: crate::config::InventoryMode::ListHead,
+                inventory_bootstrap: crate::config::InventoryBootstrap::PushEnsure,
             },
             &mut out,
             &mut err,
@@ -1571,6 +1756,7 @@ mod tests {
                 progress_mode: mode,
                 ignore: crate::IgnoreSet::empty(),
                 inventory_mode: crate::config::InventoryMode::ListHead,
+                inventory_bootstrap: crate::config::InventoryBootstrap::PushEnsure,
             },
             &mut out,
             &mut err,
@@ -1831,6 +2017,7 @@ mod tests {
                 progress_mode: ProgressMode::Off,
                 ignore: crate::IgnoreSet::empty(),
                 inventory_mode: crate::config::InventoryMode::Auto,
+                inventory_bootstrap: crate::config::InventoryBootstrap::PushEnsure,
             },
             &mut out,
             &mut err,
@@ -1856,6 +2043,7 @@ mod tests {
                 progress_mode: ProgressMode::Off,
                 ignore: crate::IgnoreSet::empty(),
                 inventory_mode: crate::config::InventoryMode::ListHead,
+                inventory_bootstrap: crate::config::InventoryBootstrap::PushEnsure,
             },
             &mut out,
             &mut err,
@@ -1880,6 +2068,7 @@ mod tests {
             config: None,
             verbose: 0,
             follow_symlinks: false,
+            write_manifest: false,
         };
         let (code, _, err) = run(cmd, &MemoryStore::new());
         assert_eq!(code, 1);
@@ -1906,6 +2095,7 @@ mod tests {
                 progress_mode: ProgressMode::Off,
                 ignore: crate::IgnoreSet::empty(),
                 inventory_mode: crate::config::InventoryMode::Auto,
+                inventory_bootstrap: crate::config::InventoryBootstrap::PushEnsure,
             },
             &mut out,
             &mut err,
@@ -1934,6 +2124,7 @@ mod tests {
                 progress_mode: ProgressMode::Off,
                 ignore: crate::IgnoreSet::empty(),
                 inventory_mode: crate::config::InventoryMode::Auto,
+                inventory_bootstrap: crate::config::InventoryBootstrap::PushEnsure,
             },
             &mut out,
             &mut err,
@@ -1963,6 +2154,7 @@ mod tests {
                 progress_mode: ProgressMode::Off,
                 ignore: crate::IgnoreSet::empty(),
                 inventory_mode: crate::config::InventoryMode::Auto,
+                inventory_bootstrap: crate::config::InventoryBootstrap::PushEnsure,
             },
             &mut out,
             &mut err,
@@ -2013,6 +2205,7 @@ mod tests {
                 progress_mode: ProgressMode::Off,
                 ignore: crate::IgnoreSet::empty(),
                 inventory_mode: crate::config::InventoryMode::Auto,
+                inventory_bootstrap: crate::config::InventoryBootstrap::PushEnsure,
             },
             &mut out,
             &mut err,
@@ -2052,6 +2245,7 @@ mod tests {
                 progress_mode: ProgressMode::Off,
                 ignore: crate::IgnoreSet::empty(),
                 inventory_mode: crate::config::InventoryMode::Auto,
+                inventory_bootstrap: crate::config::InventoryBootstrap::PushEnsure,
             },
             &mut out,
             &mut err,
@@ -2101,6 +2295,7 @@ mod tests {
                 progress_mode: ProgressMode::Off,
                 ignore: crate::IgnoreSet::empty(),
                 inventory_mode: crate::config::InventoryMode::Auto,
+                inventory_bootstrap: crate::config::InventoryBootstrap::PushEnsure,
             },
             &mut out,
             &mut err,
@@ -2133,6 +2328,11 @@ mod tests {
                 progress_mode: ProgressMode::Off,
                 ignore: crate::IgnoreSet::empty(),
                 inventory_mode: crate::config::InventoryMode::Auto,
+                // This PINS the FINAL-COMMIT Q2 path (race at commit => warn
+                // + exit 0). Bootstrap is disabled so B1 does not abort first
+                // on this always-races double (the B1-race-abort path is a
+                // separate pin - W276).
+                inventory_bootstrap: crate::config::InventoryBootstrap::Never,
             },
             &mut out,
             &mut err,
@@ -2213,6 +2413,7 @@ mod tests {
                 progress_mode: ProgressMode::Off,
                 ignore: crate::IgnoreSet::empty(),
                 inventory_mode: crate::config::InventoryMode::ListHead,
+                inventory_bootstrap: crate::config::InventoryBootstrap::PushEnsure,
             },
             &mut out,
             &mut err,
@@ -2263,6 +2464,7 @@ mod tests {
                 progress_mode: ProgressMode::Off,
                 ignore: crate::IgnoreSet::empty(),
                 inventory_mode: crate::config::InventoryMode::ListHead,
+                inventory_bootstrap: crate::config::InventoryBootstrap::PushEnsure,
             },
             &mut out,
             &mut err,
@@ -2310,6 +2512,7 @@ mod tests {
                 progress_mode: ProgressMode::Off,
                 ignore: crate::IgnoreSet::empty(),
                 inventory_mode: crate::config::InventoryMode::ListHead,
+                inventory_bootstrap: crate::config::InventoryBootstrap::PushEnsure,
             },
             &mut out,
             &mut err,
@@ -2350,6 +2553,7 @@ mod tests {
                 progress_mode: ProgressMode::Off,
                 ignore: crate::IgnoreSet::empty(),
                 inventory_mode: crate::config::InventoryMode::ListHead,
+                inventory_bootstrap: crate::config::InventoryBootstrap::PushEnsure,
             },
             &mut out,
             &mut err,
@@ -2390,6 +2594,7 @@ mod tests {
                 progress_mode: ProgressMode::Off,
                 ignore: crate::IgnoreSet::empty(),
                 inventory_mode: crate::config::InventoryMode::ListHead,
+                inventory_bootstrap: crate::config::InventoryBootstrap::PushEnsure,
             },
             &mut out,
             &mut err,
@@ -3748,5 +3953,936 @@ mod tests {
         );
         assert_eq!(code, 1);
         assert!(err.contains("error:"));
+    }
+
+    // --- issue 48 (S5/S6): push-time + status bootstrap ---
+
+    /// Test seam: run a command with an explicit inventory mode + bootstrap
+    /// and captured stdout/stderr (the plain `run` helper pins ListHead, which
+    /// would skip B1; these tests need Auto / specific modes).
+    fn run_bi(
+        cmd: Command,
+        store: &dyn ObjectStore,
+        mode: crate::config::InventoryMode,
+        bootstrap: crate::config::InventoryBootstrap,
+    ) -> (i32, String, String) {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            cmd,
+            store,
+            &DispatchCtx {
+                tolerance_ms: crate::config::DEFAULT_MTIME_TOLERANCE_MS,
+                concurrency: 1,
+                progress_mode: ProgressMode::Off,
+                ignore: crate::IgnoreSet::empty(),
+                inventory_mode: mode,
+                inventory_bootstrap: bootstrap,
+            },
+            &mut out,
+            &mut err,
+        );
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    }
+
+    fn status_wm(vault: &std::path::Path, flag: bool) -> Command {
+        Command::Status {
+            vault: vault.to_path_buf(),
+            json: false,
+            config: None,
+            verbose: 0,
+            follow_symlinks: false,
+            write_manifest: flag,
+        }
+    }
+
+    #[test]
+    fn should_push_b1_predicate_table() {
+        use crate::config::{InventoryBootstrap as B, InventoryMode as M};
+        use crate::inventory::InventorySource as S;
+        let cold = S::LiveListHead;
+        let warm = S::Manifest {
+            remote_etag: Some("e".into()),
+        };
+        // W290 table (F5): only NONE of the negative drivers may turn it off.
+        assert!(should_push_b1(false, M::Auto, B::PushEnsure, &cold));
+        assert!(
+            !should_push_b1(true, M::Auto, B::PushEnsure, &cold),
+            "dry-run"
+        );
+        assert!(
+            !should_push_b1(false, M::ListHead, B::PushEnsure, &cold),
+            "list_head"
+        );
+        assert!(!should_push_b1(false, M::Auto, B::Never, &cold), "never");
+        assert!(
+            !should_push_b1(false, M::Auto, B::PushEnsure, &warm),
+            "warm"
+        );
+        assert!(
+            !should_push_b1(false, M::Manifest, B::PushEnsure, &cold),
+            "manifest mode"
+        );
+    }
+
+    #[test]
+    fn warm_push_never_bootstraps() {
+        // W290 (issue 48, F5): a WARM push (valid manifest already) must NOT
+        // call B1 - the manifest-key put counter stays 0 and the manifest is
+        // untouched (zero mutations, so no commit either).
+        struct Counter(MemoryStore, std::sync::atomic::AtomicUsize);
+        impl ObjectStore for Counter {
+            fn list(&self, p: &str) -> Result<crate::store::Listing, crate::error::Error> {
+                self.0.list(p)
+            }
+            fn head(&self, k: &str) -> Result<crate::entity::Entity, crate::error::Error> {
+                self.0.head(k)
+            }
+            fn get_to(
+                &self,
+                k: &str,
+                w: &mut dyn std::io::Write,
+            ) -> Result<crate::entity::Entity, crate::error::Error> {
+                self.0.get_to(k, w)
+            }
+            fn put_from(
+                &self,
+                k: &str,
+                r: &mut dyn std::io::Read,
+                s: u64,
+                m: Option<u64>,
+            ) -> Result<crate::entity::Entity, crate::error::Error> {
+                if k == crate::local::MANIFEST_KEY {
+                    self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.0.put_from(k, r, s, m)
+            }
+            fn put_from_with(
+                &self,
+                k: &str,
+                r: &mut dyn std::io::Read,
+                s: u64,
+                o: crate::store::PutOpts,
+            ) -> Result<crate::entity::Entity, crate::error::Error> {
+                if k == crate::local::MANIFEST_KEY {
+                    self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.0.put_from_with(k, r, s, o)
+            }
+            fn delete(&self, k: &str) -> Result<(), crate::error::Error> {
+                self.0.delete(k)
+            }
+        }
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "hi").unwrap();
+        let store = Counter(MemoryStore::new(), std::sync::atomic::AtomicUsize::new(0));
+        // Remote is newer (future mtime) so push plans zero uploads; with no
+        // B1 on a warm source and no mutations, the manifest put counter is 0.
+        let body = br#"{"schema":"vaultsync.manifest.v1","created_ms":0,"entry_count":1,"entries":[{"key":"a.md","size":2,"mtime_ms":9999999999999}]}"#;
+        let mut c = std::io::Cursor::new(body.to_vec());
+        store
+            .0
+            .put_from(crate::local::MANIFEST_KEY, &mut c, body.len() as u64, None)
+            .unwrap();
+        let (code, _, _) = run_bi(
+            Command::push(dir.path().into(), false),
+            &store,
+            crate::config::InventoryMode::Auto,
+            crate::config::InventoryBootstrap::PushEnsure,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(
+            store.1.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "warm push must not put the manifest (no B1, no commit)"
+        );
+    }
+
+    #[test]
+    fn push_dry_run_never_bootstraps() {
+        // W273 (issue 48, D-dry-run): `push --dry-run` never B1 (and never
+        // commits) - the manifest stays absent.
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "hi").unwrap();
+        let cmd = Command::Push {
+            vault: dir.path().into(),
+            delete: false,
+            dry_run: true,
+            force_local: false,
+            force_remote: false,
+            json: false,
+            config: None,
+            verbose: 0,
+            follow_symlinks: false,
+        };
+        let store = MemoryStore::new();
+        let (code, _, err) = run_bi(
+            cmd,
+            &store,
+            crate::config::InventoryMode::Auto,
+            crate::config::InventoryBootstrap::PushEnsure,
+        );
+        assert_eq!(code, 2, "plan shows upload but nothing ran");
+        assert!(!err.contains("bootstrap written"));
+        assert!(matches!(
+            store.head(crate::local::MANIFEST_KEY).unwrap_err(),
+            crate::error::Error::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn push_bootstrap_never_skips_b1() {
+        // W274 (issue 48, D-config): `bootstrap = "never"` skips push-time
+        // B1 - a clean cold push leaves the manifest absent (a create-allowed
+        // push-ensure would have written a 0-entry baseline here).
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = MemoryStore::new();
+        let (code, _, _) = run_bi(
+            Command::push(dir.path().into(), false),
+            &store,
+            crate::config::InventoryMode::Auto,
+            crate::config::InventoryBootstrap::Never,
+        );
+        assert_eq!(code, 0);
+        assert!(matches!(
+            store.head(crate::local::MANIFEST_KEY).unwrap_err(),
+            crate::error::Error::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn push_list_head_skips_b1() {
+        // W275 (issue 48, IQ4): `mode = list_head` never bootstraps, even on
+        // a cold clean push.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = MemoryStore::new();
+        let (code, _, _) = run_bi(
+            Command::push(dir.path().into(), false),
+            &store,
+            crate::config::InventoryMode::ListHead,
+            crate::config::InventoryBootstrap::PushEnsure,
+        );
+        assert_eq!(code, 0);
+        assert!(matches!(
+            store.head(crate::local::MANIFEST_KEY).unwrap_err(),
+            crate::error::Error::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn zero_mutation_cold_push_writes_warm_baseline() {
+        // W271 (issue 48, A7): a clean cold push (no uploads) still publishes
+        // a 0-entry baseline via B1, prints the locked bootstrap line, and the
+        // next auto load is WARM (no list).
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = MemoryStore::new();
+        let (code, _, err) = run_bi(
+            Command::push(dir.path().into(), false),
+            &store,
+            crate::config::InventoryMode::Auto,
+            crate::config::InventoryBootstrap::PushEnsure,
+        );
+        assert_eq!(code, 0);
+        assert!(err.contains("manifest bootstrap written ("), "err: {err}");
+        let mut buf = Vec::new();
+        store.get_to(crate::local::MANIFEST_KEY, &mut buf).unwrap();
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        assert_eq!(m.entry_count, 0);
+        // Next auto load is warm on a no-list store.
+        struct NoList(MemoryStore);
+        impl ObjectStore for NoList {
+            fn list(&self, _p: &str) -> Result<crate::store::Listing, crate::error::Error> {
+                panic!("warm path must not list");
+            }
+            fn head(&self, k: &str) -> Result<crate::entity::Entity, crate::error::Error> {
+                self.0.head(k)
+            }
+            fn get_to(
+                &self,
+                k: &str,
+                w: &mut dyn std::io::Write,
+            ) -> Result<crate::entity::Entity, crate::error::Error> {
+                self.0.get_to(k, w)
+            }
+            fn put_from(
+                &self,
+                k: &str,
+                r: &mut dyn std::io::Read,
+                s: u64,
+                m: Option<u64>,
+            ) -> Result<crate::entity::Entity, crate::error::Error> {
+                self.0.put_from(k, r, s, m)
+            }
+            fn delete(&self, k: &str) -> Result<(), crate::error::Error> {
+                self.0.delete(k)
+            }
+        }
+        let nolist = NoList(MemoryStore::new());
+        let mut c = std::io::Cursor::new(buf.clone());
+        nolist
+            .0
+            .put_from(crate::local::MANIFEST_KEY, &mut c, buf.len() as u64, None)
+            .unwrap();
+        let inv = crate::inventory::load_remote_inventory(
+            &nolist,
+            crate::config::InventoryMode::Auto,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            inv.base.source,
+            crate::inventory::InventorySource::Manifest { .. }
+        ));
+    }
+
+    #[test]
+    fn push_bootstrap_persists_despite_transfer_failure() {
+        // W272 (issue 48, A1): B1 writes the baseline BEFORE transfers, so a
+        // transfer failure (exit 1) leaves the manifest present - the next
+        // run plans warm.
+        struct FailFileStore {
+            inner: MemoryStore,
+        }
+        impl ObjectStore for FailFileStore {
+            fn list(&self, p: &str) -> Result<crate::store::Listing, crate::error::Error> {
+                self.inner.list(p)
+            }
+            fn head(&self, k: &str) -> Result<crate::entity::Entity, crate::error::Error> {
+                self.inner.head(k)
+            }
+            fn get_to(
+                &self,
+                k: &str,
+                w: &mut dyn std::io::Write,
+            ) -> Result<crate::entity::Entity, crate::error::Error> {
+                self.inner.get_to(k, w)
+            }
+            fn put_from(
+                &self,
+                k: &str,
+                _r: &mut dyn std::io::Read,
+                _s: u64,
+                _m: Option<u64>,
+            ) -> Result<crate::entity::Entity, crate::error::Error> {
+                if k != crate::local::MANIFEST_KEY {
+                    return Err(crate::error::Error::Other(format!(
+                        "transfer to {k} failed"
+                    )));
+                }
+                self.inner.put_from(k, _r, _s, _m)
+            }
+            fn put_from_with(
+                &self,
+                k: &str,
+                r: &mut dyn std::io::Read,
+                s: u64,
+                o: crate::store::PutOpts,
+            ) -> Result<crate::entity::Entity, crate::error::Error> {
+                if k != crate::local::MANIFEST_KEY {
+                    return Err(crate::error::Error::Other(format!(
+                        "transfer to {k} failed"
+                    )));
+                }
+                self.inner.put_from_with(k, r, s, o)
+            }
+            fn delete(&self, k: &str) -> Result<(), crate::error::Error> {
+                self.inner.delete(k)
+            }
+        }
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "hi").unwrap();
+        let store = FailFileStore {
+            inner: MemoryStore::new(),
+        };
+        let (code, _, err) = run_bi(
+            Command::push(dir.path().into(), false),
+            &store,
+            crate::config::InventoryMode::Auto,
+            crate::config::InventoryBootstrap::PushEnsure,
+        );
+        assert_eq!(code, 1, "transfer failed");
+        assert!(err.contains("bootstrap written ("), "err: {err}");
+        store
+            .inner
+            .head(crate::local::MANIFEST_KEY)
+            .expect("B1 baseline must persist despite transfer failure");
+    }
+
+    /// TOCTOU double (W296, F5 honesty): the WARM LOAD sees the manifest MISSING
+    /// (cold fallback), then the manifest becomes valid before B1's HEAD/GET
+    /// (a concurrent writer published it) so B1 ADOPTS. Implemented as a
+    /// mini store whose first MANIFEST_KEY head answers NotFound and later
+    /// heads answer the real (valid) body.
+    struct TofuAdoptStore {
+        inner: MemoryStore,
+        manifest_heads: std::sync::atomic::AtomicUsize,
+    }
+    impl TofuAdoptStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                manifest_heads: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+    impl ObjectStore for TofuAdoptStore {
+        fn list(&self, _p: &str) -> Result<crate::store::Listing, crate::error::Error> {
+            Ok(crate::store::Listing::default())
+        }
+        fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
+            if key == crate::local::MANIFEST_KEY
+                && self
+                    .manifest_heads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    == 0
+            {
+                // First head (warm load): pretend MISSING so B1 becomes
+                // eligible. Later heads (B1 resolve) see the real valid body.
+                return Err(crate::error::Error::NotFound(key.to_string()));
+            }
+            self.inner.head(key)
+        }
+        fn get_to(
+            &self,
+            key: &str,
+            w: &mut dyn std::io::Write,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.get_to(key, w)
+        }
+        fn put_from(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            s: u64,
+            m: Option<u64>,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.put_from(key, r, s, m)
+        }
+        fn put_from_with(
+            &self,
+            key: &str,
+            r: &mut dyn std::io::Read,
+            s: u64,
+            o: crate::store::PutOpts,
+        ) -> Result<crate::entity::Entity, crate::error::Error> {
+            self.inner.put_from_with(key, r, s, o)
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
+            self.inner.delete(key)
+        }
+    }
+
+    #[test]
+    fn push_prints_adopted_bootstrap_line() {
+        // W296 / W268 CLI half (issue 48, A18): when B1 ADOPTS a
+        // concurrent-valid manifest, the push prints the locked adopted line
+        // and does NOT write (the live manifest stays the winner's).
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("b.md"), "hi").unwrap();
+        let store = TofuAdoptStore::new();
+        let their_body =
+            br#"{"schema":"vaultsync.manifest.v1","created_ms":0,"entry_count":1,"entries":[{"key":"b.md","size":2,"mtime_ms":1000}]}"#;
+        let mut c = std::io::Cursor::new(their_body.to_vec());
+        store
+            .inner
+            .put_from(
+                crate::local::MANIFEST_KEY,
+                &mut c,
+                their_body.len() as u64,
+                None,
+            )
+            .unwrap();
+        let (code, _, err) = run_bi(
+            Command::push(dir.path().into(), false),
+            &store,
+            crate::config::InventoryMode::Auto,
+            crate::config::InventoryBootstrap::PushEnsure,
+        );
+        assert_eq!(code, 0, "err: {err}");
+        assert!(
+            err.contains("manifest bootstrap adopted") && err.contains("already present"),
+            "err: {err}"
+        );
+        // The live manifest still has exactly the winner's entry (not clobbered).
+        let mut buf = Vec::new();
+        store
+            .inner
+            .get_to(crate::local::MANIFEST_KEY, &mut buf)
+            .unwrap();
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        assert_eq!(m.entry_count, 1);
+        assert_eq!(m.entries[0].key, "b.md");
+    }
+
+    #[test]
+    fn push_b1_lost_race_aborts_no_uploads() {
+        // W276 (issue 48, F0/F2/A4): a B1 PreconditionFailed (another writer
+        // won) ABORTS the push - exit 1, no transfers run, nothing clobbered.
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "hi").unwrap();
+        let store = RaceCommitStore {
+            inner: MemoryStore::new(),
+        };
+        let (code, _, err) = run_bi(
+            Command::push(dir.path().into(), false),
+            &store,
+            crate::config::InventoryMode::Auto,
+            crate::config::InventoryBootstrap::PushEnsure,
+        );
+        assert_eq!(code, 1, "B1 lost race must abort the push");
+        assert!(err.contains("manifest bootstrap failed"), "err: {err}");
+        assert!(err.contains("lost race"), "err: {err}");
+        // No upload happened: a.md never landed.
+        assert!(matches!(
+            store.inner.head("a.md").unwrap_err(),
+            crate::error::Error::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn push_b1_transient_err_warns_and_continues() {
+        // W277 (issue 48, F2/A17): a transient B1 Err warns and continues
+        // COLD - transfers may run (exit 0 if they succeed); the continue
+        // string is distinct from the abort string.
+        struct FailManifestHeadStore {
+            inner: MemoryStore,
+            heads: std::sync::atomic::AtomicUsize,
+        }
+        impl ObjectStore for FailManifestHeadStore {
+            fn list(&self, p: &str) -> Result<crate::store::Listing, crate::error::Error> {
+                self.inner.list(p)
+            }
+            fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
+                if key == crate::local::MANIFEST_KEY
+                    && self
+                        .heads
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        > 0
+                {
+                    // First head (warm load) answers NotFound so the load
+                    // falls COLD; the SECOND head (B1 resolve) fails with a
+                    // transient error - the F2-Err path (load must succeed).
+                    return Err(crate::error::Error::Other("simulated 503".to_string()));
+                }
+                self.inner.head(key)
+            }
+            fn get_to(
+                &self,
+                key: &str,
+                w: &mut dyn std::io::Write,
+            ) -> Result<crate::entity::Entity, crate::error::Error> {
+                self.inner.get_to(key, w)
+            }
+            fn put_from(
+                &self,
+                key: &str,
+                r: &mut dyn std::io::Read,
+                s: u64,
+                m: Option<u64>,
+            ) -> Result<crate::entity::Entity, crate::error::Error> {
+                self.inner.put_from(key, r, s, m)
+            }
+            fn put_from_with(
+                &self,
+                key: &str,
+                r: &mut dyn std::io::Read,
+                s: u64,
+                o: crate::store::PutOpts,
+            ) -> Result<crate::entity::Entity, crate::error::Error> {
+                self.inner.put_from_with(key, r, s, o)
+            }
+            fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
+                self.inner.delete(key)
+            }
+        }
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "hi").unwrap();
+        let store = FailManifestHeadStore {
+            inner: MemoryStore::new(),
+            heads: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let (code, _, err) = run_bi(
+            Command::push(dir.path().into(), false),
+            &store,
+            crate::config::InventoryMode::Auto,
+            crate::config::InventoryBootstrap::PushEnsure,
+        );
+        assert_eq!(code, 0, "transient B1 Err must not fail an ok push");
+        assert!(err.contains("manifest bootstrap failed"), "err: {err}");
+        assert!(err.contains("continuing without bootstrap"), "err: {err}");
+        assert!(
+            !err.contains("lost race"),
+            "Err must not be labeled a lost race: {err}"
+        );
+        // Transfers ran: a.md landed even though B1 never wrote.
+        store.inner.head("a.md").expect("upload must have run");
+    }
+
+    #[test]
+    fn push_refresh_drives_warm_final_commit() {
+        // W278 (issue 48, IQ-refresh / A5): after B1 Written the in-memory
+        // base is refreshed to a MANIFEST with the B1 etag, so the final
+        // commit uses the WARM If-Match path (no re-head). A store whose
+        // manifest HEAD fails after B1 proves the commit never re-heads:
+        // the refresh made the warm path succeed. If refresh were missing,
+        // the cold commit would HEAD again and fail.
+        struct HeadFailAfterTwoStore {
+            inner: MemoryStore,
+            heads: std::sync::atomic::AtomicUsize,
+        }
+        impl ObjectStore for HeadFailAfterTwoStore {
+            fn list(&self, p: &str) -> Result<crate::store::Listing, crate::error::Error> {
+                self.inner.list(p)
+            }
+            fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
+                if key == crate::local::MANIFEST_KEY
+                    && self
+                        .heads
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        >= 2
+                {
+                    // Second manifest HEAD onward fails (head disabled after
+                    // B1) - only the warm path avoids it.
+                    return Err(crate::error::Error::Unavailable(
+                        "head disabled after B1".to_string(),
+                    ));
+                }
+                self.inner.head(key)
+            }
+            fn get_to(
+                &self,
+                key: &str,
+                w: &mut dyn std::io::Write,
+            ) -> Result<crate::entity::Entity, crate::error::Error> {
+                self.inner.get_to(key, w)
+            }
+            fn put_from(
+                &self,
+                key: &str,
+                r: &mut dyn std::io::Read,
+                s: u64,
+                m: Option<u64>,
+            ) -> Result<crate::entity::Entity, crate::error::Error> {
+                self.inner.put_from(key, r, s, m)
+            }
+            fn put_from_with(
+                &self,
+                key: &str,
+                r: &mut dyn std::io::Read,
+                s: u64,
+                o: crate::store::PutOpts,
+            ) -> Result<crate::entity::Entity, crate::error::Error> {
+                self.inner.put_from_with(key, r, s, o)
+            }
+            fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
+                self.inner.delete(key)
+            }
+        }
+        let dir = TempDir::new("vaultsync-cli-test");
+        std::fs::write(dir.join("a.md"), "hi").unwrap();
+        let store = HeadFailAfterTwoStore {
+            inner: MemoryStore::new(),
+            heads: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let (code, _, err) = run_bi(
+            Command::push(dir.path().into(), false),
+            &store,
+            crate::config::InventoryMode::Auto,
+            crate::config::InventoryBootstrap::PushEnsure,
+        );
+        assert_eq!(code, 0, "err: {err}");
+        assert!(
+            !err.contains("manifest commit failed"),
+            "final commit must not re-head (refresh failed): {err}"
+        );
+        // The final commit still folded the upload onto the refreshed base.
+        let mut buf = Vec::new();
+        store
+            .inner
+            .get_to(crate::local::MANIFEST_KEY, &mut buf)
+            .unwrap();
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        assert_eq!(m.entry_count, 1);
+        assert_eq!(m.entries[0].key, "a.md");
+    }
+
+    #[test]
+    fn cold_pull_never_creates_manifest() {
+        // Q6 / A3 (issue 48): pull never calls B1 - a cold pull that
+        // downloads leaves MANIFEST_KEY absent.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = MemoryStore::new();
+        let mut c = std::io::Cursor::new(b"hi".to_vec());
+        store
+            .put_from("a.md", &mut c, 2, Some(1_600_000_000_000))
+            .unwrap();
+        let (code, _, _) = run_bi(
+            Command::pull(dir.path().into(), false),
+            &store,
+            crate::config::InventoryMode::Auto,
+            crate::config::InventoryBootstrap::PushEnsure,
+        );
+        assert_eq!(code, 0);
+        assert!(dir.join("a.md").exists(), "body pulled");
+        assert!(matches!(
+            store.head(crate::local::MANIFEST_KEY).unwrap_err(),
+            crate::error::Error::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn parse_status_write_manifest_flag() {
+        // W280: `status --write-manifest` parses to the flag on; without the
+        // flag it is off.
+        let mut args = a();
+        args.extend(["status".to_string(), "--write-manifest".to_string()]);
+        match parse_args(&args).unwrap() {
+            Command::Status { write_manifest, .. } => assert!(write_manifest),
+            other => panic!("expected Status, got {other:?}"),
+        }
+        let mut args = a();
+        args.push("status".to_string());
+        match parse_args(&args).unwrap() {
+            Command::Status { write_manifest, .. } => assert!(!write_manifest),
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_no_flag_never_writes_q3() {
+        // Q3 / A2 (issue 48): default status never writes the manifest, even
+        // auto + cold + push-ensure.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = MemoryStore::new();
+        let (code, _, err) = run_bi(
+            status_wm(dir.path(), false),
+            &store,
+            crate::config::InventoryMode::Auto,
+            crate::config::InventoryBootstrap::PushEnsure,
+        );
+        assert_eq!(code, 0);
+        assert!(!err.contains("bootstrap written"), "err: {err}");
+        assert!(matches!(
+            store.head(crate::local::MANIFEST_KEY).unwrap_err(),
+            crate::error::Error::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn status_write_manifest_cold_writes_and_warms() {
+        // W281 / A13 (issue 48): `status --write-manifest` on a cold auto
+        // store publishes the baseline (B1 write) and prints the line; the
+        // next status is warm.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = MemoryStore::new();
+        let (code, _, err) = run_bi(
+            status_wm(dir.path(), true),
+            &store,
+            crate::config::InventoryMode::Auto,
+            crate::config::InventoryBootstrap::PushEnsure,
+        );
+        assert_eq!(code, 0, "err: {err}");
+        assert!(err.contains("manifest bootstrap written ("), "err: {err}");
+        let mut buf = Vec::new();
+        store.get_to(crate::local::MANIFEST_KEY, &mut buf).unwrap();
+        let m = crate::manifest::parse_manifest_bytes(&buf).unwrap();
+        assert_eq!(m.entry_count, 0);
+        // Next status is warm (manifest line, no cold marker).
+        let (code2, _, err2) = run_bi(
+            status_wm(dir.path(), false),
+            &store,
+            crate::config::InventoryMode::Auto,
+            crate::config::InventoryBootstrap::PushEnsure,
+        );
+        assert_eq!(code2, 0);
+        assert!(
+            err2.contains("inventory: manifest (0 entries)"),
+            "err2: {err2}"
+        );
+        assert!(!err2.contains("list+head (cold)"), "err2: {err2}");
+    }
+
+    #[test]
+    fn status_write_manifest_warm_auto_skips_already_warm() {
+        // W282 / A14 (issue 48): a valid manifest + auto + flag => skip line
+        // `already warm`, and NO put happens.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = MemoryStore::new();
+        let body =
+            br#"{"schema":"vaultsync.manifest.v1","created_ms":0,"entry_count":0,"entries":[]}"#;
+        let mut c = std::io::Cursor::new(body.to_vec());
+        store
+            .put_from(crate::local::MANIFEST_KEY, &mut c, body.len() as u64, None)
+            .unwrap();
+        let before = store.head(crate::local::MANIFEST_KEY).unwrap().etag;
+        let (code, _, err) = run_bi(
+            status_wm(dir.path(), true),
+            &store,
+            crate::config::InventoryMode::Auto,
+            crate::config::InventoryBootstrap::PushEnsure,
+        );
+        assert_eq!(code, 0, "err: {err}");
+        assert!(
+            err.contains("manifest bootstrap skipped (already warm)"),
+            "err: {err}"
+        );
+        assert_eq!(
+            store.head(crate::local::MANIFEST_KEY).unwrap().etag,
+            before,
+            "warm skip must not rewrite the manifest"
+        );
+    }
+
+    #[test]
+    fn status_flag_ignores_bootstrap_never() {
+        // W283 / A15 (issue 48, IQ-status-flag-vs-bootstrap): the explicit
+        // `--write-manifest` flag always wins; `bootstrap = "never"` does not
+        // gate status.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = MemoryStore::new();
+        let (code, _, err) = run_bi(
+            status_wm(dir.path(), true),
+            &store,
+            crate::config::InventoryMode::Auto,
+            crate::config::InventoryBootstrap::Never,
+        );
+        assert_eq!(code, 0, "err: {err}");
+        assert!(err.contains("manifest bootstrap written ("), "err: {err}");
+        store
+            .head(crate::local::MANIFEST_KEY)
+            .expect("flag writes even under bootstrap=never");
+    }
+
+    #[test]
+    fn status_write_manifest_mode_first_skip() {
+        // W297 / F4 / A21 (issue 48): non-Auto mode is reported as a MODE
+        // skip even when a valid manifest is present (mode checked before
+        // warm); it is never labeled already-warm.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = MemoryStore::new();
+        let body =
+            br#"{"schema":"vaultsync.manifest.v1","created_ms":0,"entry_count":0,"entries":[]}"#;
+        let mut c = std::io::Cursor::new(body.to_vec());
+        store
+            .put_from(crate::local::MANIFEST_KEY, &mut c, body.len() as u64, None)
+            .unwrap();
+        let (code, _, err) = run_bi(
+            status_wm(dir.path(), true),
+            &store,
+            crate::config::InventoryMode::ListHead,
+            crate::config::InventoryBootstrap::PushEnsure,
+        );
+        assert_eq!(code, 0, "err: {err}");
+        assert!(err.contains("skipped (mode="), "err: {err}");
+        assert!(
+            !err.contains("already warm"),
+            "mode-first: warm must not be claimed under a mode skip: {err}"
+        );
+    }
+
+    #[test]
+    fn status_write_manifest_fails_closed() {
+        // W284 / A4? / F2 (issue 48): under status, ANY B1 failure
+        // (PreconditionFailed OR Err) exits 1 - never the continue warning.
+        struct FailManifestStore {
+            inner: MemoryStore,
+            heads: std::sync::atomic::AtomicUsize,
+        }
+        impl ObjectStore for FailManifestStore {
+            fn list(&self, p: &str) -> Result<crate::store::Listing, crate::error::Error> {
+                self.inner.list(p)
+            }
+            fn head(&self, key: &str) -> Result<crate::entity::Entity, crate::error::Error> {
+                if key == crate::local::MANIFEST_KEY
+                    && self
+                        .heads
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        > 0
+                {
+                    // First head (warm load) NotFound => cold; the SECOND
+                    // (B1 resolve) fails - status must exit 1.
+                    return Err(crate::error::Error::Other("simulated 503".to_string()));
+                }
+                self.inner.head(key)
+            }
+            fn get_to(
+                &self,
+                key: &str,
+                w: &mut dyn std::io::Write,
+            ) -> Result<crate::entity::Entity, crate::error::Error> {
+                self.inner.get_to(key, w)
+            }
+            fn put_from(
+                &self,
+                key: &str,
+                r: &mut dyn std::io::Read,
+                s: u64,
+                m: Option<u64>,
+            ) -> Result<crate::entity::Entity, crate::error::Error> {
+                self.inner.put_from(key, r, s, m)
+            }
+            fn put_from_with(
+                &self,
+                key: &str,
+                r: &mut dyn std::io::Read,
+                s: u64,
+                o: crate::store::PutOpts,
+            ) -> Result<crate::entity::Entity, crate::error::Error> {
+                self.inner.put_from_with(key, r, s, o)
+            }
+            fn delete(&self, key: &str) -> Result<(), crate::error::Error> {
+                self.inner.delete(key)
+            }
+        }
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = FailManifestStore {
+            inner: MemoryStore::new(),
+            heads: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let (code, _, err) = run_bi(
+            status_wm(dir.path(), true),
+            &store,
+            crate::config::InventoryMode::Auto,
+            crate::config::InventoryBootstrap::PushEnsure,
+        );
+        assert_eq!(code, 1, "status write-manifest fails closed");
+        assert!(err.contains("manifest bootstrap failed"), "err: {err}");
+        assert!(
+            !err.contains("continuing without bootstrap"),
+            "status must not continue: {err}"
+        );
+    }
+
+    #[test]
+    fn status_write_manifest_json_still_rejected() {
+        // W298 / D-json / A22 (issue 48): `status --write-manifest --json`
+        // is STILL rejected (Phase-3 `--json`), before any manifest write -
+        // no bootstrap side effect.
+        let dir = TempDir::new("vaultsync-cli-test");
+        let store = MemoryStore::new();
+        let cmd = Command::Status {
+            vault: dir.path().into(),
+            json: true,
+            config: None,
+            verbose: 0,
+            follow_symlinks: false,
+            write_manifest: true,
+        };
+        let (code, _, err) = run_bi(
+            cmd,
+            &store,
+            crate::config::InventoryMode::Auto,
+            crate::config::InventoryBootstrap::PushEnsure,
+        );
+        assert_eq!(code, 1);
+        assert!(err.contains("not implemented"), "err: {err}");
+        assert!(matches!(
+            store.head(crate::local::MANIFEST_KEY).unwrap_err(),
+            crate::error::Error::NotFound(_)
+        ));
     }
 }

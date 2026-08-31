@@ -43,6 +43,18 @@ pub enum InventoryMode {
     ListHead,
 }
 
+/// Push-time inventory bootstrap policy (issue 48, IQ6 / D-config): when may
+/// B1 (`ensure_remote_manifest`) run on a cold push. `PushEnsure` (default):
+/// auto + cold push publishes a baseline. `Never`: push never bootstraps
+/// (repair / `status --write-manifest` remain the explicit writers). Gates
+/// push-time B1 only; the explicit `status --write-manifest` flag always
+/// wins over `never` (IQ-status-flag-vs-bootstrap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InventoryBootstrap {
+    PushEnsure,
+    Never,
+}
+
 /// Built-in Obsidian default ignore profile (issue #31 / roadmap D3).
 /// Vault-relative; exact strings; single source of truth for docs + resolve.
 /// The `obsidian` profile is the default when `[ignore]` is absent or
@@ -124,12 +136,16 @@ pub struct TransferConfig {
 }
 
 /// `[inventory]` section (issue 45, D-config). Optional; `mode` absent =>
-/// `auto`. Unknown keys are rejected loudly (W56) via `deny_unknown_fields`.
+/// `auto`. `bootstrap` (issue 48, IQ6 / D-config) absent => `push-ensure`.
+/// Unknown keys are rejected loudly (W56) via `deny_unknown_fields`.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InventoryConfig {
     #[serde(default)]
     pub mode: Option<String>,
+    /// issue 48: push-time bootstrap policy (`push-ensure` | `never`).
+    #[serde(default)]
+    pub bootstrap: Option<String>,
 }
 
 /// `[transfer.retry]` section (I8). All fields optional; absent section (or
@@ -170,6 +186,9 @@ pub struct Settings {
     pub resolved_ignore_patterns: Vec<String>,
     /// Resolved `[inventory].mode` (issue 45): `Auto` when absent.
     pub inventory_mode: InventoryMode,
+    /// Resolved `[inventory].bootstrap` (issue 48, IQ6): `PushEnsure` when
+    /// absent. Gates push-time B1 only; `status --write-manifest` ignores it.
+    pub inventory_bootstrap: InventoryBootstrap,
 }
 
 /// Resolved retry policy (I8). Milliseconds at this layer; `Duration`
@@ -303,6 +322,7 @@ pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings,
     let (ignore_patterns, resolved_ignore_patterns) = resolve_ignore(cfg.ignore.as_ref())?;
     let retry = resolve_retry(cfg.transfer.as_ref())?;
     let inventory_mode = resolve_inventory_mode(cfg.inventory.as_ref())?;
+    let inventory_bootstrap = resolve_inventory_bootstrap(cfg.inventory.as_ref())?;
     Ok(Settings {
         vault_root,
         store,
@@ -312,6 +332,7 @@ pub fn resolve_settings(cfg: &FileConfig, env: &EnvSnapshot) -> Result<Settings,
         ignore_patterns,
         resolved_ignore_patterns,
         inventory_mode,
+        inventory_bootstrap,
     })
 }
 
@@ -327,6 +348,22 @@ fn resolve_inventory_mode(inventory: Option<&InventoryConfig>) -> Result<Invento
         Some("list_head") => Ok(InventoryMode::ListHead),
         Some(other) => Err(Error::Other(format!(
             "inventory.mode: unknown mode {other:?} (allowed: \"auto\" | \"manifest\" | \"list_head\")"
+        ))),
+    }
+}
+
+/// Resolve `[inventory].bootstrap` (issue 48, W269/W270 / D-config): absent
+/// key => `PushEnsure`; `"push-ensure"` / `"never"` map 1:1; unknown values
+/// are loud errors naming `inventory.bootstrap` and the allowed set.
+fn resolve_inventory_bootstrap(
+    inventory: Option<&InventoryConfig>,
+) -> Result<InventoryBootstrap, Error> {
+    let bootstrap = inventory.and_then(|i| i.bootstrap.as_deref());
+    match bootstrap {
+        None | Some("push-ensure") => Ok(InventoryBootstrap::PushEnsure),
+        Some("never") => Ok(InventoryBootstrap::Never),
+        Some(other) => Err(Error::Other(format!(
+            "inventory.bootstrap: unknown value {other:?} (allowed: \"push-ensure\" | \"never\")"
         ))),
     }
 }
@@ -678,6 +715,67 @@ patterns = [".git/"]
         let err = parse_config_str("[inventory]\nmod = \"auto\"\n").unwrap_err();
         assert!(
             format!("{err}").contains("mod"),
+            "unknown inventory key not named: {err}"
+        );
+    }
+
+    #[test]
+    fn inventory_bootstrap_absent_defaults_to_push_ensure() {
+        // W269 (issue 48, D-config): absent `[inventory]` section or absent
+        // `bootstrap` key resolves to `InventoryBootstrap::PushEnsure`. The
+        // default mode stays Auto (not coupled to bootstrap).
+        let cfg = FileConfig::default();
+        assert_eq!(
+            settings(&cfg).unwrap().inventory_bootstrap,
+            InventoryBootstrap::PushEnsure
+        );
+        let cfg = parse_config_str("[inventory]\n").unwrap();
+        assert_eq!(
+            settings(&cfg).unwrap().inventory_bootstrap,
+            InventoryBootstrap::PushEnsure
+        );
+        let cfg = parse_config_str("[inventory]\nbootstrap = \"push-ensure\"\n").unwrap();
+        assert_eq!(
+            settings(&cfg).unwrap().inventory_bootstrap,
+            InventoryBootstrap::PushEnsure
+        );
+    }
+
+    #[test]
+    fn inventory_bootstrap_never_parses() {
+        // W269 (issue 48): `bootstrap = "never"` maps to `Never`; the
+        // string round-trips through `FileConfig`.
+        let cfg = parse_config_str("[inventory]\nbootstrap = \"never\"\n").unwrap();
+        let inv = cfg.inventory.as_ref().unwrap();
+        assert_eq!(inv.bootstrap.as_deref(), Some("never"));
+        assert_eq!(
+            settings(&cfg).unwrap().inventory_bootstrap,
+            InventoryBootstrap::Never
+        );
+    }
+
+    #[test]
+    fn inventory_bootstrap_unknown_is_loud_error() {
+        // W269 (issue 48, W56 ethos): an unknown bootstrap value is
+        // rejected loudly naming `inventory.bootstrap` and the allowed set.
+        let cfg = parse_config_str("[inventory]\nbootstrap = \"sometimes\"\n").unwrap();
+        let err = settings(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("inventory.bootstrap"), "unexpected: {msg}");
+        assert!(
+            msg.contains("\"push-ensure\""),
+            "allowed set not named: {msg}"
+        );
+        assert!(msg.contains("\"never\""), "allowed set not named: {msg}");
+    }
+
+    #[test]
+    fn inventory_still_denies_unknown_bootstrap_fields() {
+        // W269 (issue 48): `deny_unknown_fields` stays on the section even
+        // with the new `bootstrap` key - a typo is still loud.
+        let err = parse_config_str("[inventory]\nboootstrap = \"never\"\n").unwrap_err();
+        assert!(
+            format!("{err}").contains("boootstrap"),
             "unknown inventory key not named: {err}"
         );
     }
