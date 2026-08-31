@@ -240,11 +240,7 @@ pub(crate) fn enrich_with_head_mtimes<S: ObjectStore + ?Sized>(
     // only - folder views are never headed, never counted), then one
     // `HeadDone` per completed object head (success or NotFound-vanish).
     // Skipped entirely when there are zero object rows (I42 emission rules).
-    let object_rows_total = listing
-        .entities
-        .iter()
-        .filter(|e| !e.is_folder())
-        .count() as u32;
+    let object_rows_total = listing.entities.iter().filter(|e| !e.is_folder()).count() as u32;
     if object_rows_total > 0 {
         progress.event(crate::progress::ProgressEvent::HeadsStart {
             total_keys: object_rows_total,
@@ -527,10 +523,7 @@ mod tests {
         let pages: Vec<(u32, u64)> = events
             .iter()
             .map(|e| match e {
-                ProgressEvent::ListPage {
-                    page,
-                    keys_so_far,
-                } => (*page, *keys_so_far),
+                ProgressEvent::ListPage { page, keys_so_far } => (*page, *keys_so_far),
                 other => panic!("expected ListPage, got {other:?}"),
             })
             .collect();
@@ -659,7 +652,10 @@ mod tests {
         assert!(format!("{err}").contains("boom"));
         let events2 = prog2.events();
         assert!(
-            matches!(events2.first(), Some(ProgressEvent::HeadsStart { total_keys: 1 })),
+            matches!(
+                events2.first(),
+                Some(ProgressEvent::HeadsStart { total_keys: 1 })
+            ),
             "HeadsStart may precede the fail-closed error: {events2:?}"
         );
     }
@@ -722,8 +718,7 @@ mod tests {
         // I15 unchanged: head mtimes win; folder view passes through unheaded.
         let a = enriched.entities.iter().find(|e| e.key == "a.md").unwrap();
         assert_eq!(a.mtime_ms, Some(100));
-        let folders: Vec<&Entity> =
-            enriched.entities.iter().filter(|e| e.is_folder()).collect();
+        let folders: Vec<&Entity> = enriched.entities.iter().filter(|e| e.is_folder()).collect();
         assert_eq!(folders.len(), 1, "folder view survives unheaded");
     }
 
@@ -741,7 +736,8 @@ mod tests {
             .find(|e| e.key == "a.md")
             .unwrap();
         a.size = 9_999;
-        let enriched = enrich_with_head_mtimes(&store, listing, 1, &crate::progress::NoProgress).unwrap();
+        let enriched =
+            enrich_with_head_mtimes(&store, listing, 1, &crate::progress::NoProgress).unwrap();
         let a = enriched.entities.iter().find(|e| e.key == "a.md").unwrap();
         assert_eq!(a.size, store.head("a.md").unwrap().size);
         assert_eq!(
@@ -753,7 +749,8 @@ mod tests {
     #[test]
     fn enrich_overrides_listing_mtime_with_head_mtime() {
         let (store, listing) = degraded_listing();
-        let enriched = enrich_with_head_mtimes(&store, listing, 1, &crate::progress::NoProgress).unwrap();
+        let enriched =
+            enrich_with_head_mtimes(&store, listing, 1, &crate::progress::NoProgress).unwrap();
         // head reports the true (earlier) metadata mtimes and the real etag.
         let a = enriched.entities.iter().find(|e| e.key == "a.md").unwrap();
         assert_eq!(a.mtime_ms, Some(100));
@@ -795,7 +792,8 @@ mod tests {
             entities,
             warnings: vec!["pre-existing".to_string()],
         };
-        let enriched = enrich_with_head_mtimes(&store, listing, 1, &crate::progress::NoProgress).unwrap();
+        let enriched =
+            enrich_with_head_mtimes(&store, listing, 1, &crate::progress::NoProgress).unwrap();
         // Healthy row kept; all vanished rows dropped.
         let keys: Vec<_> = enriched.entities.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(keys, vec!["a.md"]);
@@ -816,7 +814,8 @@ mod tests {
         // A listed key that vanishes between LIST and HEAD (concurrent-delete
         // race): head answers NotFound, so the row is dropped, siblings kept.
         listing.entities.push(file("gone.md", 5, Some(9_999_999)));
-        let enriched = enrich_with_head_mtimes(&store, listing, 1, &crate::progress::NoProgress).unwrap();
+        let enriched =
+            enrich_with_head_mtimes(&store, listing, 1, &crate::progress::NoProgress).unwrap();
         let keys: Vec<_> = enriched.entities.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(keys, vec!["a.md", "notes/", "notes/b.md"]);
     }
@@ -944,8 +943,15 @@ mod tests {
         // so a conc-1 pass through the gauge deadlocks (target=2 never
         // reached; `n_workers` was sized for the N leg). Same trap as
         // `enrich_parallel_vanished_warning_order_stable`.
-        let enriched1 = enrich_with_head_mtimes(&store.inner, listing.clone(), 1, &crate::progress::NoProgress).unwrap();
-        let enriched4 = enrich_with_head_mtimes(&store, listing, 4, &crate::progress::NoProgress).unwrap();
+        let enriched1 = enrich_with_head_mtimes(
+            &store.inner,
+            listing.clone(),
+            1,
+            &crate::progress::NoProgress,
+        )
+        .unwrap();
+        let enriched4 =
+            enrich_with_head_mtimes(&store, listing, 4, &crate::progress::NoProgress).unwrap();
         assert!(
             store.max_in_flight() > 1,
             "heads must overlap at concurrency 4 (max in-flight {})",
@@ -978,7 +984,8 @@ mod tests {
             entities,
             warnings: vec!["pre-existing".to_string()],
         };
-        let r1 = enrich_with_head_mtimes(&store, listing.clone(), 1, &crate::progress::NoProgress).unwrap();
+        let r1 = enrich_with_head_mtimes(&store, listing.clone(), 1, &crate::progress::NoProgress)
+            .unwrap();
         let r4 = enrich_with_head_mtimes(&store, listing, 4, &crate::progress::NoProgress).unwrap();
         assert_eq!(r1, r4);
         assert_eq!(
@@ -1015,7 +1022,8 @@ mod tests {
             ],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&store, listing, 4, &crate::progress::NoProgress).unwrap_err();
+        let err =
+            enrich_with_head_mtimes(&store, listing, 4, &crate::progress::NoProgress).unwrap_err();
         assert_eq!(
             format!("{err}"),
             "a.md:boom-a",
@@ -1141,7 +1149,8 @@ mod tests {
             ],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&store, listing, 1, &crate::progress::NoProgress).unwrap_err();
+        let err =
+            enrich_with_head_mtimes(&store, listing, 1, &crate::progress::NoProgress).unwrap_err();
         assert!(
             matches!(err, Error::Unauthorized(_)),
             "a.md's Unauthorized must fail the listing, got {err:?}"
@@ -1179,7 +1188,8 @@ mod tests {
             ],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&store, listing, 4, &crate::progress::NoProgress).unwrap_err();
+        let err =
+            enrich_with_head_mtimes(&store, listing, 4, &crate::progress::NoProgress).unwrap_err();
         assert!(
             matches!(err, Error::Unauthorized(_)),
             "listing-earliest error must win, got {err:?}"
@@ -1212,7 +1222,9 @@ mod tests {
             .filter(|e| !e.is_folder())
             .map(|e| e.key.clone())
             .collect();
-        let enriched = enrich_with_head_mtimes(&store, listing.clone(), 1, &crate::progress::NoProgress).unwrap();
+        let enriched =
+            enrich_with_head_mtimes(&store, listing.clone(), 1, &crate::progress::NoProgress)
+                .unwrap();
         assert_eq!(
             store.log(),
             expected,
@@ -1336,7 +1348,8 @@ mod tests {
             entities: vec![file("a.md", 9_999, Some(9_999_999))],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&flaky, listing, 1, &crate::progress::NoProgress).unwrap_err();
+        let err =
+            enrich_with_head_mtimes(&flaky, listing, 1, &crate::progress::NoProgress).unwrap_err();
         assert!(
             matches!(err, Error::Unavailable(_)),
             "a transient head error must fail the listing on the first attempt, got {err:?}"
@@ -1358,7 +1371,8 @@ mod tests {
             entities: vec![file("a.md", 1, Some(9_999_999))],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&store, listing, 1, &crate::progress::NoProgress).unwrap_err();
+        let err =
+            enrich_with_head_mtimes(&store, listing, 1, &crate::progress::NoProgress).unwrap_err();
         assert!(matches!(err, Error::Unavailable(_)));
         assert_eq!(store.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
@@ -1372,7 +1386,8 @@ mod tests {
             entities: vec![file("a.md", 1, None)],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&flaky, listing, 1, &crate::progress::NoProgress).unwrap_err();
+        let err =
+            enrich_with_head_mtimes(&flaky, listing, 1, &crate::progress::NoProgress).unwrap_err();
         assert!(matches!(err, Error::Unauthorized(_)));
         assert_eq!(flaky.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
@@ -1383,7 +1398,13 @@ mod tests {
             entities: vec![file("a.md", 1, Some(9_999_999))],
             warnings: Vec::new(),
         };
-        let err = enrich_with_head_mtimes(&HeadFailStore::new(), listing, 1, &crate::progress::NoProgress).unwrap_err();
+        let err = enrich_with_head_mtimes(
+            &HeadFailStore::new(),
+            listing,
+            1,
+            &crate::progress::NoProgress,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, Error::Unavailable(_)),
             "non-NotFound head error must fail the listing, got {err:?}"

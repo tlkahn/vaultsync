@@ -65,10 +65,7 @@ pub enum ProgressEvent {
     /// 1-based; `keys_so_far` is the CUMULATIVE raw object-row count from the
     /// page `contents` (pre-folder-synth; matches wall-time work, W342 lock).
     /// No total-page denominator - S3 does not know it up front.
-    ListPage {
-        page: u32,
-        keys_so_far: u64,
-    },
+    ListPage { page: u32, keys_so_far: u64 },
     /// Issue 42 (I42-heads): the head-enrichment fan-out is about to start;
     /// `total_keys` is the object rows that WILL be headed (post-reserved,
     /// non-folder). Skipped when there are zero object rows.
@@ -277,10 +274,7 @@ impl PlanProgressLine {
     pub fn on_event(&mut self, ev: ProgressEvent) {
         match ev {
             ProgressEvent::PlanStart => {}
-            ProgressEvent::ListPage {
-                page,
-                keys_so_far,
-            } => {
+            ProgressEvent::ListPage { page, keys_so_far } => {
                 self.listing = Some((page, keys_so_far));
             }
             ProgressEvent::HeadsStart { total_keys } => {
@@ -1327,10 +1321,7 @@ mod tests {
             page: 1,
             keys_so_far: 1000,
         }) {
-            ProgressEvent::ListPage {
-                page,
-                keys_so_far,
-            } => {
+            ProgressEvent::ListPage { page, keys_so_far } => {
                 assert_eq!(page, 1);
                 assert_eq!(keys_so_far, 1000);
             }

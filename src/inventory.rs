@@ -1396,8 +1396,7 @@ mod tests {
             .unwrap();
         let prog = crate::testutil::RecordingProgress::new();
         let inv =
-            load_remote_inventory_with_progress(&store, InventoryMode::Auto, None, &prog)
-                .unwrap();
+            load_remote_inventory_with_progress(&store, InventoryMode::Auto, None, &prog).unwrap();
         assert_eq!(inv.base.source, InventorySource::LiveListHead);
         let events = prog.events();
         assert!(matches!(events.first(), Some(ProgressEvent::PlanStart)));
@@ -1422,9 +1421,8 @@ mod tests {
             .put_from("a.md", &mut c, 3, Some(1_600_000_000_000))
             .unwrap();
         let prog2 = crate::testutil::RecordingProgress::new();
-        let inv2 =
-            load_remote_inventory_with_progress(&store2, InventoryMode::Auto, None, &prog2)
-                .unwrap();
+        let inv2 = load_remote_inventory_with_progress(&store2, InventoryMode::Auto, None, &prog2)
+            .unwrap();
         assert_eq!(inv2.base.source, InventorySource::LiveListHead);
         let events2 = prog2.events();
         assert!(matches!(events2.first(), Some(ProgressEvent::PlanStart)));
@@ -1448,8 +1446,7 @@ mod tests {
             .unwrap();
         for mode in [InventoryMode::Auto, InventoryMode::Manifest] {
             let prog = crate::testutil::RecordingProgress::new();
-            let inv =
-                load_remote_inventory_with_progress(&store, mode, None, &prog).unwrap();
+            let inv = load_remote_inventory_with_progress(&store, mode, None, &prog).unwrap();
             assert!(
                 prog.events().is_empty(),
                 "warm load must be event-free: {:?}",
@@ -1474,9 +1471,8 @@ mod tests {
             .put_from("a.md", &mut c, 3, Some(1_600_000_000_000))
             .unwrap();
         let prog = crate::testutil::RecordingProgress::new();
-        let inv =
-            load_remote_inventory_with_progress(&store, InventoryMode::ListHead, None, &prog)
-                .unwrap();
+        let inv = load_remote_inventory_with_progress(&store, InventoryMode::ListHead, None, &prog)
+            .unwrap();
         let events = prog.events();
         assert!(
             matches!(events.first(), Some(ProgressEvent::PlanStart)),

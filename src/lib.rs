@@ -74,7 +74,15 @@ pub fn build_plan(
 ) -> Result<PlanReport, Error> {
     // I42-callers-no-sink: the no-sink wrapper behaves byte-identically to
     // today (NoProgress emits nothing on the cold path).
-    build_plan_with_progress(local, store, mode, opts, ignore, inventory, &crate::progress::NoProgress)
+    build_plan_with_progress(
+        local,
+        store,
+        mode,
+        opts,
+        ignore,
+        inventory,
+        &crate::progress::NoProgress,
+    )
 }
 
 /// Like [`build_plan`] with a plan-phase progress sink threaded into the
@@ -446,14 +454,9 @@ pub(crate) mod testutil {
         ) -> Result<crate::store::Listing, crate::error::Error> {
             let listing = self.inner.list(prefix)?;
             let mut keys_so_far: u64 = 0;
-            let mut page: u32 = 0;
-            for chunk in listing.entities.chunks(self.page_size) {
-                page += 1;
+            for (page, chunk) in (1_u32..).zip(listing.entities.chunks(self.page_size)) {
                 keys_so_far += chunk.len() as u64;
-                progress.event(crate::progress::ProgressEvent::ListPage {
-                    page,
-                    keys_so_far,
-                });
+                progress.event(crate::progress::ProgressEvent::ListPage { page, keys_so_far });
             }
             Ok(listing)
         }
@@ -1020,7 +1023,6 @@ mod tests {
         );
     }
 
-    #[test]
     // I42-warm (W348): warm build_plan_with_progress stays silent - the
     // recording is empty and the report source is Manifest (W236 remains a
     // CLI concern only; the library never prints it).
@@ -1157,10 +1159,7 @@ mod tests {
         .unwrap();
         assert_eq!(report.plan, report2.plan);
         assert_eq!(report.warnings, report2.warnings);
-        assert_eq!(
-            report.inventory_base.source,
-            report2.inventory_base.source
-        );
+        assert_eq!(report.inventory_base.source, report2.inventory_base.source);
         assert_eq!(
             report.inventory_base.file_entities,
             report2.inventory_base.file_entities
@@ -1171,6 +1170,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn build_plan_empty_ignore_matches_today() {
         // W196: the new `ignore: &IgnoreSet` argument defaults to empty, and
         // an empty set must not break remote ingest - a normal remote-only

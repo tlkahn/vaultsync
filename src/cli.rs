@@ -1992,7 +1992,9 @@ mod tests {
 
     /// Seed a paging store with a local dirty file + a remote-only file so a
     /// cold status/push has both plan-phase pages and a dirty plan.
-    fn paging_store_with_local_and_remote(dir: &std::path::Path) -> crate::testutil::FakePagingStore {
+    fn paging_store_with_local_and_remote(
+        dir: &std::path::Path,
+    ) -> crate::testutil::FakePagingStore {
         std::fs::write(dir.join("a.md"), "hello").unwrap();
         let store = crate::testutil::FakePagingStore::new(1);
         let mut c = std::io::Cursor::new(b"remote".to_vec());
@@ -2134,7 +2136,10 @@ mod tests {
         let upload_idx = err_on
             .find("Uploading")
             .expect("upload frames after the plan phase");
-        assert!(plan_idx < upload_idx, "plan phase before upload: {err_on:?}");
+        assert!(
+            plan_idx < upload_idx,
+            "plan phase before upload: {err_on:?}"
+        );
         assert!(
             err_on[..upload_idx].contains('\n'),
             "plan frame finalized with a newline before upload: {err_on:?}"
@@ -2160,9 +2165,7 @@ mod tests {
         for cmd in cmds {
             let (_, _, err) = run_mode(cmd, &store, ProgressMode::Off);
             assert!(
-                !err.contains('\r')
-                    && !err.contains("Listing")
-                    && !err.contains("Heading"),
+                !err.contains('\r') && !err.contains("Listing") && !err.contains("Heading"),
                 "Off must not render plan frames: {err:?}"
             );
         }
@@ -2187,10 +2190,7 @@ mod tests {
             .expect("W236 must follow a finalized progress frame");
         for (i, ch) in err.char_indices() {
             if ch == '\r' {
-                assert!(
-                    i < last_nl,
-                    "\r frame after the plan finalize: {err:?}"
-                );
+                assert!(i < last_nl, "\r frame after the plan finalize: {err:?}");
             }
         }
     }
@@ -2245,9 +2245,7 @@ mod tests {
             let (code, _, err) = run_mode(cmd, &store, ProgressMode::Always);
             assert_eq!(code, 1, "reject_json exits 1");
             assert!(
-                !err.contains("Listing")
-                    && !err.contains("Heading")
-                    && !err.contains('\r'),
+                !err.contains("Listing") && !err.contains("Heading") && !err.contains('\r'),
                 "json reject must precede any plan progress: {err:?}"
             );
             assert!(
