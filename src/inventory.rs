@@ -70,7 +70,7 @@ pub fn load_remote_inventory(
                 // warning (Q3: the read path stays side-effect free).
                 let mut inv = live_list_head(store)?;
                 inv.warnings.push(
-                    "inventory manifest missing; falling back to list+head (next push will create one)"
+                    "inventory manifest missing; falling back to list+head (next push may ensure a manifest via bootstrap or commit, or run vaultsync repair)"
                         .to_string(),
                 );
                 Ok(inv)
@@ -1355,11 +1355,13 @@ mod tests {
 
     #[test]
     fn auto_missing_manifest_warning_names_absent() {
-        // W255 (F4/L6, reviews 5472028291 + 5472033449): the auto fallback
-        // warning must let an operator tell ABSENT from CORRUPT - the
-        // missing case names absence (and that the next push will create),
-        // and must NOT claim "corrupt". RED today: the single shared
-        // "missing or corrupt" string.
+        // W255 (F4/L6, reviews 5472028291 + 5472033449) + W319 (PR50-r2
+        // L2, review 5476798257): the auto fallback warning must let an
+        // operator tell ABSENT from CORRUPT - the missing case names
+        // absence and that a future push may ENSURE a manifest (bootstrap
+        // or commit) or repair can create it, and must NOT claim "corrupt"
+        // or promise "will create one". The unconditional old promise is
+        // wrong post-48: bootstrap=never may write nothing on zero mutation.
         let store = MemoryStore::new();
         let inv = load_remote_inventory(&store, InventoryMode::Auto, None).unwrap();
         assert_eq!(inv.base.source, InventorySource::LiveListHead);
@@ -1374,6 +1376,14 @@ mod tests {
             "missing must not be called invalid: {warn}"
         );
         assert!(warn.contains("push"), "warnings: {warn}");
+        assert!(
+            warn.contains("ensure") || warn.contains("bootstrap"),
+            "must mention post-48 ensure/bootstrap: {warn}"
+        );
+        assert!(
+            !warn.contains("will create one"),
+            "must not promise an unconditional create: {warn}"
+        );
     }
 
     #[test]
